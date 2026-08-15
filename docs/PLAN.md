@@ -67,19 +67,26 @@ line shows "N tiles below pixel size").
 - Tiles carry scan state (pending/partial/complete/denied) → rendered
   distinctly (pending = outlined dim, denied = hatched/distinct color).
 
-## Open decisions (ratify before TZ-2 — will be presented problem-first)
+## Ratified decisions (human, 2026-08-12)
 
-1. **Allocated vs logical size as the primary metric.** Recommendation:
-   allocated (explains free space, the founding mystery); logical shown in
-   the hover/status detail.
-2. **Hard links / APFS clones.** v1 recommendation: count naively, record
-   TD (dedup-by-inode pass as extension). Cheap, slightly over-counts.
-3. **Relayout cadence value** (~1 s start, operator latitude).
-4. **Depth-scan semantics**: scan computes FULL sizes to unlimited depth
-   (sizes must be true), but only maintains child detail to depth N
-   (default 5) below the current focus; zooming extends detail on demand.
-   (Sizes true, detail windowed — recommendation; the alternative
-   "sizes only to depth N" would make every ancestor size a lie.)
+1. **Allocated size is the primary metric** (tile area = allocated bytes;
+   logical shown in hover detail). The map must reconcile against volume
+   accounting — that is the founding purpose.
+2. **Hard links / APFS clones: count naively in v1.** Recorded debt with a
+   named trigger: dedup-by-inode pass when scanned totals visibly exceed
+   volume used space (the unaccounted tile going negative is the signal).
+3. **Relayout batched ~1 s, animated** (named constant; operator tuning
+   latitude at checkpoints). Per-event relayout is forbidden (jitter).
+4. **Sizes true, detail windowed.** The scanner always descends fully —
+   every size on screen is the real recursive total; the depth setting
+   (default 5) limits only retained/rendered child DETAIL below the current
+   focus, extended on demand when zooming.
+5. **Per-top-level-folder parallel scanning** (human addition): each
+   top-level folder of the scan root gets its own concurrent worker so ALL
+   top-level tiles show progress simultaneously — no sequential DFS where
+   one folder monopolizes the map. Workers emit subtree-tagged ScanEvents
+   into the single reducer; the reducer stays pure and single-threaded
+   (events are the concurrency boundary).
 
 ## Slices
 
