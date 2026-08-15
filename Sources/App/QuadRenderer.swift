@@ -1,0 +1,166 @@
+//
+//  QuadRenderer.swift — Metal instanced-quad renderer for treemap tiles.
+//  Module maturity: PROTOTYPE (slice TZ-1)
+//
+//  PROVENANCE: CAMetalLayer setup, runtime shader compile
+//  (`makeLibrary(source:)`), and the single-draw-call instanced-quad pattern are
+//  adapted from glyph-saver's ZapRenderer (../glyph-saver/Sources/Saver/
+//  ZapRenderer.swift) and its ZapZap heritage. Dropped: the two-pass
+//  scene/lighting pipeline, textures, particles — TZ-1 is flat filled rects.
+//
+//  This is the App-side half of the crossing point: it consumes a flat
+//  [TileRect] (TreemapCore output) and knows nothing about SizeTree, scanning,
+//  or the treemap algorithm. It maps each tile's viewport-space rect (top-left
+//  origin, y-down, in DEVICE PIXELS) to Metal NDC, its dimLevel to a brightness,
+//  and draws all tiles in ONE instanced draw call.
+//
+//  Two entry points share one encode path:
+//    - render(tiles:to:)              live path → the CAMetalLayer's drawable
+//    - renderSynchronously(tiles:into:) offscreen seam → an arbitrary texture,
+//                                       blocking until the GPU finishes
+//                                       (scripts/verify.sh determinism gate).
+//
+//  ABSTRACTION LEDGER: adds none. One concrete renderer; its only collaborators
+//  are TreemapCore's TileRect (in) and a Metal drawable/texture (out). No
+//  renderer protocol — there is exactly one renderer and no demonstrated second.
+//
+
+import Metal
+import QuartzCore
+import simd
+// NOTE: no `import TreemapCore` / `import ScanCore` — the App layer is built ONLY
+// by the swiftc monolith (build.sh / verify.sh), where the core sources are part
+// of the same module (glyph-saver ZapRenderer pattern). TileRect/Rect/NodeKind
+// resolve same-module.
+
+final class QuadRenderer {
+    /// CPU mirror of MSL `QuadInstance` — 9 contiguous Floats (36-byte stride).
+    /// All-Float on purpose (no SIMD3) so there is no hidden 16-byte alignment
+    /// padding between CPU and GPU layouts (the trap ZapRenderer's PointLightGPU
+    /// avoids the same way).
+    private struct QuadInstance {
+        var ox: Float = 0, oy: Float = 0, sx: Float = 0, sy: Float = 0
+        var r: Float = 0, g: Float = 0, b: Float = 0
+        var pw: Float = 0, ph: Float = 0
+    }
+
+    // Depth-dim ladder (VISION §Experience 2: each level progressively dimmer).
+    // Base tile hue is a cool finviz-panel blue; brightness = base · k^dimLevel.
+    // dimLevel 0 (focus) is brightest but mostly hidden under its children, so
+    // the VISIBLE gradient is "top-level folders bright → deeper dimmer".
+    private static let baseTileColor = SIMD3<Float>(0.42, 0.60, 0.84)
+    private static let dimFalloff: Float = 0.74
+    private static let background = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+    private let device: MTLDevice
+    private let queue: MTLCommandQueue
+    private let pipeline: MTLRenderPipelineState
+
+    /// - Parameters:
+    ///   - pixelFormat: the target color format (the layer's / offscreen
+    ///     texture's — both `.bgra8Unorm` in TZ-1).
+    ///   - shaderSource: contents of Shaders.metal. Passed in (not read from a
+    ///     Bundle) so the App reads it from its bundle Resources while
+    ///     verify_host reads it straight from Sources/App — the renderer has NO
+    ///     Bundle dependency. Returns nil if Metal setup fails.
+    init?(device: MTLDevice, pixelFormat: MTLPixelFormat, shaderSource: String) {
+        self.device = device
+        guard let queue = device.makeCommandQueue() else { return nil }
+        self.queue = queue
+
+        let library: MTLLibrary
+        do {
+            library = try device.makeLibrary(source: shaderSource, options: nil)
+        } catch {
+            NSLog("QuadRenderer: shader compile failed: \(error)")
+            return nil
+        }
+        guard let vfn = library.makeFunction(name: "quad_vertex"),
+              let ffn = library.makeFunction(name: "quad_fragment") else {
+            NSLog("QuadRenderer: missing shader function(s)")
+            return nil
+        }
+        let pd = MTLRenderPipelineDescriptor()
+        pd.label = "TreemapQuadPass"
+        pd.vertexFunction = vfn
+        pd.fragmentFunction = ffn
+        pd.colorAttachments[0].pixelFormat = pixelFormat
+        do {
+            self.pipeline = try device.makeRenderPipelineState(descriptor: pd)
+        } catch {
+            NSLog("QuadRenderer: pipeline creation failed: \(error)")
+            return nil
+        }
+    }
+
+    // MARK: - Entry points
+
+    /// Live path: render `tiles` into the layer's next drawable. `tiles` must be
+    /// laid out in the SAME pixel space as `layer.drawableSize`.
+    func render(tiles: [TileRect], to layer: CAMetalLayer) {
+        let ds = layer.drawableSize
+        guard ds.width > 0, ds.height > 0,
+              let drawable = layer.nextDrawable(),
+              let cmd = queue.makeCommandBuffer() else { return }
+        encode(tiles: tiles, into: drawable.texture,
+               pixelWidth: Double(ds.width), pixelHeight: Double(ds.height), cmd: cmd)
+        cmd.present(drawable)
+        cmd.commit()
+    }
+
+    /// Offscreen seam (verify.sh / tests): render into `target` and BLOCK until
+    /// the GPU finishes. Deterministic — no time input, pure function of `tiles`.
+    /// `tiles` must be laid out in `target`'s pixel space.
+    func renderSynchronously(tiles: [TileRect], into target: MTLTexture) {
+        guard let cmd = queue.makeCommandBuffer() else { return }
+        encode(tiles: tiles, into: target,
+               pixelWidth: Double(target.width), pixelHeight: Double(target.height), cmd: cmd)
+        cmd.commit()
+        cmd.waitUntilCompleted()
+    }
+
+    // MARK: - Encoding
+
+    /// Build instances from tiles and draw them in one instanced call. Tiles are
+    /// drawn in the order given — TreemapScene emits pre-order (parent before
+    /// children), which is exactly the painter's-algorithm order that leaves each
+    /// parent's inset border showing under its children.
+    private func encode(tiles: [TileRect], into target: MTLTexture,
+                        pixelWidth W: Double, pixelHeight H: Double, cmd: MTLCommandBuffer) {
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = target
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].storeAction = .store
+        pass.colorAttachments[0].clearColor = Self.background
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return }
+        enc.label = "TreemapQuadPass"
+        enc.setRenderPipelineState(pipeline)
+
+        var instances = [QuadInstance]()
+        instances.reserveCapacity(tiles.count)
+        for tile in tiles {
+            guard tile.rect.width > 0, tile.rect.height > 0 else { continue } // skip degenerate
+            let color = Self.baseTileColor * pow(Self.dimFalloff, Float(tile.dimLevel))
+            var q = QuadInstance()
+            // viewport (top-left origin, y-down, pixels) → NDC (y-up).
+            q.ox = Float(2.0 * tile.rect.x / W - 1.0)
+            q.oy = Float(1.0 - 2.0 * tile.rect.y / H)
+            q.sx = Float(2.0 * tile.rect.width / W)
+            q.sy = Float(-2.0 * tile.rect.height / H)
+            q.r = color.x; q.g = color.y; q.b = color.z
+            q.pw = Float(tile.rect.width)
+            q.ph = Float(tile.rect.height)
+            instances.append(q)
+        }
+
+        if !instances.isEmpty,
+           let buf = device.makeBuffer(bytes: instances,
+                                       length: instances.count * MemoryLayout<QuadInstance>.stride,
+                                       options: .storageModeShared) {
+            enc.setVertexBuffer(buf, offset: 0, index: 0)
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4,
+                               instanceCount: instances.count)
+        }
+        enc.endEncoding()
+    }
+}

@@ -1,0 +1,1989 @@
+{
+ "id": "root:Macintosh HD",
+ "name": "Macintosh HD",
+ "kind": "dir",
+ "allocatedBytes": 1026314240,
+ "logicalBytes": 1004592128,
+ "children": [
+  {
+   "id": "n028:System",
+   "name": "System",
+   "kind": "dir",
+   "allocatedBytes": 221003776,
+   "logicalBytes": 220967936,
+   "children": [
+    {
+     "id": "n001:System-f0",
+     "name": "System-f0",
+     "kind": "file",
+     "allocatedBytes": 147456,
+     "logicalBytes": 144384,
+     "children": [],
+     "scanState": "complete"
+    },
+    {
+     "id": "n014:System/1",
+     "name": "System/1",
+     "kind": "dir",
+     "allocatedBytes": 62693376,
+     "logicalBytes": 62679040,
+     "children": [
+      {
+       "id": "n006:System/1/0",
+       "name": "System/1/0",
+       "kind": "dir",
+       "allocatedBytes": 56942592,
+       "logicalBytes": 56935424,
+       "children": [
+        {
+         "id": "n002:System/1/0-f0",
+         "name": "System/1/0-f0",
+         "kind": "file",
+         "allocatedBytes": 13103104,
+         "logicalBytes": 13100032,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n003:System/1/0-f1",
+         "name": "System/1/0-f1",
+         "kind": "file",
+         "allocatedBytes": 24576,
+         "logicalBytes": 22528,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n004:System/1/0-f2",
+         "name": "System/1/0-f2",
+         "kind": "file",
+         "allocatedBytes": 25792512,
+         "logicalBytes": 25791488,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n005:System/1/0-f3",
+         "name": "System/1/0-f3",
+         "kind": "file",
+         "allocatedBytes": 18022400,
+         "logicalBytes": 18021376,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n012:System/1/1",
+       "name": "System/1/1",
+       "kind": "dir",
+       "allocatedBytes": 5701632,
+       "logicalBytes": 5697536,
+       "children": [
+        {
+         "id": "n007:System/1/1-f0",
+         "name": "System/1/1-f0",
+         "kind": "file",
+         "allocatedBytes": 4096,
+         "logicalBytes": 1024,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n008:System/1/1-f1",
+         "name": "System/1/1-f1",
+         "kind": "file",
+         "allocatedBytes": 143360,
+         "logicalBytes": 143360,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n009:System/1/1-f2",
+         "name": "System/1/1-f2",
+         "kind": "file",
+         "allocatedBytes": 73728,
+         "logicalBytes": 73728,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n010:System/1/1-f3",
+         "name": "System/1/1-f3",
+         "kind": "file",
+         "allocatedBytes": 3063808,
+         "logicalBytes": 3063808,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n011:System/1/1-f4",
+         "name": "System/1/1-f4",
+         "kind": "file",
+         "allocatedBytes": 2416640,
+         "logicalBytes": 2415616,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n013:System/1-f2",
+       "name": "System/1-f2",
+       "kind": "file",
+       "allocatedBytes": 49152,
+       "logicalBytes": 46080,
+       "children": [],
+       "scanState": "complete"
+      }
+     ],
+     "scanState": "complete"
+    },
+    {
+     "id": "n015:System-f2",
+     "name": "System-f2",
+     "kind": "file",
+     "allocatedBytes": 7303168,
+     "logicalBytes": 7301120,
+     "children": [],
+     "scanState": "complete"
+    },
+    {
+     "id": "n027:System/3",
+     "name": "System/3",
+     "kind": "dir",
+     "allocatedBytes": 150859776,
+     "logicalBytes": 150843392,
+     "children": [
+      {
+       "id": "n021:System/3/0",
+       "name": "System/3/0",
+       "kind": "dir",
+       "allocatedBytes": 80986112,
+       "logicalBytes": 80976896,
+       "children": [
+        {
+         "id": "n016:System/3/0-f0",
+         "name": "System/3/0-f0",
+         "kind": "file",
+         "allocatedBytes": 16486400,
+         "logicalBytes": 16484352,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n017:System/3/0-f1",
+         "name": "System/3/0-f1",
+         "kind": "file",
+         "allocatedBytes": 737280,
+         "logicalBytes": 734208,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n018:System/3/0-f2",
+         "name": "System/3/0-f2",
+         "kind": "file",
+         "allocatedBytes": 28594176,
+         "logicalBytes": 28592128,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n019:System/3/0-f3",
+         "name": "System/3/0-f3",
+         "kind": "file",
+         "allocatedBytes": 35123200,
+         "logicalBytes": 35121152,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n020:System/3/0-f4",
+         "name": "System/3/0-f4",
+         "kind": "file",
+         "allocatedBytes": 45056,
+         "logicalBytes": 45056,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n026:System/3/1",
+       "name": "System/3/1",
+       "kind": "dir",
+       "allocatedBytes": 69873664,
+       "logicalBytes": 69866496,
+       "children": [
+        {
+         "id": "n022:System/3/1-f0",
+         "name": "System/3/1-f0",
+         "kind": "file",
+         "allocatedBytes": 512000,
+         "logicalBytes": 510976,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n023:System/3/1-f1",
+         "name": "System/3/1-f1",
+         "kind": "file",
+         "allocatedBytes": 37097472,
+         "logicalBytes": 37096448,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n024:System/3/1-f2",
+         "name": "System/3/1-f2",
+         "kind": "file",
+         "allocatedBytes": 147456,
+         "logicalBytes": 145408,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n025:System/3/1-f3",
+         "name": "System/3/1-f3",
+         "kind": "file",
+         "allocatedBytes": 32116736,
+         "logicalBytes": 32113664,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      }
+     ],
+     "scanState": "complete"
+    }
+   ],
+   "scanState": "complete"
+  },
+  {
+   "id": "n069:Library",
+   "name": "Library",
+   "kind": "dir",
+   "allocatedBytes": 175546368,
+   "logicalBytes": 175490048,
+   "children": [
+    {
+     "id": "n029:Library-f0",
+     "name": "Library-f0",
+     "kind": "file",
+     "allocatedBytes": 114688,
+     "logicalBytes": 112640,
+     "children": [],
+     "scanState": "complete"
+    },
+    {
+     "id": "n030:Library-f1",
+     "name": "Library-f1",
+     "kind": "file",
+     "allocatedBytes": 73728,
+     "logicalBytes": 71680,
+     "children": [],
+     "scanState": "complete"
+    },
+    {
+     "id": "n038:Library/2",
+     "name": "Library/2",
+     "kind": "dir",
+     "allocatedBytes": 64970752,
+     "logicalBytes": 64961536,
+     "children": [
+      {
+       "id": "n031:Library/2-0.app",
+       "name": "Library/2-0.app",
+       "kind": "bundleLeaf",
+       "allocatedBytes": 30973952,
+       "logicalBytes": 30970880,
+       "children": [],
+       "scanState": "complete"
+      },
+      {
+       "id": "n032:Library/2-1.app",
+       "name": "Library/2-1.app",
+       "kind": "bundleLeaf",
+       "allocatedBytes": 2052096,
+       "logicalBytes": 2050048,
+       "children": [],
+       "scanState": "complete"
+      },
+      {
+       "id": "n037:Library/2/2",
+       "name": "Library/2/2",
+       "kind": "dir",
+       "allocatedBytes": 31944704,
+       "logicalBytes": 31940608,
+       "children": [
+        {
+         "id": "n033:Library/2/2-f0",
+         "name": "Library/2/2-f0",
+         "kind": "file",
+         "allocatedBytes": 20480,
+         "logicalBytes": 19456,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n034:Library/2/2-f1",
+         "name": "Library/2/2-f1",
+         "kind": "file",
+         "allocatedBytes": 8081408,
+         "logicalBytes": 8080384,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n035:Library/2/2-f2",
+         "name": "Library/2/2-f2",
+         "kind": "file",
+         "allocatedBytes": 23711744,
+         "logicalBytes": 23710720,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n036:Library/2/2-f3",
+         "name": "Library/2/2-f3",
+         "kind": "file",
+         "allocatedBytes": 131072,
+         "logicalBytes": 130048,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      }
+     ],
+     "scanState": "complete"
+    },
+    {
+     "id": "n039:Library-f3",
+     "name": "Library-f3",
+     "kind": "file",
+     "allocatedBytes": 4096,
+     "logicalBytes": 1024,
+     "children": [],
+     "scanState": "complete"
+    },
+    {
+     "id": "n052:Library/4",
+     "name": "Library/4",
+     "kind": "dir",
+     "allocatedBytes": 31019008,
+     "logicalBytes": 31005696,
+     "children": [
+      {
+       "id": "n040:Library/4-f0",
+       "name": "Library/4-f0",
+       "kind": "file",
+       "allocatedBytes": 57344,
+       "logicalBytes": 55296,
+       "children": [],
+       "scanState": "complete"
+      },
+      {
+       "id": "n041:Library/4-f1",
+       "name": "Library/4-f1",
+       "kind": "file",
+       "allocatedBytes": 557056,
+       "logicalBytes": 555008,
+       "children": [],
+       "scanState": "complete"
+      },
+      {
+       "id": "n047:Library/4/2",
+       "name": "Library/4/2",
+       "kind": "dir",
+       "allocatedBytes": 18694144,
+       "logicalBytes": 18690048,
+       "children": [
+        {
+         "id": "n042:Library/4/2-f0",
+         "name": "Library/4/2-f0",
+         "kind": "file",
+         "allocatedBytes": 135168,
+         "logicalBytes": 135168,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n043:Library/4/2-f1",
+         "name": "Library/4/2-f1",
+         "kind": "file",
+         "allocatedBytes": 8192,
+         "logicalBytes": 6144,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n044:Library/4/2-f2",
+         "name": "Library/4/2-f2",
+         "kind": "file",
+         "allocatedBytes": 2674688,
+         "logicalBytes": 2673664,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n045:Library/4/2-f3",
+         "name": "Library/4/2-f3",
+         "kind": "file",
+         "allocatedBytes": 15626240,
+         "logicalBytes": 15626240,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n046:Library/4/2-f4",
+         "name": "Library/4/2-f4",
+         "kind": "file",
+         "allocatedBytes": 249856,
+         "logicalBytes": 248832,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n050:Library/4/3",
+       "name": "Library/4/3",
+       "kind": "dir",
+       "allocatedBytes": 2424832,
+       "logicalBytes": 2420736,
+       "children": [
+        {
+         "id": "n048:Library/4/3-f0",
+         "name": "Library/4/3-f0",
+         "kind": "file",
+         "allocatedBytes": 20480,
+         "logicalBytes": 17408,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n049:Library/4/3-f1",
+         "name": "Library/4/3-f1",
+         "kind": "file",
+         "allocatedBytes": 2404352,
+         "logicalBytes": 2403328,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n051:Library/4-f4",
+       "name": "Library/4-f4",
+       "kind": "file",
+       "allocatedBytes": 9285632,
+       "logicalBytes": 9284608,
+       "children": [],
+       "scanState": "complete"
+      }
+     ],
+     "scanState": "complete"
+    },
+    {
+     "id": "n065:Library/5",
+     "name": "Library/5",
+     "kind": "dir",
+     "allocatedBytes": 59830272,
+     "logicalBytes": 59808768,
+     "children": [
+      {
+       "id": "n057:Library/5/0",
+       "name": "Library/5/0",
+       "kind": "dir",
+       "allocatedBytes": 954368,
+       "logicalBytes": 944128,
+       "children": [
+        {
+         "id": "n053:Library/5/0-f0",
+         "name": "Library/5/0-f0",
+         "kind": "file",
+         "allocatedBytes": 24576,
+         "logicalBytes": 22528,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n054:Library/5/0-f1",
+         "name": "Library/5/0-f1",
+         "kind": "file",
+         "allocatedBytes": 4096,
+         "logicalBytes": 1024,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n055:Library/5/0-f2",
+         "name": "Library/5/0-f2",
+         "kind": "file",
+         "allocatedBytes": 757760,
+         "logicalBytes": 755712,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n056:Library/5/0-f3",
+         "name": "Library/5/0-f3",
+         "kind": "file",
+         "allocatedBytes": 167936,
+         "logicalBytes": 164864,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n058:Library/5-f1",
+       "name": "Library/5-f1",
+       "kind": "file",
+       "allocatedBytes": 27090944,
+       "logicalBytes": 27088896,
+       "children": [],
+       "scanState": "complete"
+      },
+      {
+       "id": "n059:Library/5-f2",
+       "name": "Library/5-f2",
+       "kind": "file",
+       "allocatedBytes": 24576,
+       "logicalBytes": 22528,
+       "children": [],
+       "scanState": "complete"
+      },
+      {
+       "id": "n064:Library/5/3",
+       "name": "Library/5/3",
+       "kind": "dir",
+       "allocatedBytes": 31760384,
+       "logicalBytes": 31753216,
+       "children": [
+        {
+         "id": "n060:Library/5/3-f0",
+         "name": "Library/5/3-f0",
+         "kind": "file",
+         "allocatedBytes": 31662080,
+         "logicalBytes": 31661056,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n061:Library/5/3-f1",
+         "name": "Library/5/3-f1",
+         "kind": "file",
+         "allocatedBytes": 24576,
+         "logicalBytes": 24576,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n062:Library/5/3-f2",
+         "name": "Library/5/3-f2",
+         "kind": "file",
+         "allocatedBytes": 69632,
+         "logicalBytes": 66560,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n063:Library/5/3-f3",
+         "name": "Library/5/3-f3",
+         "kind": "file",
+         "allocatedBytes": 4096,
+         "logicalBytes": 1024,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      }
+     ],
+     "scanState": "complete"
+    },
+    {
+     "id": "n068:Library/6",
+     "name": "Library/6",
+     "kind": "dir",
+     "allocatedBytes": 19533824,
+     "logicalBytes": 19528704,
+     "children": [
+      {
+       "id": "n066:Library/6-f0",
+       "name": "Library/6-f0",
+       "kind": "file",
+       "allocatedBytes": 1482752,
+       "logicalBytes": 1480704,
+       "children": [],
+       "scanState": "complete"
+      },
+      {
+       "id": "n067:Library/6-f1",
+       "name": "Library/6-f1",
+       "kind": "file",
+       "allocatedBytes": 18051072,
+       "logicalBytes": 18048000,
+       "children": [],
+       "scanState": "complete"
+      }
+     ],
+     "scanState": "complete"
+    },
+    {
+     "id": "n214:Caches-pending",
+     "name": "Caches-pending",
+     "kind": "pending",
+     "allocatedBytes": 0,
+     "logicalBytes": 0,
+     "children": [],
+     "scanState": "pending"
+    }
+   ],
+   "scanState": "complete"
+  },
+  {
+   "id": "n102:Users",
+   "name": "Users",
+   "kind": "dir",
+   "allocatedBytes": 113401856,
+   "logicalBytes": 91914240,
+   "children": [
+    {
+     "id": "n081:Users/0",
+     "name": "Users/0",
+     "kind": "dir",
+     "allocatedBytes": 57479168,
+     "logicalBytes": 57460736,
+     "children": [
+      {
+       "id": "n075:Users/0/0",
+       "name": "Users/0/0",
+       "kind": "dir",
+       "allocatedBytes": 44408832,
+       "logicalBytes": 44398592,
+       "children": [
+        {
+         "id": "n070:Users/0/0-f0",
+         "name": "Users/0/0-f0",
+         "kind": "file",
+         "allocatedBytes": 24584192,
+         "logicalBytes": 24581120,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n071:Users/0/0-f1",
+         "name": "Users/0/0-f1",
+         "kind": "file",
+         "allocatedBytes": 45056,
+         "logicalBytes": 43008,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n072:Users/0/0-f2",
+         "name": "Users/0/0-f2",
+         "kind": "file",
+         "allocatedBytes": 2359296,
+         "logicalBytes": 2357248,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n073:Users/0/0-f3",
+         "name": "Users/0/0-f3",
+         "kind": "file",
+         "allocatedBytes": 2523136,
+         "logicalBytes": 2522112,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n074:Users/0/0-f4",
+         "name": "Users/0/0-f4",
+         "kind": "file",
+         "allocatedBytes": 14897152,
+         "logicalBytes": 14895104,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n080:Users/0/1",
+       "name": "Users/0/1",
+       "kind": "dir",
+       "allocatedBytes": 13070336,
+       "logicalBytes": 13062144,
+       "children": [
+        {
+         "id": "n076:Users/0/1-f0",
+         "name": "Users/0/1-f0",
+         "kind": "file",
+         "allocatedBytes": 9084928,
+         "logicalBytes": 9083904,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n077:Users/0/1-f1",
+         "name": "Users/0/1-f1",
+         "kind": "file",
+         "allocatedBytes": 1748992,
+         "logicalBytes": 1746944,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n078:Users/0/1-f2",
+         "name": "Users/0/1-f2",
+         "kind": "file",
+         "allocatedBytes": 2232320,
+         "logicalBytes": 2230272,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n079:Users/0/1-f3",
+         "name": "Users/0/1-f3",
+         "kind": "file",
+         "allocatedBytes": 4096,
+         "logicalBytes": 1024,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      }
+     ],
+     "scanState": "complete"
+    },
+    {
+     "id": "n089:Users/1",
+     "name": "Users/1",
+     "kind": "dir",
+     "allocatedBytes": 7397376,
+     "logicalBytes": 7387136,
+     "children": [
+      {
+       "id": "n084:Users/1/0",
+       "name": "Users/1/0",
+       "kind": "dir",
+       "allocatedBytes": 3244032,
+       "logicalBytes": 3241984,
+       "children": [
+        {
+         "id": "n082:Users/1/0-f0",
+         "name": "Users/1/0-f0",
+         "kind": "file",
+         "allocatedBytes": 3239936,
+         "logicalBytes": 3237888,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n083:Users/1/0-f1",
+         "name": "Users/1/0-f1",
+         "kind": "file",
+         "allocatedBytes": 4096,
+         "logicalBytes": 4096,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n088:Users/1/1",
+       "name": "Users/1/1",
+       "kind": "dir",
+       "allocatedBytes": 4153344,
+       "logicalBytes": 4145152,
+       "children": [
+        {
+         "id": "n085:Users/1/1-f0",
+         "name": "Users/1/1-f0",
+         "kind": "file",
+         "allocatedBytes": 1544192,
+         "logicalBytes": 1542144,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n086:Users/1/1-f1",
+         "name": "Users/1/1-f1",
+         "kind": "file",
+         "allocatedBytes": 8192,
+         "logicalBytes": 5120,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n087:Users/1/1-f2",
+         "name": "Users/1/1-f2",
+         "kind": "file",
+         "allocatedBytes": 2600960,
+         "logicalBytes": 2597888,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      }
+     ],
+     "scanState": "complete"
+    },
+    {
+     "id": "n099:Users/2",
+     "name": "Users/2",
+     "kind": "dir",
+     "allocatedBytes": 25702400,
+     "logicalBytes": 25694208,
+     "children": [
+      {
+       "id": "n092:Users/2/0",
+       "name": "Users/2/0",
+       "kind": "dir",
+       "allocatedBytes": 2920448,
+       "logicalBytes": 2916352,
+       "children": [
+        {
+         "id": "n090:Users/2/0-f0",
+         "name": "Users/2/0-f0",
+         "kind": "file",
+         "allocatedBytes": 2756608,
+         "logicalBytes": 2753536,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n091:Users/2/0-f1",
+         "name": "Users/2/0-f1",
+         "kind": "file",
+         "allocatedBytes": 163840,
+         "logicalBytes": 162816,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n098:Users/2/1",
+       "name": "Users/2/1",
+       "kind": "dir",
+       "allocatedBytes": 22781952,
+       "logicalBytes": 22777856,
+       "children": [
+        {
+         "id": "n093:Users/2/1-f0",
+         "name": "Users/2/1-f0",
+         "kind": "file",
+         "allocatedBytes": 4096,
+         "logicalBytes": 3072,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n094:Users/2/1-f1",
+         "name": "Users/2/1-f1",
+         "kind": "file",
+         "allocatedBytes": 1331200,
+         "logicalBytes": 1331200,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n095:Users/2/1-f2",
+         "name": "Users/2/1-f2",
+         "kind": "file",
+         "allocatedBytes": 16252928,
+         "logicalBytes": 16252928,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n096:Users/2/1-f3",
+         "name": "Users/2/1-f3",
+         "kind": "file",
+         "allocatedBytes": 4616192,
+         "logicalBytes": 4616192,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n097:Users/2/1-f4",
+         "name": "Users/2/1-f4",
+         "kind": "file",
+         "allocatedBytes": 577536,
+         "logicalBytes": 574464,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      }
+     ],
+     "scanState": "complete"
+    },
+    {
+     "id": "n100:Users-f3",
+     "name": "Users-f3",
+     "kind": "file",
+     "allocatedBytes": 1118208,
+     "logicalBytes": 1116160,
+     "children": [],
+     "scanState": "complete"
+    },
+    {
+     "id": "n101:Users-f4",
+     "name": "Users-f4",
+     "kind": "file",
+     "allocatedBytes": 258048,
+     "logicalBytes": 256000,
+     "children": [],
+     "scanState": "complete"
+    },
+    {
+     "id": "n213:otheruser",
+     "name": "otheruser",
+     "kind": "denied",
+     "allocatedBytes": 21446656,
+     "logicalBytes": 0,
+     "children": [],
+     "scanState": "complete"
+    }
+   ],
+   "scanState": "complete"
+  },
+  {
+   "id": "n124:Applications",
+   "name": "Applications",
+   "kind": "dir",
+   "allocatedBytes": 57929728,
+   "logicalBytes": 57901056,
+   "children": [
+    {
+     "id": "n103:Applications-f0",
+     "name": "Applications-f0",
+     "kind": "file",
+     "allocatedBytes": 4096,
+     "logicalBytes": 4096,
+     "children": [],
+     "scanState": "complete"
+    },
+    {
+     "id": "n104:Applications-f1",
+     "name": "Applications-f1",
+     "kind": "file",
+     "allocatedBytes": 16384,
+     "logicalBytes": 16384,
+     "children": [],
+     "scanState": "complete"
+    },
+    {
+     "id": "n105:Applications-f2",
+     "name": "Applications-f2",
+     "kind": "file",
+     "allocatedBytes": 36864,
+     "logicalBytes": 35840,
+     "children": [],
+     "scanState": "complete"
+    },
+    {
+     "id": "n123:Applications/3",
+     "name": "Applications/3",
+     "kind": "dir",
+     "allocatedBytes": 57872384,
+     "logicalBytes": 57844736,
+     "children": [
+      {
+       "id": "n111:Applications/3/0",
+       "name": "Applications/3/0",
+       "kind": "dir",
+       "allocatedBytes": 22425600,
+       "logicalBytes": 22412288,
+       "children": [
+        {
+         "id": "n106:Applications/3/0-f0",
+         "name": "Applications/3/0-f0",
+         "kind": "file",
+         "allocatedBytes": 450560,
+         "logicalBytes": 447488,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n107:Applications/3/0-f1",
+         "name": "Applications/3/0-f1",
+         "kind": "file",
+         "allocatedBytes": 643072,
+         "logicalBytes": 640000,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n108:Applications/3/0-f2",
+         "name": "Applications/3/0-f2",
+         "kind": "file",
+         "allocatedBytes": 147456,
+         "logicalBytes": 144384,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n109:Applications/3/0-f3",
+         "name": "Applications/3/0-f3",
+         "kind": "file",
+         "allocatedBytes": 7671808,
+         "logicalBytes": 7670784,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n110:Applications/3/0-f4",
+         "name": "Applications/3/0-f4",
+         "kind": "file",
+         "allocatedBytes": 13512704,
+         "logicalBytes": 13509632,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n116:Applications/3/1",
+       "name": "Applications/3/1",
+       "kind": "dir",
+       "allocatedBytes": 516096,
+       "logicalBytes": 506880,
+       "children": [
+        {
+         "id": "n112:Applications/3/1-f0",
+         "name": "Applications/3/1-f0",
+         "kind": "file",
+         "allocatedBytes": 487424,
+         "logicalBytes": 487424,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n113:Applications/3/1-f1",
+         "name": "Applications/3/1-f1",
+         "kind": "file",
+         "allocatedBytes": 4096,
+         "logicalBytes": 1024,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n114:Applications/3/1-f2",
+         "name": "Applications/3/1-f2",
+         "kind": "file",
+         "allocatedBytes": 4096,
+         "logicalBytes": 1024,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n115:Applications/3/1-f3",
+         "name": "Applications/3/1-f3",
+         "kind": "file",
+         "allocatedBytes": 20480,
+         "logicalBytes": 17408,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n122:Applications/3/2",
+       "name": "Applications/3/2",
+       "kind": "dir",
+       "allocatedBytes": 34930688,
+       "logicalBytes": 34925568,
+       "children": [
+        {
+         "id": "n117:Applications/3/2-f0",
+         "name": "Applications/3/2-f0",
+         "kind": "file",
+         "allocatedBytes": 10895360,
+         "logicalBytes": 10895360,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n118:Applications/3/2-f1",
+         "name": "Applications/3/2-f1",
+         "kind": "file",
+         "allocatedBytes": 23871488,
+         "logicalBytes": 23869440,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n119:Applications/3/2-f2",
+         "name": "Applications/3/2-f2",
+         "kind": "file",
+         "allocatedBytes": 81920,
+         "logicalBytes": 80896,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n120:Applications/3/2-f3",
+         "name": "Applications/3/2-f3",
+         "kind": "file",
+         "allocatedBytes": 69632,
+         "logicalBytes": 69632,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n121:Applications/3/2-f4",
+         "name": "Applications/3/2-f4",
+         "kind": "file",
+         "allocatedBytes": 12288,
+         "logicalBytes": 10240,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      }
+     ],
+     "scanState": "complete"
+    }
+   ],
+   "scanState": "complete"
+  },
+  {
+   "id": "n158:private",
+   "name": "private",
+   "kind": "dir",
+   "allocatedBytes": 189542400,
+   "logicalBytes": 189501440,
+   "children": [
+    {
+     "id": "n125:private-0.app",
+     "name": "private-0.app",
+     "kind": "bundleLeaf",
+     "allocatedBytes": 4096,
+     "logicalBytes": 2048,
+     "children": [],
+     "scanState": "complete"
+    },
+    {
+     "id": "n138:private/1",
+     "name": "private/1",
+     "kind": "dir",
+     "allocatedBytes": 83742720,
+     "logicalBytes": 83725312,
+     "children": [
+      {
+       "id": "n131:private/1/0",
+       "name": "private/1/0",
+       "kind": "dir",
+       "allocatedBytes": 21135360,
+       "logicalBytes": 21126144,
+       "children": [
+        {
+         "id": "n126:private/1/0-f0",
+         "name": "private/1/0-f0",
+         "kind": "file",
+         "allocatedBytes": 86016,
+         "logicalBytes": 84992,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n127:private/1/0-f1",
+         "name": "private/1/0-f1",
+         "kind": "file",
+         "allocatedBytes": 4096,
+         "logicalBytes": 1024,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n128:private/1/0-f2",
+         "name": "private/1/0-f2",
+         "kind": "file",
+         "allocatedBytes": 376832,
+         "logicalBytes": 374784,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n129:private/1/0-f3",
+         "name": "private/1/0-f3",
+         "kind": "file",
+         "allocatedBytes": 19374080,
+         "logicalBytes": 19373056,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n130:private/1/0-f4",
+         "name": "private/1/0-f4",
+         "kind": "file",
+         "allocatedBytes": 1294336,
+         "logicalBytes": 1292288,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n137:private/1/1",
+       "name": "private/1/1",
+       "kind": "dir",
+       "allocatedBytes": 62607360,
+       "logicalBytes": 62599168,
+       "children": [
+        {
+         "id": "n132:private/1/1-f0",
+         "name": "private/1/1-f0",
+         "kind": "file",
+         "allocatedBytes": 8798208,
+         "logicalBytes": 8795136,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n133:private/1/1-f1",
+         "name": "private/1/1-f1",
+         "kind": "file",
+         "allocatedBytes": 13131776,
+         "logicalBytes": 13131776,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n134:private/1/1-f2",
+         "name": "private/1/1-f2",
+         "kind": "file",
+         "allocatedBytes": 49152,
+         "logicalBytes": 48128,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n135:private/1/1-f3",
+         "name": "private/1/1-f3",
+         "kind": "file",
+         "allocatedBytes": 40570880,
+         "logicalBytes": 40569856,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n136:private/1/1-f4",
+         "name": "private/1/1-f4",
+         "kind": "file",
+         "allocatedBytes": 57344,
+         "logicalBytes": 54272,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      }
+     ],
+     "scanState": "complete"
+    },
+    {
+     "id": "n139:private-f2",
+     "name": "private-f2",
+     "kind": "file",
+     "allocatedBytes": 4096,
+     "logicalBytes": 2048,
+     "children": [],
+     "scanState": "complete"
+    },
+    {
+     "id": "n145:private/3",
+     "name": "private/3",
+     "kind": "dir",
+     "allocatedBytes": 44146688,
+     "logicalBytes": 44140544,
+     "children": [
+      {
+       "id": "n143:private/3/0",
+       "name": "private/3/0",
+       "kind": "dir",
+       "allocatedBytes": 12939264,
+       "logicalBytes": 12936192,
+       "children": [
+        {
+         "id": "n140:private/3/0-f0",
+         "name": "private/3/0-f0",
+         "kind": "file",
+         "allocatedBytes": 4173824,
+         "logicalBytes": 4173824,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n141:private/3/0-f1",
+         "name": "private/3/0-f1",
+         "kind": "file",
+         "allocatedBytes": 172032,
+         "logicalBytes": 172032,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n142:private/3/0-f2",
+         "name": "private/3/0-f2",
+         "kind": "file",
+         "allocatedBytes": 8593408,
+         "logicalBytes": 8590336,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n144:private/3-f1",
+       "name": "private/3-f1",
+       "kind": "file",
+       "allocatedBytes": 31207424,
+       "logicalBytes": 31204352,
+       "children": [],
+       "scanState": "complete"
+      }
+     ],
+     "scanState": "complete"
+    },
+    {
+     "id": "n156:private/4",
+     "name": "private/4",
+     "kind": "dir",
+     "allocatedBytes": 61632512,
+     "logicalBytes": 61622272,
+     "children": [
+      {
+       "id": "n149:private/4/0",
+       "name": "private/4/0",
+       "kind": "dir",
+       "allocatedBytes": 22843392,
+       "logicalBytes": 22842368,
+       "children": [
+        {
+         "id": "n146:private/4/0-f0",
+         "name": "private/4/0-f0",
+         "kind": "file",
+         "allocatedBytes": 299008,
+         "logicalBytes": 297984,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n147:private/4/0-f1",
+         "name": "private/4/0-f1",
+         "kind": "file",
+         "allocatedBytes": 24576,
+         "logicalBytes": 24576,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n148:private/4/0-f2",
+         "name": "private/4/0-f2",
+         "kind": "file",
+         "allocatedBytes": 22519808,
+         "logicalBytes": 22519808,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n154:private/4/1",
+       "name": "private/4/1",
+       "kind": "dir",
+       "allocatedBytes": 23302144,
+       "logicalBytes": 23293952,
+       "children": [
+        {
+         "id": "n150:private/4/1-f0",
+         "name": "private/4/1-f0",
+         "kind": "file",
+         "allocatedBytes": 28672,
+         "logicalBytes": 25600,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n151:private/4/1-f1",
+         "name": "private/4/1-f1",
+         "kind": "file",
+         "allocatedBytes": 8192,
+         "logicalBytes": 5120,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n152:private/4/1-f2",
+         "name": "private/4/1-f2",
+         "kind": "file",
+         "allocatedBytes": 6868992,
+         "logicalBytes": 6868992,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n153:private/4/1-f3",
+         "name": "private/4/1-f3",
+         "kind": "file",
+         "allocatedBytes": 16396288,
+         "logicalBytes": 16394240,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n155:private/4-f2",
+       "name": "private/4-f2",
+       "kind": "file",
+       "allocatedBytes": 15486976,
+       "logicalBytes": 15485952,
+       "children": [],
+       "scanState": "complete"
+      }
+     ],
+     "scanState": "complete"
+    },
+    {
+     "id": "n157:private-f5",
+     "name": "private-f5",
+     "kind": "file",
+     "allocatedBytes": 12288,
+     "logicalBytes": 9216,
+     "children": [],
+     "scanState": "complete"
+    }
+   ],
+   "scanState": "complete"
+  },
+  {
+   "id": "n212:opt",
+   "name": "opt",
+   "kind": "dir",
+   "allocatedBytes": 268890112,
+   "logicalBytes": 268817408,
+   "children": [
+    {
+     "id": "n159:opt-0.app",
+     "name": "opt-0.app",
+     "kind": "bundleLeaf",
+     "allocatedBytes": 348160,
+     "logicalBytes": 348160,
+     "children": [],
+     "scanState": "complete"
+    },
+    {
+     "id": "n160:opt-f1",
+     "name": "opt-f1",
+     "kind": "file",
+     "allocatedBytes": 40071168,
+     "logicalBytes": 40071168,
+     "children": [],
+     "scanState": "complete"
+    },
+    {
+     "id": "n188:opt/2",
+     "name": "opt/2",
+     "kind": "dir",
+     "allocatedBytes": 173039616,
+     "logicalBytes": 173005824,
+     "children": [
+      {
+       "id": "n166:opt/2/0",
+       "name": "opt/2/0",
+       "kind": "dir",
+       "allocatedBytes": 9932800,
+       "logicalBytes": 9926656,
+       "children": [
+        {
+         "id": "n161:opt/2/0-f0",
+         "name": "opt/2/0-f0",
+         "kind": "file",
+         "allocatedBytes": 8437760,
+         "logicalBytes": 8437760,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n162:opt/2/0-f1",
+         "name": "opt/2/0-f1",
+         "kind": "file",
+         "allocatedBytes": 147456,
+         "logicalBytes": 146432,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n163:opt/2/0-f2",
+         "name": "opt/2/0-f2",
+         "kind": "file",
+         "allocatedBytes": 40960,
+         "logicalBytes": 40960,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n164:opt/2/0-f3",
+         "name": "opt/2/0-f3",
+         "kind": "file",
+         "allocatedBytes": 102400,
+         "logicalBytes": 100352,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n165:opt/2/0-f4",
+         "name": "opt/2/0-f4",
+         "kind": "file",
+         "allocatedBytes": 1204224,
+         "logicalBytes": 1201152,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n171:opt/2/1",
+       "name": "opt/2/1",
+       "kind": "dir",
+       "allocatedBytes": 52473856,
+       "logicalBytes": 52468736,
+       "children": [
+        {
+         "id": "n167:opt/2/1-f0",
+         "name": "opt/2/1-f0",
+         "kind": "file",
+         "allocatedBytes": 27410432,
+         "logicalBytes": 27409408,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n168:opt/2/1-f1",
+         "name": "opt/2/1-f1",
+         "kind": "file",
+         "allocatedBytes": 15020032,
+         "logicalBytes": 15020032,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n169:opt/2/1-f2",
+         "name": "opt/2/1-f2",
+         "kind": "file",
+         "allocatedBytes": 204800,
+         "logicalBytes": 203776,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n170:opt/2/1-f3",
+         "name": "opt/2/1-f3",
+         "kind": "file",
+         "allocatedBytes": 9838592,
+         "logicalBytes": 9835520,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n176:opt/2/2",
+       "name": "opt/2/2",
+       "kind": "dir",
+       "allocatedBytes": 38944768,
+       "logicalBytes": 38936576,
+       "children": [
+        {
+         "id": "n172:opt/2/2-f0",
+         "name": "opt/2/2-f0",
+         "kind": "file",
+         "allocatedBytes": 4096,
+         "logicalBytes": 3072,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n173:opt/2/2-f1",
+         "name": "opt/2/2-f1",
+         "kind": "file",
+         "allocatedBytes": 36847616,
+         "logicalBytes": 36844544,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n174:opt/2/2-f2",
+         "name": "opt/2/2-f2",
+         "kind": "file",
+         "allocatedBytes": 2088960,
+         "logicalBytes": 2086912,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n175:opt/2/2-f3",
+         "name": "opt/2/2-f3",
+         "kind": "file",
+         "allocatedBytes": 4096,
+         "logicalBytes": 2048,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n181:opt/2/3",
+       "name": "opt/2/3",
+       "kind": "dir",
+       "allocatedBytes": 27365376,
+       "logicalBytes": 27358208,
+       "children": [
+        {
+         "id": "n177:opt/2/3-f0",
+         "name": "opt/2/3-f0",
+         "kind": "file",
+         "allocatedBytes": 24530944,
+         "logicalBytes": 24529920,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n178:opt/2/3-f1",
+         "name": "opt/2/3-f1",
+         "kind": "file",
+         "allocatedBytes": 2813952,
+         "logicalBytes": 2810880,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n179:opt/2/3-f2",
+         "name": "opt/2/3-f2",
+         "kind": "file",
+         "allocatedBytes": 12288,
+         "logicalBytes": 9216,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n180:opt/2/3-f3",
+         "name": "opt/2/3-f3",
+         "kind": "file",
+         "allocatedBytes": 8192,
+         "logicalBytes": 8192,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n187:opt/2/4",
+       "name": "opt/2/4",
+       "kind": "dir",
+       "allocatedBytes": 44322816,
+       "logicalBytes": 44315648,
+       "children": [
+        {
+         "id": "n182:opt/2/4-f0",
+         "name": "opt/2/4-f0",
+         "kind": "file",
+         "allocatedBytes": 180224,
+         "logicalBytes": 179200,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n183:opt/2/4-f1",
+         "name": "opt/2/4-f1",
+         "kind": "file",
+         "allocatedBytes": 43876352,
+         "logicalBytes": 43874304,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n184:opt/2/4-f2",
+         "name": "opt/2/4-f2",
+         "kind": "file",
+         "allocatedBytes": 8192,
+         "logicalBytes": 8192,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n185:opt/2/4-f3",
+         "name": "opt/2/4-f3",
+         "kind": "file",
+         "allocatedBytes": 225280,
+         "logicalBytes": 224256,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n186:opt/2/4-f4",
+         "name": "opt/2/4-f4",
+         "kind": "file",
+         "allocatedBytes": 32768,
+         "logicalBytes": 29696,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      }
+     ],
+     "scanState": "complete"
+    },
+    {
+     "id": "n189:opt-f3",
+     "name": "opt-f3",
+     "kind": "file",
+     "allocatedBytes": 5201920,
+     "logicalBytes": 5198848,
+     "children": [],
+     "scanState": "complete"
+    },
+    {
+     "id": "n193:opt/4",
+     "name": "opt/4",
+     "kind": "dir",
+     "allocatedBytes": 38346752,
+     "logicalBytes": 38338560,
+     "children": [
+      {
+       "id": "n190:opt/4-0.app",
+       "name": "opt/4-0.app",
+       "kind": "bundleLeaf",
+       "allocatedBytes": 143360,
+       "logicalBytes": 140288,
+       "children": [],
+       "scanState": "complete"
+      },
+      {
+       "id": "n191:opt/4-f1",
+       "name": "opt/4-f1",
+       "kind": "file",
+       "allocatedBytes": 20750336,
+       "logicalBytes": 20748288,
+       "children": [],
+       "scanState": "complete"
+      },
+      {
+       "id": "n192:opt/4-f2",
+       "name": "opt/4-f2",
+       "kind": "file",
+       "allocatedBytes": 17453056,
+       "logicalBytes": 17449984,
+       "children": [],
+       "scanState": "complete"
+      }
+     ],
+     "scanState": "complete"
+    },
+    {
+     "id": "n211:opt/5",
+     "name": "opt/5",
+     "kind": "dir",
+     "allocatedBytes": 11882496,
+     "logicalBytes": 11854848,
+     "children": [
+      {
+       "id": "n198:opt/5/0",
+       "name": "opt/5/0",
+       "kind": "dir",
+       "allocatedBytes": 643072,
+       "logicalBytes": 637952,
+       "children": [
+        {
+         "id": "n194:opt/5/0-f0",
+         "name": "opt/5/0-f0",
+         "kind": "file",
+         "allocatedBytes": 212992,
+         "logicalBytes": 210944,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n195:opt/5/0-f1",
+         "name": "opt/5/0-f1",
+         "kind": "file",
+         "allocatedBytes": 65536,
+         "logicalBytes": 64512,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n196:opt/5/0-f2",
+         "name": "opt/5/0-f2",
+         "kind": "file",
+         "allocatedBytes": 356352,
+         "logicalBytes": 354304,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n197:opt/5/0-f3",
+         "name": "opt/5/0-f3",
+         "kind": "file",
+         "allocatedBytes": 8192,
+         "logicalBytes": 8192,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n199:opt/5-f1",
+       "name": "opt/5-f1",
+       "kind": "file",
+       "allocatedBytes": 8605696,
+       "logicalBytes": 8602624,
+       "children": [],
+       "scanState": "complete"
+      },
+      {
+       "id": "n204:opt/5/2",
+       "name": "opt/5/2",
+       "kind": "dir",
+       "allocatedBytes": 36864,
+       "logicalBytes": 27648,
+       "children": [
+        {
+         "id": "n200:opt/5/2-f0",
+         "name": "opt/5/2-f0",
+         "kind": "file",
+         "allocatedBytes": 8192,
+         "logicalBytes": 5120,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n201:opt/5/2-f1",
+         "name": "opt/5/2-f1",
+         "kind": "file",
+         "allocatedBytes": 8192,
+         "logicalBytes": 5120,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n202:opt/5/2-f2",
+         "name": "opt/5/2-f2",
+         "kind": "file",
+         "allocatedBytes": 4096,
+         "logicalBytes": 2048,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n203:opt/5/2-f3",
+         "name": "opt/5/2-f3",
+         "kind": "file",
+         "allocatedBytes": 16384,
+         "logicalBytes": 15360,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      },
+      {
+       "id": "n210:opt/5/3",
+       "name": "opt/5/3",
+       "kind": "dir",
+       "allocatedBytes": 2596864,
+       "logicalBytes": 2586624,
+       "children": [
+        {
+         "id": "n205:opt/5/3-f0",
+         "name": "opt/5/3-f0",
+         "kind": "file",
+         "allocatedBytes": 24576,
+         "logicalBytes": 21504,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n206:opt/5/3-f1",
+         "name": "opt/5/3-f1",
+         "kind": "file",
+         "allocatedBytes": 180224,
+         "logicalBytes": 179200,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n207:opt/5/3-f2",
+         "name": "opt/5/3-f2",
+         "kind": "file",
+         "allocatedBytes": 4096,
+         "logicalBytes": 1024,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n208:opt/5/3-f3",
+         "name": "opt/5/3-f3",
+         "kind": "file",
+         "allocatedBytes": 2281472,
+         "logicalBytes": 2279424,
+         "children": [],
+         "scanState": "complete"
+        },
+        {
+         "id": "n209:opt/5/3-f4",
+         "name": "opt/5/3-f4",
+         "kind": "file",
+         "allocatedBytes": 106496,
+         "logicalBytes": 105472,
+         "children": [],
+         "scanState": "complete"
+        }
+       ],
+       "scanState": "complete"
+      }
+     ],
+     "scanState": "complete"
+    }
+   ],
+   "scanState": "complete"
+  }
+ ],
+ "scanState": "complete"
+}
