@@ -17,7 +17,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// CPU mirror: QuadRenderer.QuadInstance (9 contiguous floats, 36-byte stride).
+// CPU mirror: QuadRenderer.QuadInstance (10 contiguous floats, 40-byte stride).
 struct QuadInstance {
     float ox;   // origin x in NDC (top-left corner of the tile)
     float oy;   // origin y in NDC
@@ -28,6 +28,7 @@ struct QuadInstance {
     float b;
     float pw;   // tile width in device pixels (for the border band)
     float ph;   // tile height in device pixels
+    float kd;   // style code: 0 normal, 1 pending (outlined-dim), 2 denied
 };
 
 struct VOut {
@@ -35,6 +36,7 @@ struct VOut {
     float2 local;      // 0..1 within the tile
     float3 color;
     float2 pixelSize;  // tile size in device pixels
+    float  style;      // QuadInstance.kd, flat across the tile
 };
 
 // Unit quad as a triangle strip: vertex ids 0..3 → (0,0)(1,0)(0,1)(1,1).
@@ -49,19 +51,29 @@ vertex VOut quad_vertex(uint vid [[vertex_id]],
     o.local = corner;
     o.color = float3(q.r, q.g, q.b);
     o.pixelSize = float2(q.pw, q.ph);
+    o.style = q.kd;
     return o;
 }
 
 fragment float4 quad_fragment(VOut in [[stage_in]]) {
     float3 c = in.color;
-    // Thin darker border: darken pixels within 1px of any edge, but only when the
-    // tile is big enough that a border would not swallow it (slivers stay solid).
     float minSide = min(in.pixelSize.x, in.pixelSize.y);
-    if (minSide > 3.0) {
-        float2 p = in.local * in.pixelSize;                 // pixel coords in tile
-        float d = min(min(p.x, in.pixelSize.x - p.x),
-                      min(p.y, in.pixelSize.y - p.y));       // distance to nearest edge
-        if (d < 1.0) {
+    float2 p = in.local * in.pixelSize;                     // pixel coords in tile
+    float d = min(min(p.x, in.pixelSize.x - p.x),
+                  min(p.y, in.pixelSize.y - p.y));           // distance to nearest edge
+
+    if (in.style > 0.5 && in.style < 1.5) {
+        // PENDING (outlined-dim): dark fill with a BRIGHT outline so a not-yet
+        // -known region reads as an explicit placeholder, not empty canvas.
+        if (minSide > 3.0 && d < 1.5) {
+            c *= 2.2;                                        // bright edge
+        } else {
+            c *= 0.55;                                       // dim interior
+        }
+    } else {
+        // NORMAL data tile and DENIED tile: thin darker border so nested tiles
+        // read as distinct rectangles (slivers stay solid — no border swallow).
+        if (minSide > 3.0 && d < 1.0) {
             c *= 0.35;
         }
     }

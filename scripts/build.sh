@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # build.sh — compile the App layer into build/Terrazzo.app (a normal .app).
-# Module maturity: PROTOTYPE (slice TZ-1)
+# Module maturity: PROTOTYPE (slice TZ-2)
 #
-# The two pure cores (Sources/ScanCore, Sources/TreemapCore) are SPM libraries
-# for `swift test`, but the App is built by swiftc (glyph-saver PLAN.md pattern:
-# no build-time Metal toolchain) — the SAME core sources are compiled straight
-# into the Terrazzo executable here. Shaders ship as SOURCE and compile at
-# RUNTIME (makeLibrary(source:)); this script MUST NOT invoke the `metal` tool.
+# The pure cores (Sources/ScanCore, Sources/TreemapCore) and the ScanFS I/O
+# adapter are SPM libraries for `swift test`, but the App is built by swiftc
+# (glyph-saver PLAN.md pattern: no build-time Metal toolchain) — the SAME core +
+# ScanFS sources are compiled straight into the Terrazzo executable here (see the
+# swiftc invocation below, which lists Sources/ScanFS). Shaders ship as SOURCE and
+# compile at RUNTIME (makeLibrary(source:)); this script MUST NOT invoke `metal`.
 #
 # Run BARE, check the exit code.
 set -euo pipefail
@@ -22,13 +23,14 @@ echo "==> Clean bundle tree"
 rm -rf "$APP"
 mkdir -p "$MACOS" "$RES"
 
-echo "==> Compile Sources/App + Sources/TreemapCore + Sources/ScanCore -> $MACOS/Terrazzo"
+echo "==> Compile Sources/App + Sources/TreemapCore + Sources/ScanCore + Sources/ScanFS -> $MACOS/Terrazzo"
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swiftc \
 	-O \
 	-o "$MACOS/Terrazzo" \
 	Sources/App/*.swift \
 	Sources/TreemapCore/*.swift \
 	Sources/ScanCore/*.swift \
+	Sources/ScanFS/*.swift \
 	-framework AppKit \
 	-framework Metal \
 	-framework MetalKit \
@@ -55,4 +57,23 @@ for f in \
 	fi
 done
 
-echo "==> Built $APP"
+echo "==> Code sign with a STABLE identity (operator directive 2026-08-16)"
+# WHY (TCC persistence): macOS TCC identifies an app by its code signature. Ad-hoc
+# signing mints a NEW identity every rebuild, so every protected-folder prompt
+# reappears on every build. Signing with a fixed Developer identity keeps folder
+# grants — and the TZ-4 Full Disk Access grant — sticky across rebuilds.
+# Operator-verified command/identity on this machine (TeamIdentifier PTN74UT4G3).
+SIGN_ID="Apple Development: andrei.roman@gmail.com (T9FDE7X7VE)"
+codesign --force --sign "$SIGN_ID" "$APP"
+
+echo "==> Assert the signature carries a stable TeamIdentifier"
+# An ad-hoc or unsigned bundle reports 'TeamIdentifier=not set'. Require a real
+# team id so an identity-less build (which would defeat TCC persistence) fails
+# LOUDLY here rather than silently re-prompting the operator at runtime.
+if ! codesign -dv "$APP" 2>&1 | grep -Eq '^TeamIdentifier=[A-Z0-9]+$'; then
+	echo "BUILD FAILED: $APP has no stable TeamIdentifier after codesign" >&2
+	codesign -dv "$APP" 2>&1 || true
+	exit 1
+fi
+
+echo "==> Built $APP (signed: $SIGN_ID)"

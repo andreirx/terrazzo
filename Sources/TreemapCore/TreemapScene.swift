@@ -51,12 +51,19 @@ public struct TileRect: Equatable, Sendable {
     public let dimLevel: Int
     public let nodeId: String
     public let kind: NodeKind
+    /// Scan progress of the underlying node. Added in TZ-2 (resolving the TZ-1
+    /// open question): `NodeKind` stays "what it is", `ScanState` carries "how far
+    /// scanned", and the renderer styles a not-yet-`.complete` tile outlined-dim
+    /// WITHOUT conflating kind and state. Concrete current user: QuadRenderer.
+    public let scanState: ScanState
 
-    public init(rect: Rect, dimLevel: Int, nodeId: String, kind: NodeKind) {
+    public init(rect: Rect, dimLevel: Int, nodeId: String, kind: NodeKind,
+                scanState: ScanState = .complete) {
         self.rect = rect
         self.dimLevel = dimLevel
         self.nodeId = nodeId
         self.kind = kind
+        self.scanState = scanState
     }
 }
 
@@ -107,7 +114,8 @@ public enum TreemapScene {
         node: SizeTree, rect: Rect, level: Int,
         depthWindow: Int, borderInset: Double, into tiles: inout [TileRect]
     ) {
-        tiles.append(TileRect(rect: rect, dimLevel: level, nodeId: node.id, kind: node.kind))
+        tiles.append(TileRect(rect: rect, dimLevel: level, nodeId: node.id,
+                              kind: node.kind, scanState: node.scanState))
 
         guard level < depthWindow, !node.children.isEmpty else { return }
         let inner = rect.inset(by: borderInset)

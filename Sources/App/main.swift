@@ -10,8 +10,17 @@
 
 import AppKit
 
-let app = NSApplication.shared
-app.setActivationPolicy(.regular)
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()
+// Top-level code is nonisolated, but it runs on the main thread — enter the main
+// actor explicitly so we can construct the @MainActor AppDelegate (the UI object)
+// without hopping. `assumeIsolated` is sound here precisely because startup IS on
+// the main thread.
+MainActor.assumeIsolated {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    // `delegate` is retained for the whole process: NSApp.delegate is weak, but
+    // app.run() blocks inside this closure until termination, so this local frame
+    // (and its strong `delegate`) lives for the process lifetime.
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    app.run()
+}

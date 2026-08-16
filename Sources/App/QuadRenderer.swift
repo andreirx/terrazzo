@@ -42,6 +42,11 @@ final class QuadRenderer {
         var ox: Float = 0, oy: Float = 0, sx: Float = 0, sy: Float = 0
         var r: Float = 0, g: Float = 0, b: Float = 0
         var pw: Float = 0, ph: Float = 0
+        /// Style code the fragment shader branches on: 0 = normal (data tile,
+        /// darkened border), 1 = pending (outlined-dim: dark fill, bright edge),
+        /// 2 = denied (its own color, normal border). Kept as a Float so the CPU
+        /// mirror stays all-Float (no hidden alignment padding — see header note).
+        var kd: Float = 0
     }
 
     // Depth-dim ladder (VISION §Experience 2: each level progressively dimmer).
@@ -50,6 +55,13 @@ final class QuadRenderer {
     // the VISIBLE gradient is "top-level folders bright → deeper dimmer".
     private static let baseTileColor = SIMD3<Float>(0.42, 0.60, 0.84)
     private static let dimFalloff: Float = 0.74
+    // Denied space gets its OWN color, deliberately NOT on the blue data ramp
+    // (VISION §"invisible space is first-class"; name honesty — a denied tile is
+    // never approximated into ordinary data). A warm amber-red reads as "blocked".
+    private static let deniedColor = SIMD3<Float>(0.86, 0.34, 0.24)
+    // Pending fill: a very dim blue-grey; the shader adds a brighter outline so a
+    // not-yet-known region reads as "outlined placeholder", not empty canvas.
+    private static let pendingColor = SIMD3<Float>(0.30, 0.36, 0.46)
     private static let background = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
 
     private let device: MTLDevice
@@ -140,7 +152,20 @@ final class QuadRenderer {
         instances.reserveCapacity(tiles.count)
         for tile in tiles {
             guard tile.rect.width > 0, tile.rect.height > 0 else { continue } // skip degenerate
-            let color = Self.baseTileColor * pow(Self.dimFalloff, Float(tile.dimLevel))
+
+            // Style precedence: denied (kind) → pending (scanState) → normal data.
+            // Denied is a KIND fact (we could not enter); pending is a STATE fact
+            // (we have not finished). Both are first-class, never silent.
+            let color: SIMD3<Float>
+            let kd: Float
+            if tile.kind == .denied {
+                color = Self.deniedColor; kd = 2
+            } else if tile.scanState != .complete {
+                color = Self.pendingColor; kd = 1
+            } else {
+                color = Self.baseTileColor * pow(Self.dimFalloff, Float(tile.dimLevel)); kd = 0
+            }
+
             var q = QuadInstance()
             // viewport (top-left origin, y-down, pixels) → NDC (y-up).
             q.ox = Float(2.0 * tile.rect.x / W - 1.0)
@@ -150,6 +175,7 @@ final class QuadRenderer {
             q.r = color.x; q.g = color.y; q.b = color.z
             q.pw = Float(tile.rect.width)
             q.ph = Float(tile.rect.height)
+            q.kd = kd
             instances.append(q)
         }
 

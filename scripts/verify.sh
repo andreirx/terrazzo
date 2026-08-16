@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
-# verify.sh — TZ-1 deterministic offscreen gate + bundle-structure assertions.
-# Module maturity: PROTOTYPE (slice TZ-1)
+# verify.sh — deterministic offscreen gates + bundle-structure assertions.
+# Module maturity: PROTOTYPE (slice TZ-2)
 #
-# Two jobs, both bare and exit-code-checked (never piped — CLAUDE.md Gates):
+# Three jobs, all bare and exit-code-checked (never piped — CLAUDE.md Gates):
 #
-#   (1) OFFSCREEN FRAMES: compile scripts/verify_host.swift together with the
-#       real Sources/App/QuadRenderer.swift + the two core source trees into one
-#       swiftc binary (the App-monolith arrangement), then render the fixture
+#   (1) OFFSCREEN FIXTURE FRAMES (TZ-1): compile scripts/verify_host.swift with
+#       the real Sources/App/QuadRenderer.swift + the two core source trees into
+#       one swiftc binary (the App-monolith arrangement), then render the fixture
 #       scene at TWO viewport sizes THROUGH the real QuadRenderer into PNGs.
 #       Assert both PNGs are non-empty and byte-DIFFER (different viewport ⇒
 #       different squarified layout ⇒ different pixels). This is the App-adapted
 #       version of glyph-saver's offscreen verify seam — no ScreenSaverEngine,
 #       no `screencapture`; the app window is separate, additional evidence.
+#
+#   (3) SCAN GATE (TZ-2): compile scripts/scan_host.swift with the real walker
+#       (Sources/ScanFS) + reducer + cores + QuadRenderer, walk a REAL fixture
+#       directory tree to completion, assert the FULL golden tree (structure +
+#       per-node sizes), then render the scanned SizeTree to two PNGs and assert
+#       they are non-empty and differ.
 #
 #   (2) BUNDLE STRUCTURE: build the app and assert the .app carries the
 #       executable, Info.plist, the runtime shader source, and the fixture.
@@ -25,13 +31,16 @@ cd "$ROOT"
 
 APP="build/Terrazzo.app"
 HOST_BIN="build/verify_host"
+SCAN_BIN="build/scan_host"
 SHADER="Sources/App/Shaders.metal"
 FIXTURE="Tests/Fixtures/fixture-tree.json"
 OUT1="build/verify-1.png"
 OUT2="build/verify-2.png"
+SCAN_OUT1="build/verify-scan-1.png"
+SCAN_OUT2="build/verify-scan-2.png"
 
 mkdir -p build
-rm -f "$OUT1" "$OUT2"
+rm -f "$OUT1" "$OUT2" "$SCAN_OUT1" "$SCAN_OUT2"
 
 echo "==> (2a) Build the app bundle (also needed for structure assertions)"
 scripts/build.sh
@@ -64,6 +73,33 @@ if cmp -s "$OUT1" "$OUT2"; then
 	exit 1
 fi
 
+echo "==> (3a) Compile the scan gate host (real walker + reducer + cores + QuadRenderer)"
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swiftc \
+	-O \
+	-o "$SCAN_BIN" \
+	scripts/scan_host.swift \
+	Sources/App/QuadRenderer.swift \
+	Sources/ScanFS/*.swift \
+	Sources/TreemapCore/*.swift \
+	Sources/ScanCore/*.swift \
+	-framework Metal \
+	-framework CoreGraphics \
+	-framework ImageIO \
+	-target arm64-apple-macos14
+
+echo "==> (3b) Walk a real fixture tree to completion, assert golden, render two frames"
+"$SCAN_BIN" "$SHADER" "$SCAN_OUT1" "$SCAN_OUT2"
+
+echo "==> (3c) Assert both scan frames were written, are non-empty, and differ"
+if [[ ! -s "$SCAN_OUT1" || ! -s "$SCAN_OUT2" ]]; then
+	echo "VERIFY FAILED: a scan frame is missing/empty ($SCAN_OUT1, $SCAN_OUT2)" >&2
+	exit 1
+fi
+if cmp -s "$SCAN_OUT1" "$SCAN_OUT2"; then
+	echo "VERIFY FAILED: $SCAN_OUT1 and $SCAN_OUT2 are byte-identical — layout did not respond to size" >&2
+	exit 1
+fi
+
 echo "==> (2b) Assert bundle structure"
 for f in \
 	"$APP/Contents/MacOS/Terrazzo" \
@@ -76,5 +112,6 @@ for f in \
 	fi
 done
 
-echo "==> VERIFY OK: $OUT1 and $OUT2 written and differ; $APP structure complete."
-echo "    Operator judges the two PNGs + the live window (scripts/run.sh)."
+echo "==> VERIFY OK: fixture frames ($OUT1,$OUT2) and scan frames ($SCAN_OUT1,$SCAN_OUT2) written and differ; $APP structure complete."
+echo "    Scan gate: real walker+reducer produced the golden tree and rendered it."
+echo "    Operator judges the PNGs + the live window (scripts/run.sh)."
