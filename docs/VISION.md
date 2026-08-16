@@ -31,10 +31,12 @@ free-space mystery**. Terrazzo renders:
 - **Denied space** — directories the scan cannot enter (other users' homes,
   TCC-protected areas) render as visibly distinct tiles sized by what the
   volume accounting implies, never dropped.
-- **Unaccounted space** — one synthetic tile per volume:
-  `capacity − free − scanned total`. If files invisible even to root-level
-  enumeration (snapshots, purgeable, other-volume overlap) hold space, the
-  map SAYS so instead of lying by omission.
+- **Unaccounted space** — a STATUS-BAR figure per volume (amended
+  2026-08-16, human field ruling: the earlier synthetic map tile rendered
+  a volume-level quantity inside a subtree map — a category error,
+  retracted): `capacity − free − scanned total`, decomposed as purgeable
+  + other-users/unknown. The number is always shown; it is never drawn
+  as a rectangle pretending to be a folder.
 - **Purgeable vs free** — the volume header shows capacity, free, and
   purgeable (the APFS quantity that makes "available space" differ between
   contexts and users) via both `volumeAvailableCapacity` and
