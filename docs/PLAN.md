@@ -68,6 +68,13 @@ Abstraction ledger:
 - **Focus path label at the bottom**: the current focus path as absolute
   path text ("/", then "/Users/apple", "/Users/apple/Library", … growing
   with zoom-in, shrinking on zoom-out), alongside the volume status bar.
+- **Status bar speaks plain language** (2026-08-16): fields are
+  `Capacity · Free · Reclaimable · Available up to · Scanned` — "Important"
+  (the `volumeAvailableCapacityForImportantUsage` API term) never appears
+  in the UI; every field has a one-sentence hover tooltip. Verified
+  identity on this machine: Available-up-to = Free + Reclaimable
+  (513.70 = 124.73 + 388.97) — the two-users free-space discrepancy is
+  these two answers to the same question.
 
 ## Rendering scale
 
