@@ -44,3 +44,12 @@ changes need a decision record) → PRODUCTION. Everything starts PROTOTYPE.
 
 Tracked: `Sources/`, `Tests/`, `docs/`, `scripts/`, `Package.swift`.
 Gitignored: `build/`, `.build/`, `.agent-manager/`, `.DS_Store`.
+
+## Builder conduct on the live desktop (binding, 2026-08-16)
+
+Builders must NEVER post synthetic input events (CGEvent, System Events
+keystrokes/clicks) or activate/raise windows — the human works on this
+machine and cycle-4's e2e harness moved their real mouse. Evidence comes
+from: unit tests, offscreen verify frames, direct programmatic driving of
+controllers (no window), trace logs, and timing measurements. Live
+interaction evidence belongs to the operator and the human.
