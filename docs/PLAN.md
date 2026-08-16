@@ -50,6 +50,25 @@ Abstraction ledger:
 - Nothing else. No renderer protocol, no plugin system, no persistence
   layer (rescan is cheap; no cache in v1 — recorded as possible debt).
 
+## Visual language (amended 2026-08-16, human direction from live use)
+
+- **Hue per top-level tile**: each top-level folder under the current
+  focus gets its own hue, derived DETERMINISTICALLY from the folder NAME
+  (hash → hue wheel) so a folder keeps its color across rescans, zooms,
+  and app restarts (Library is always Library's color). All descendants
+  inherit the subtree hue; the depth-dim ladder (brightness ·
+  falloff^level) applies within the hue — the emergent
+  brightness=shallowness semantics is preserved, now per-colored-subtree.
+  Medium saturation over black; denied/pending keep their reserved
+  non-data colors.
+- **Tile labels**: every top-level tile (relative to current focus) shows
+  its folder name (+ size) as an overlay label, clipped to the tile,
+  hidden below a minimum tile width (named constant). Labels re-target on
+  zoom (the new top level gets labels).
+- **Focus path label at the bottom**: the current focus path as absolute
+  path text ("/", then "/Users/apple", "/Users/apple/Library", … growing
+  with zoom-in, shrinking on zoom-out), alongside the volume status bar.
+
 ## Rendering scale
 
 Depth-5 tree of a full disk ≈ 10⁴–10⁶ rects. Instanced quads in one draw
