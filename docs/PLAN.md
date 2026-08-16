@@ -186,8 +186,13 @@ files/sec-derived ETA next to the bar. Known approximation, displayed
 as such: the denominator is volume-wide (includes denied/other-user
 files), so the bar may complete below 100% — clamp and snap to done on
 completion; never fake linearity.
-VolumePicker (all mounted volumes); **default scan root becomes `/`**
-(2026-08-16: the `~` start was TZ-2 staging only); **Rescan button** in the
+VolumePicker (all mounted volumes); **root promotion** (refined
+2026-08-16, superseding "default /"): scans start at `~` for fast first
+paint, and zooming out AT the scan root promotes it one level
+(`/Users/apple` → `/Users` → `/`) — the existing tree grafts as a child
+of the new root (nothing discarded), only new siblings scan, the camera
+animates the old map shrinking into its parent tile; repeatable to the
+volume root; **Rescan button** in the
 toolbar/status area (human directive 2026-08-16 — the map is a snapshot of
 scan time; rescan re-runs the current volume+focus scan, streaming as
 usual); root scan with FDA guided flow (probe → explain → open System
