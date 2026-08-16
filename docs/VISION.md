@@ -90,7 +90,11 @@ DTO is the single crossing point.
    FileManager); exercised headless by `swift test`. `ScanFS` and `App` are
    the only I/O/UI layers.
 2. **Files are the system of record** — repo fully determines the build; no
-   generated state outside `build/`.
+   generated state outside `build/`. One ratified runtime exception
+   (2026-08-16): `scan-history.json` in Application Support persists
+   last-completed-scan totals per volume+root as a PROGRESS HINT only —
+   sizes, layout, and the map never depend on it; deleting it costs a
+   progress bar, nothing else.
 3. **Streaming is the contract**: the scan API is an event stream; "wait
    until done then draw" is a forbidden simplification.
 4. **Name honesty** — a tile that means "denied" is named and rendered
