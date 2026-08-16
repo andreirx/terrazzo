@@ -239,6 +239,16 @@ scan, one .utility-priority task walks / EXCLUDING the active scan root
 (shares promotion's scan-X-excluding-grafted-Y machinery) so zoom-out
 promotion finds siblings warm or complete. Acceptance: wall-clock home
 scan improves measurably (state before/after); threading law untouched.
+DISJOINTNESS INVARIANTS (human question 2026-08-16 — why nothing is ever
+walked twice): (1) one enumeration point (classifyChildren), called once
+by a directory's single owner; (2) ownership transfers exclusively at
+enumeration — a parent never descends into a delegated child; stealing
+picks up unstarted subtasks, never splits a directory; (3) symlinks never
+followed; (4) ONE SCAN = ONE DEVICE: any child whose st_dev differs from
+the scan root's is a boundary stub, never entered (kills the
+/System/Volumes/Data firmlink double-count, /Volumes mounts, network
+mounts); (5) a concurrent anticipatory scan excludes the active scan
+root by emitting a graft reference at its enumeration point.
 
 ## Slice → relay mapping
 
