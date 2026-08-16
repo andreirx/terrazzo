@@ -174,19 +174,18 @@ Finder (right-click + ⌘R) on any tile incl. bundle leaves. Output: navigate
 your disk fluidly.
 
 ### TZ-4 — Volumes, root, and the mystery (PROTOTYPE → acceptance)
-**Scan progress bar** (human directive 2026-08-16): shown in the status
-area while scanning. Denominator preference: (1) last-known-good totals
-from `scan-history.json` (below); (2) for volume-root scans with no
-history, volume accounting available at t=0 — bytes: `capacity − free`
-(progress-by-bytes matches the map: tile area IS bytes), inodes: statfs
-used-inode count; (3) genuinely-first subtree scan → indeterminate.
-**`scan-history.json`** (ratified persisted-state exception to "no caches",
-human 2026-08-16): `~/Library/Application Support/Terrazzo/`, keyed by
-volume UUID + scan root; stores {fileCount, byteTotal, completedAt} —
-written ONLY on scan completion (partials never overwrite; that is the
-"good" in last-known-good). It is a PROGRESS HINT ONLY: correctness of
-sizes/layout/map must never depend on it; deleting it costs a progress
-bar, nothing else. Owned by ScanFS (I/O), read at scan start.
+**Scan progress bar — BY FILE COUNT** (human directive 2026-08-16,
+superseding same-day byte/persistence draft): progress =
+filesProcessed / volume used-inode count (statfs `f_files − f_ffree`,
+available at t=0, zero cost, zero persistence — the earlier
+`scan-history.json` idea is RETRACTED, nothing is persisted). Rationale
+(human): scan TIME is spent per inode, not per byte — one stat for a
+10 GB movie, thousands for a cache dir — so a file-count bar tracks
+actual remaining work and yields an honest ETA. Show a rolling
+files/sec-derived ETA next to the bar. Known approximation, displayed
+as such: the denominator is volume-wide (includes denied/other-user
+files), so the bar may complete below 100% — clamp and snap to done on
+completion; never fake linearity.
 VolumePicker (all mounted volumes); **default scan root becomes `/`**
 (2026-08-16: the `~` start was TZ-2 staging only); **Rescan button** in the
 toolbar/status area (human directive 2026-08-16 — the map is a snapshot of
