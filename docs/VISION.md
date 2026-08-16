@@ -101,6 +101,10 @@ DTO is the single crossing point.
 
 ## Named extension points (deferred, not designed for)
 
+- **Root-privileged scan mode** (2026-08-16): exact sizing of other
+  users' files requires root — FDA bypasses TCC, never POSIX 700 homes.
+  Until then: the unaccounted−purgeable residual estimates the aggregate,
+  and each user scanning their own session covers their territory.
 - Deletion / cleanup actions (undo-safety design required first).
 - Snapshot/purgeable deep inspection (tmutil integration).
 - Hard-link/clone dedup accuracy pass (v1 policy set at ratification).
