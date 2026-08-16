@@ -52,15 +52,17 @@ Abstraction ledger:
 
 ## Visual language (amended 2026-08-16, human direction from live use)
 
-- **Hue per top-level tile**: each top-level folder under the current
-  focus gets its own hue, derived DETERMINISTICALLY from the folder NAME
-  (hash → hue wheel) so a folder keeps its color across rescans, zooms,
-  and app restarts (Library is always Library's color). All descendants
-  inherit the subtree hue; the depth-dim ladder (brightness ·
-  falloff^level) applies within the hue — the emergent
-  brightness=shallowness semantics is preserved, now per-colored-subtree.
-  Medium saturation over black; denied/pending keep their reserved
-  non-data colors.
+- **Hue per top-level tile, RE-TINTED at every focus level** (clarified
+  2026-08-16, human: "going into one tinted rectangle, the subfolders get
+  THEIR OWN tints — not the parent's"): hue derives DETERMINISTICALLY from
+  the folder NAME (hash → hue wheel), and the display rule is
+  focus-relative — tiles ONE level below the current focus each show
+  their OWN hue; their deeper descendants inherit that level-1 ancestor's
+  hue through the dim ladder. Dive into Library and its children get a
+  fresh palette; zoom out and the top-level palette returns. Identity
+  stays stable: any given folder shows the same hue whenever it is a
+  top-level tile, across zooms, rescans, restarts. Medium saturation over
+  black; denied/pending keep reserved non-data colors.
 - **Tile labels**: every top-level tile (relative to current focus) shows
   its folder name (+ size) as an overlay label, clipped to the tile,
   hidden below a minimum tile width (named constant). Labels re-target on
@@ -145,12 +147,18 @@ Finder (right-click + ⌘R) on any tile incl. bundle leaves. Output: navigate
 your disk fluidly.
 
 ### TZ-4 — Volumes, root, and the mystery (PROTOTYPE → acceptance)
-VolumePicker (all mounted volumes); root scan with FDA guided flow (probe →
-explain → open System Settings pane → rescan); depth setting UI (default 5);
-unaccounted-space tile verified against volume accounting; denied tiles for
-other users' homes. ACCEPTANCE = the founding use case: map the boot volume
-as each user, see where the space disagreement lives, find what the
-Storage-Settings view hides. Output: the answer to "what is going on."
+VolumePicker (all mounted volumes); **default scan root becomes `/`**
+(2026-08-16: the `~` start was TZ-2 staging only); **Rescan button** in the
+toolbar/status area (human directive 2026-08-16 — the map is a snapshot of
+scan time; rescan re-runs the current volume+focus scan, streaming as
+usual); root scan with FDA guided flow (probe → explain → open System
+Settings pane → rescan); depth setting UI (default 5); unaccounted-space
+tile verified against volume accounting; denied tiles for other users'
+homes. ACCEPTANCE = the founding use case: map the boot volume as each
+user, see where the space disagreement lives, find what Storage Settings
+hides. (The founding mystery itself was solved during TZ-2/3 field use —
+a stale pinned TM snapshot; TZ-4 makes such answers visible by design.)
+Output: the answer to "what is going on."
 
 ## Slice → relay mapping
 
