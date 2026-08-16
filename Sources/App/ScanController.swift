@@ -62,6 +62,11 @@ final class ScanController {
     /// folds into the SAME pipeline concurrently with the primary walk that may still be
     /// draining the grafted subtree. All are cancelled together on teardown.
     private var walkTasks: [Task<Void, Never>] = []
+    /// The anticipatory volume-root warm (TZ-6 PLAN deliverable 5), started for a SUBTREE
+    /// scan so a later zoom-out promotion finds siblings warm. `.utility` priority, emits
+    /// nothing, excludes the active scan root — see `FileSystemWalker.anticipateVolumeRoot`.
+    /// Cancelled on teardown and superseded when a promotion begins.
+    private var anticipateTask: Task<Void, Never>?
     private var sceneTask: Task<Void, Never>?
     private var cadenceTimer: Timer?
     private let hitch = HitchMonitor()
@@ -124,6 +129,15 @@ final class ScanController {
         // node-count-scaling projection/layout run inside the actor, off main.
         let walker = FileSystemWalker.scan(root: root, policy: policy)
         walkTasks = [Task { await pipe.ingest(walker) }]
+
+        // TZ-6 deliverable 5: for a SUBTREE scan (not already the volume root), warm the
+        // volume root's metadata cache off the primary path at .utility QoS (the measured
+        // FileSystemWalker.defaultAnticipatoryPriority) — excluding this scan's subtree — so a
+        // zoom-out promotion finds its new siblings warm. A volume-root scan needs no
+        // anticipation (it already covers the volume).
+        if !isVolumeRoot {
+            anticipateTask = FileSystemWalker.anticipateVolumeRoot(excluding: root)
+        }
 
         // Consume finished scenes on the MAIN actor. O(scene), not O(node count).
         sceneTask = Task { @MainActor [weak self] in
@@ -188,6 +202,9 @@ final class ScanController {
         self.root = newRoot
         running = true
         hitch.setPhase("promote")
+        // Promotion supersedes anticipation: we are now scanning the parent's new siblings
+        // ourselves, so stop warming (avoids redundant I/O overlapping the sibling walk).
+        anticipateTask?.cancel(); anticipateTask = nil
 
         // Re-read the progress denominator + volume accounting for the promoted root, and
         // whether the promoted root IS the volume root — promotion is how a `~` scan
@@ -287,6 +304,7 @@ final class ScanController {
     /// Internal teardown shared by `cancel()` and the start of every `scan(root:)`.
     private func cancelScan() {
         for t in walkTasks { t.cancel() }; walkTasks = []
+        anticipateTask?.cancel(); anticipateTask = nil
         sceneTask?.cancel(); sceneTask = nil
         stopCadence()
         pipeline = nil
