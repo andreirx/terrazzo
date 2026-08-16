@@ -43,6 +43,16 @@ public enum NodeKind: String, Codable, Sendable {
     case denied
     /// A node discovered but not yet sized/expanded by the streaming scan.
     case pending
+    /// A SYNTHETIC accounting tile INJECTED by the composition layer
+    /// (`RenderPipeline.SyntheticTile`) — NOT produced by scanning. The per-volume
+    /// "Unaccounted" tile is the only current instance: its bytes are a volume
+    /// accounting residual (`capacity − free − scanned`), not a filesystem entry, so
+    /// it has NO real path and is never divable or revealable. First-class per VISION
+    /// §"invisible space is first-class" — the map SAYS "we don't know" rather than
+    /// omitting the gap. The walker NEVER emits this kind; the reducer never derives
+    /// it; exhaustive `switch`es carry it only so a new synthetic use breaks them
+    /// deliberately (TZ-4).
+    case synthetic
 }
 
 /// How complete our accounting of a node is. Distinct from `NodeKind`: kind is

@@ -41,6 +41,18 @@ struct ScanStatus {
     /// principle). Comes prebuilt on the RenderScene; the App only formats it.
     let belowPixelCount: Int
     let running: Bool
+    /// Entries stat'd so far (progress-bar numerator, TZ-4). Default 0 keeps the TZ-2/3
+    /// call sites that predate the progress bar compiling unchanged.
+    var filesProcessed: Int = 0
+    /// Volume used-inode count at scan start (progress-bar denominator); 0 ⇒ unknown.
+    var totalInodes: Int64 = 0
+
+    /// The file-count progress derived from this status (TZ-4). The ControlBar renders
+    /// its clamped fraction + ETA; kept here so the arithmetic (pure `ScanProgress`)
+    /// stays testable and out of the AppKit view.
+    var progress: ScanProgress {
+        ScanProgress(filesProcessed: filesProcessed, usedInodes: totalInodes, running: running)
+    }
 }
 
 final class StatusBar: NSView {
@@ -50,6 +62,15 @@ final class StatusBar: NSView {
     /// Under the live scan a node id IS its absolute path, so this is the focus's
     /// path. Truncates at the HEAD so the deepest components stay visible.
     private let focusLabel = NSTextField(labelWithString: "")
+    /// The focus path most recently set (the breadcrumb). Held so a transient hover
+    /// path (TZ-4 D9) can REPLACE it during hover and REVERT to it on hover-out.
+    private var focusPath = ""
+    private static let focusColor = NSColor(calibratedWhite: 0.90, alpha: 1)
+    /// A hovered node's full path shows here during hover in a dimmer style (D9),
+    /// distinct from the emphasized breadcrumb. Head-truncates only if unavoidable —
+    /// the full path is meant to be readable here (the on-tile chip middle-truncates,
+    /// the bottom bar does not).
+    private static let hoverColor = NSColor(calibratedWhite: 0.62, alpha: 1)
     /// The volume accounting line (TZ-2), now one NSTextField per field so each
     /// carries its own hover tooltip (deliverable 5d) — trailing, monospaced digits.
     private let volumeStack = NSStackView()
@@ -113,9 +134,34 @@ final class StatusBar: NSView {
     }
 
     /// Set the current focus path (breadcrumb). Called by NavigationController on
-    /// every relayout / focus change.
+    /// every relayout / focus change. Only paints the label when no hover path is
+    /// currently overriding it, so a streaming scene update mid-hover does not stomp
+    /// the hovered node's path out of the bottom bar.
     func setFocusPath(_ path: String) {
-        focusLabel.stringValue = path
+        focusPath = path
+        if !hovering {
+            focusLabel.stringValue = path
+            focusLabel.textColor = Self.focusColor
+        }
+    }
+
+    /// Whether a hover path is currently overriding the breadcrumb.
+    private var hovering = false
+
+    /// Show a hovered node's FULL path in the bottom bar (D9, dimmer style), or `nil`
+    /// to revert to the focus breadcrumb. The chip on the tile middle-truncates a long
+    /// path; the bottom bar shows it whole (head-truncated only if the strip is too
+    /// narrow), so this is where the operator reads the full path.
+    func setHoverPath(_ path: String?) {
+        if let path {
+            hovering = true
+            focusLabel.stringValue = path
+            focusLabel.textColor = Self.hoverColor
+        } else {
+            hovering = false
+            focusLabel.stringValue = focusPath
+            focusLabel.textColor = Self.focusColor
+        }
     }
 
     private static let bytes: ByteCountFormatter = {

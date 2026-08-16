@@ -24,9 +24,10 @@
 //  to DEVICE-PIXEL layout space (top-left origin, y-down — the space tiles live in),
 //  and forwards to its `input` delegate. Esc routes to `escapeHandler`.
 //
-//  TEXT OVERLAYS (unchanged): `setTileLabels` (top-level folder name+size) and
-//  `setReadout` (the floating `HoverReadout` label) — plain NSTextFields composited
-//  above the Metal layer; the strings are composed off-view (pipeline / controller).
+//  TEXT OVERLAYS: `setTileLabels` (top-level folder name+size) and `setCallout` (the
+//  hover chip anchored ON the hovered tile — TZ-4 D9, replacing the old fixed top-left
+//  readout that overlapped the Desktop tile's label) — composited above the Metal layer;
+//  the strings are composed off-view (pipeline / controller).
 //
 
 import AppKit
@@ -101,17 +102,33 @@ final class CanvasView: NSView {
     private var trackingArea: NSTrackingArea?
 
     // Text overlays (composited above the Metal layer).
-    private let readoutLabel = CanvasView.makeOverlayLabel(alignment: .left, lines: 2)
+    /// The hover CALLOUT chip (TZ-4 D9), anchored near the cursor ON the hovered tile —
+    /// replaces the old fixed top-left readout (which overlapped the Desktop tile's
+    /// label, operator field report). A rounded translucent-dark chip with bright text
+    /// and a 1px border in the hovered tile's hue, so it reads as distinct from the
+    /// static top-level labels.
+    private let calloutChip = CalloutChip()
     private var tileLabelViews: [NSTextField] = []
     private var currentTileLabels: [TileLabel] = []
+
+    /// The viewport (device px) the currently-installed quads were LAID OUT for. Set on
+    /// every scene present; read by `applyStretchCamera` during a live resize to scale
+    /// the current scene to the new drawable via the camera uniform — O(1), no relayout
+    /// (TZ-4 D8 stretch-then-settle). `nil` until the first scene lands.
+    private var sceneViewport: Rect?
+    /// Throttle for viewport posts during a live-resize drag (D8): stretch every frame
+    /// (cheap), but only ask the pipeline to re-squarify on a modest cadence so a huge
+    /// tree's relayout does not thrash the actor at 60 Hz.
+    private var lastResizePush: CFTimeInterval = 0
+    private static let resizePushInterval: CFTimeInterval = 0.12
 
     override init(frame frameRect: NSRect) {
         self.device = MTLCreateSystemDefaultDevice()
         super.init(frame: frameRect)
         wantsLayer = true
         layerContentsRedrawPolicy = .duringViewResize
-        addSubview(readoutLabel)
-        readoutLabel.isHidden = true
+        addSubview(calloutChip)
+        calloutChip.isHidden = true
     }
 
     required init?(coder: NSCoder) { fatalError("CanvasView is code-only (no storyboard)") }
@@ -185,6 +202,25 @@ final class CanvasView: NSView {
         camScale = SIMD2(1, 1); camTranslate = SIMD2(0, 0)
     }
 
+    /// Record the viewport the freshly-installed quads were laid out for (TZ-4 D8). The
+    /// caller (NavigationController) sets this on every present so a live resize can
+    /// stretch the current scene to the new drawable size without a relayout.
+    func setSceneViewport(_ vp: Rect) { sceneViewport = vp }
+
+    /// STRETCH the current scene to the current drawable via the camera uniform (D8).
+    /// The installed quads live in `sceneViewport`-px world space; scaling by
+    /// drawable/sceneViewport makes them fill the resized drawable — an O(1) main-thread
+    /// uniform update, no re-squarify. Briefly aspect-stretched during the drag is the
+    /// intended trade; the re-squarified scene swaps in on settle and resets the camera.
+    func applyStretchCamera() {
+        guard let sv = sceneViewport, sv.width > 0, sv.height > 0 else { return }
+        let ds = metalLayer.drawableSize
+        guard ds.width > 0, ds.height > 0 else { return }
+        camScale = SIMD2(Float(Double(ds.width) / sv.width), Float(Double(ds.height) / sv.height))
+        camTranslate = SIMD2(0, 0)
+        render()
+    }
+
     /// Set the hover-highlight instance index (or -1). A uniform update + redraw;
     /// never relays out, never restarts the settle.
     func setHighlightIndex(_ index: Int) {
@@ -220,15 +256,41 @@ final class CanvasView: NSView {
 
     // MARK: - Text overlays
 
-    /// The floating hover readout (top-left). `nil`/empty hides it.
-    func setReadout(_ text: String?) {
-        if let text, !text.isEmpty {
-            readoutLabel.stringValue = text
-            readoutLabel.isHidden = false
-            layoutReadout()
-        } else {
-            readoutLabel.isHidden = true
-        }
+    /// Show the hover CALLOUT chip near the cursor (TZ-4 D9). `text` is the chip label
+    /// (name + size); `hue` in [0,1) paints the 1px border in the hovered tile's hue;
+    /// `p` is the cursor in DEVICE PIXELS. The chip is clamped to the viewport and may
+    /// overflow a small tile — anchoring to the cursor, never clipped unreadable.
+    func setCallout(text: String, hue: Double, atPx p: Point) {
+        guard !text.isEmpty else { clearCallout(); return }
+        calloutChip.set(text: text, hue: hue)
+        calloutChip.isHidden = false
+        positionCallout(atPx: p)
+    }
+
+    /// Hide the hover callout chip.
+    func clearCallout() { calloutChip.isHidden = true }
+
+    /// Anchor the callout chip near the cursor, clamped strictly inside the view. Placed
+    /// down-right of the cursor by default, flipping to the opposite side when it would
+    /// spill past an edge, so it is never clipped.
+    private func positionCallout(atPx p: Point) {
+        let scale = Double(window?.backingScaleFactor ?? 2.0)
+        let size = calloutChip.fittingSize
+        let w = Double(size.width), h = Double(size.height)
+        let bw = Double(bounds.width), bh = Double(bounds.height)
+        // Cursor in top-left-origin POINTS (the chip layout space before the y-flip).
+        let cx = p.x / scale
+        let cyTop = p.y / scale
+        let gap = 14.0, margin = 4.0
+        var xTop = cx + gap
+        if xTop + w > bw - margin { xTop = cx - gap - w }        // flip left near the right edge
+        xTop = min(max(margin, xTop), max(margin, bw - w - margin))
+        var yTop = cyTop + gap
+        if yTop + h > bh - margin { yTop = cyTop - gap - h }      // flip above near the bottom edge
+        yTop = min(max(margin, yTop), max(margin, bh - h - margin))
+        // NSView is y-up (isFlipped == false) — convert the top-left y to a frame origin.
+        let frameY = bh - yTop - h
+        calloutChip.frame = NSRect(x: xTop, y: frameY, width: w, height: h)
     }
 
     /// Position/label the top-level tiles. Rebuilds the NSTextField overlay set
@@ -275,12 +337,10 @@ final class CanvasView: NSView {
         }
     }
 
-    private func layoutReadout() {
-        readoutLabel.sizeToFit()
-        let h = readoutLabel.frame.height
-        let w = min(readoutLabel.frame.width, Double(bounds.width) - 20)
-        readoutLabel.frame = NSRect(x: 10, y: Double(bounds.height) - Double(h) - 8,
-                                    width: w, height: Double(h))
+    /// Hide the top-level tile labels for the duration of a live-resize drag (D8) — a
+    /// re-square is coming on settle, and stretched labels mid-drag read as clutter.
+    private func hideTileLabelsDuringResize() {
+        for v in tileLabelViews { v.isHidden = true }
     }
 
     // MARK: - Streaming animation (uniform-driven; O(1) per frame)
@@ -342,8 +402,31 @@ final class CanvasView: NSView {
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         updateDrawableSize()
-        layoutReadout()
-        layoutTileLabels()
+        if inLiveResize {
+            // D8 STRETCH-THEN-SETTLE: track the drag frame-by-frame via the camera
+            // uniform (O(1) on main, no relayout); hide overlays during the drag; and
+            // post the new viewport only on a modest cadence so the pipeline's
+            // re-squarify (newest-wins) never thrashes on a large tree at 60 Hz.
+            clearCallout()
+            hideTileLabelsDuringResize()
+            applyStretchCamera()
+            let now = CACurrentMediaTime()
+            if now - lastResizePush >= Self.resizePushInterval {
+                lastResizePush = now
+                input?.canvasViewportChanged()
+            }
+        } else {
+            layoutTileLabels()
+            input?.canvasViewportChanged()
+        }
+    }
+
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        // Settle: request the re-squarified scene for the FINAL size. When it lands,
+        // `present` resets the camera to identity and re-places the labels.
+        lastResizePush = 0
+        updateDrawableSize()
         input?.canvasViewportChanged()
     }
 
@@ -445,5 +528,62 @@ final class CanvasView: NSView {
         f.isEditable = false
         f.isSelectable = false
         return f
+    }
+}
+
+// MARK: - Callout chip (TZ-4 D9)
+
+/// The hover callout chip: a rounded, translucent-dark pill with bright text and a 1px
+/// border in the hovered tile's hue — VISIBLY distinct from the static top-level labels
+/// (which are flat dark rounded rects with no coloured border). A container view (not a
+/// bare NSTextField) so it can carry internal padding around the text and a hue border
+/// the plain overlay labels don't have.
+///
+/// ABSTRACTION LEDGER: one concrete view, one user (CanvasView's hover callout). Axis:
+/// the callout's styling (padding + per-hover hue border + middle-truncation to a max
+/// width) is not expressible on the reused flat overlay label, and the packet requires
+/// it read as distinct. Rejected simpler alternative — reuse `makeOverlayLabel` — cannot
+/// pad the text or draw the hue border, and would read the same as the static labels the
+/// operator asked to disambiguate from.
+private final class CalloutChip: NSView {
+    private let label = NSTextField(labelWithString: "")
+    private static let hPad: CGFloat = 7, vPad: CGFloat = 4
+    /// Long paths middle-truncate in the CHIP (never in the bottom bar) — cap the text
+    /// width so the chip stays a readable pill rather than spanning the viewport.
+    private static let maxTextWidth: CGFloat = 320
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = CGColor(gray: 0, alpha: 0.72)
+        layer?.cornerRadius = 5
+        layer?.borderWidth = 1
+        label.font = .systemFont(ofSize: 11, weight: .semibold)
+        label.textColor = NSColor(calibratedWhite: 0.98, alpha: 1)
+        label.maximumNumberOfLines = 1
+        label.lineBreakMode = .byTruncatingMiddle
+        label.drawsBackground = false
+        label.isBezeled = false
+        label.isEditable = false
+        label.isSelectable = false
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.hPad),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -Self.hPad),
+            label.topAnchor.constraint(equalTo: topAnchor, constant: Self.vPad),
+            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -Self.vPad),
+            label.widthAnchor.constraint(lessThanOrEqualToConstant: Self.maxTextWidth),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("CalloutChip is code-only") }
+
+    /// `hue` in [0,1); a medium-sat bright border keeps the chip tied to the tile's hue
+    /// while staying legible against the translucent-dark fill.
+    func set(text: String, hue: Double) {
+        label.stringValue = text
+        layer?.borderColor = NSColor(hue: CGFloat(hue.truncatingRemainder(dividingBy: 1)),
+                                     saturation: 0.75, brightness: 1.0, alpha: 0.95).cgColor
     }
 }

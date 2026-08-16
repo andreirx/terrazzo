@@ -94,6 +94,12 @@ public enum QuadBuilder {
     // Pending fill: a very dim blue-grey; the shader adds a bright outline so a
     // not-yet-known region reads as an outlined placeholder, not empty canvas.
     private static let pendingColor: (Float, Float, Float) = (0.30, 0.36, 0.46)
+    // SYNTHETIC (unaccounted) tile: a desaturated steel grey, deliberately OFF the data
+    // hue wheel AND distinct from denied amber / pending blue-grey, so a volume-accounting
+    // residual is never mistaken for a folder (VISION §"invisible space is first-class";
+    // packet 7: "must NEVER be confused with a real folder"). The shader (style 3) adds a
+    // diagonal hatch to reinforce "not real data".
+    private static let syntheticColor: (Float, Float, Float) = (0.34, 0.37, 0.42)
 
     /// Resolve every tile to a render-ready quad, 1:1 and in order.
     public static func build(tiles: [TileRect]) -> [GPUQuad] {
@@ -104,13 +110,16 @@ public enum QuadBuilder {
     }
 
     /// The colour precedence QuadRenderer used to compute per draw, now once per
-    /// scene: denied (kind) → pending (scanState) → normal data (hue · dim ladder).
-    /// Denied is a KIND fact (could not enter); pending is a STATE fact (not finished)
-    /// — both first-class, never silent.
+    /// scene: synthetic (kind) → denied (kind) → pending (scanState) → normal data
+    /// (hue · dim ladder). Synthetic and denied are KIND facts; pending is a STATE fact
+    /// (not finished) — all first-class, never silent. Synthetic is checked FIRST: it is
+    /// a reserved accounting tile whose reserved colour must win over any hue.
     public static func quad(for t: TileRect) -> GPUQuad {
         let color: (Float, Float, Float)
         let style: Float
-        if t.kind == .denied {
+        if t.kind == .synthetic {
+            color = syntheticColor; style = 3
+        } else if t.kind == .denied {
             color = deniedColor; style = 2
         } else if t.scanState != .complete {
             color = pendingColor; style = 1

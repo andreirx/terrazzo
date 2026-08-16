@@ -140,6 +140,11 @@ final class NavigationController: CanvasInputDelegate {
     private var awaitingFocusScene = false
     /// Path targeted by the right-click context menu item (deepest tile under click).
     private var contextTargetPath: String?
+    /// Anchor (device px) for the synthetic-tile explainer popover — captured at the
+    /// click / context-menu location so a menu action fired later still has a position.
+    private var syntheticAnchorPx: Point?
+    /// The reused "About Unaccounted space" explainer popover (TZ-4 D7). Lazily built.
+    private var explainerPopover: NSPopover?
 
     private static let sizeFormatter: ByteCountFormatter = {
         let f = ByteCountFormatter(); f.countStyle = .file; f.allowsNonnumericFormatting = false
@@ -198,7 +203,9 @@ final class NavigationController: CanvasInputDelegate {
             presentScene(scene, from: commitFrom(for: scene), animated: true)
         } else {
             // Same-focus streaming update: the pipeline already built the settle "from".
-            presentScene(scene, from: scene.settleFrom, animated: true)
+            // During a live resize, SNAP to the re-squarified scene (the camera has been
+            // stretching the prior scene) rather than settle-morph mid-drag (D8).
+            presentScene(scene, from: scene.settleFrom, animated: !canvas.inLiveResize)
         }
     }
 
@@ -213,6 +220,9 @@ final class NavigationController: CanvasInputDelegate {
         displayed = DisplaySnapshot(tiles: scene.tiles, quads: scene.quads,
                                     nodeIds: scene.nodeIds)
         canvas.present(from: from, to: scene.quads, animated: animated)
+        // Record the viewport this scene was laid out for, so a live resize can stretch
+        // it to a new drawable via the camera uniform without a relayout (D8).
+        canvas.setSceneViewport(scene.viewport)
         canvas.setHighlightIndex(currentHighlightIndex())
         bottomBar.setFocusPath(scene.focusId)
         canvas.setTileLabels(scene.labels.map { CanvasView.TileLabel(rect: $0.rect, text: $0.text) })
@@ -248,9 +258,15 @@ final class NavigationController: CanvasInputDelegate {
     func canvasViewportChanged() {
         // A resize is a viewport change → tell the pipeline to re-fit (immediate emit).
         pushViewport()
-        // Redraw the current tiles at the new drawable size so the canvas is not blank
-        // during the sub-frame until the re-fitted scene lands (snap, not settle).
         guard !isAnimatingCamera, !displayed.quads.isEmpty else { return }
+        // During a LIVE resize the CanvasView is stretching the current scene via the
+        // camera uniform (D8); an identity snap here would fight it. Skip — the
+        // re-squarified scene swaps in on settle (viewDidEndLiveResize / cadence).
+        guard !canvas.inLiveResize else { return }
+        // Redraw the current tiles at the new drawable size so the canvas is not blank
+        // during the sub-frame until the re-fitted scene lands (snap, not settle). Do NOT
+        // update sceneViewport here — these quads still match the PREVIOUS scene's
+        // viewport; presentScene sets it when a scene laid out for a viewport lands.
         canvas.present(from: displayed.quads, to: displayed.quads, animated: false)
         canvas.setHighlightIndex(currentHighlightIndex())
     }
@@ -259,19 +275,30 @@ final class NavigationController: CanvasInputDelegate {
         guard !isAnimatingCamera else { return }
         hoverChain = HitTest.hit(tiles: displayed.tiles, at: p)
         canvas.setHighlightIndex(currentHighlightIndex())
-        canvas.setReadout(readoutText(for: hoverChain))
+        if let tile = hoverChain?.deepest {
+            // Callout chip anchored ON the tile near the cursor (D9); full path (or the
+            // decomposed unaccounted explanation) in the bottom bar.
+            canvas.setCallout(text: calloutText(for: tile), hue: tile.hue, atPx: p)
+            bottomBar.setHoverPath(hoverPathText(for: tile))
+        } else {
+            canvas.clearCallout()
+            bottomBar.setHoverPath(nil)
+        }
     }
 
     func canvasDidExit() {
         hoverChain = nil
         canvas.setHighlightIndex(-1)
-        canvas.setReadout(nil)
+        canvas.clearCallout()
+        bottomBar.setHoverPath(nil)
     }
 
     func canvasDidClick(atPx p: Point) {
         guard !isAnimatingCamera else { return }
-        guard let target = HitTest.hit(tiles: displayed.tiles, at: p)?.topLevelUnderFocus?.nodeId else { return }
-        dive(to: target)
+        guard let top = HitTest.hit(tiles: displayed.tiles, at: p)?.topLevelUnderFocus else { return }
+        // The UNACCOUNTED tile is not a folder — never dive it; explain instead (D7).
+        if top.kind == .synthetic { syntheticAnchorPx = p; showSyntheticExplainer(atPx: p); return }
+        dive(to: top.nodeId)
     }
 
     func canvasDidScroll(deltaY: Double, precise: Bool, atPx p: Point) {
@@ -282,8 +309,10 @@ final class NavigationController: CanvasInputDelegate {
         scrollAccum += deltaY
         if scrollAccum >= step {
             scrollAccum = 0
-            if let target = HitTest.hit(tiles: displayed.tiles, at: p)?.topLevelUnderFocus?.nodeId {
-                dive(to: target)
+            // Scroll-in dives — but never into the synthetic unaccounted tile (D7).
+            if let top = HitTest.hit(tiles: displayed.tiles, at: p)?.topLevelUnderFocus,
+               top.kind != .synthetic {
+                dive(to: top.nodeId)
             }
         } else if scrollAccum <= -step {
             scrollAccum = 0
@@ -293,11 +322,21 @@ final class NavigationController: CanvasInputDelegate {
 
     func canvasContextMenu(atPx p: Point) -> NSMenu? {
         guard let deepest = HitTest.hit(tiles: displayed.tiles, at: p)?.deepest else { return nil }
-        contextTargetPath = deepest.nodeId
-        // Name comes PREBUILT on the hit tile (denormalized off main at layout time) —
-        // no `latestScene.tree.node(withId:)` traversal on the main actor (review-3 item 1).
-        let name = deepest.name.isEmpty ? deepest.nodeId : deepest.name
         let menu = NSMenu()
+        // The unaccounted tile is not revealable in Finder (no real path) — offer the
+        // explainer instead (D7). Name/kind come PREBUILT on the hit tile (denormalized
+        // off main at layout time) — no tree traversal on the main actor.
+        if deepest.kind == .synthetic {
+            contextTargetPath = nil
+            syntheticAnchorPx = p
+            let item = NSMenuItem(title: "About Unaccounted space…",
+                                  action: #selector(explainSyntheticFromMenu), keyEquivalent: "")
+            item.target = self
+            menu.addItem(item)
+            return menu
+        }
+        contextTargetPath = deepest.nodeId
+        let name = deepest.name.isEmpty ? deepest.nodeId : deepest.name
         let item = NSMenuItem(title: "Reveal “\(name)” in Finder",
                               action: #selector(revealContextTarget), keyEquivalent: "")
         item.target = self
@@ -312,7 +351,11 @@ final class NavigationController: CanvasInputDelegate {
     /// the pipeline lays out the child focus async; the child scene swaps in on commit.
     private func dive(to childId: String) {
         guard childId != focusStack.last else { return }
-        guard let childRect = displayed.tiles.first(where: { $0.nodeId == childId })?.rect else { return }
+        guard let childTile = displayed.tiles.first(where: { $0.nodeId == childId }) else { return }
+        // Defense in depth: the synthetic unaccounted tile is never a dive target (D7);
+        // the click/scroll paths already gate on it, this guards any other caller.
+        guard childTile.kind != .synthetic else { return }
+        let childRect = childTile.rect
         trace("dive -> \(childId)")
         let base = displayed // already prebuilt — no QuadBuilder on main (OPERATOR_NOTE gap 1)
         let vp = viewport
@@ -421,7 +464,8 @@ final class NavigationController: CanvasInputDelegate {
         // Hide overlays during the flight; they re-target on commit.
         canvas.setHighlightIndex(-1)
         canvas.setTileLabels([])
-        canvas.setReadout(nil)
+        canvas.clearCallout()
+        bottomBar.setHoverPath(nil)
         hoverChain = nil
 
         // Remember the flight base + its LAST-frame transform so the commit can build
@@ -499,28 +543,111 @@ final class NavigationController: CanvasInputDelegate {
 
     /// ⌘R: reveal the currently hovered tile's deepest node (VISION §Experience 5).
     @objc func revealHovered() {
-        if let path = hoverChain?.deepest.nodeId {
-            trace("reveal(hover) -> \(path)"); FinderActions.revealInFinder(path: path)
-        } else {
-            trace("reveal(hover) -> <no hover>")
-        }
+        guard let tile = hoverChain?.deepest else { trace("reveal(hover) -> <no hover>"); return }
+        // The synthetic unaccounted tile has no real path — never send it to Finder (D7).
+        guard tile.kind != .synthetic else { trace("reveal(hover) -> <synthetic, ignored>"); return }
+        trace("reveal(hover) -> \(tile.nodeId)"); FinderActions.revealInFinder(path: tile.nodeId)
     }
 
     /// ⌘↑ menu action → zoom out.
     @objc func zoomOut() { ascend() }
 
-    // MARK: - Readout text
+    // MARK: - New-scan reset (rescan / volume switch, TZ-4)
 
-    /// The hover readout: the DEEPEST hit tile's full path + allocated + logical size.
-    /// Read straight off the hit `TileRect` — the name/sizes were denormalized onto the
-    /// tile on the pipeline actor at layout time (TZ-3b, review-3 item 1), so this does
-    /// NO tree traversal on the main actor; it touches only the viewport-bounded rendered
-    /// tile the user is hovering. Named surface: the floating `HoverReadout` label.
-    private func readoutText(for chain: HitChain?) -> String? {
-        guard let chain else { return nil }
-        let tile = chain.deepest
+    /// Reset all navigation state for a fresh scan (Rescan button / VolumePicker). The
+    /// next scene the new pipeline emits re-seeds the focus stack from its root, so the
+    /// map starts clean at the new volume's root rather than carrying a stale focus.
+    func resetForNewScan() {
+        cameraTimer?.invalidate(); cameraTimer = nil
+        isAnimatingCamera = false
+        awaitingFocusScene = false
+        latestScene = nil
+        focusStack = []
+        sceneStack = []
+        displayed = .empty
+        hoverChain = nil
+        scrollAccum = 0
+        flightBaseQuads = []; flightBaseNodeIds = []
+        canvas.setHighlightIndex(-1)
+        canvas.clearCallout()
+        canvas.setTileLabels([])
+        bottomBar.setHoverPath(nil)
+    }
+
+    // MARK: - Hover callout / path text (TZ-4 D9) + synthetic explainer (D7)
+
+    /// The on-tile callout chip text: name + allocated size (+ logical only when it
+    /// differs). Read straight off the hit `TileRect` (name/sizes denormalized onto the
+    /// tile on the pipeline actor at layout time, TZ-3b) — NO tree traversal on main.
+    private func calloutText(for tile: TileRect) -> String {
+        if tile.kind == .synthetic {
+            let name = tile.name.isEmpty ? SyntheticTile.unaccountedName : tile.name
+            return "\(name)  ·  \(Self.sizeFormatter.string(fromByteCount: tile.allocatedBytes))"
+        }
+        let name = tile.name.isEmpty ? (tile.nodeId as NSString).lastPathComponent : tile.name
+        // Denied dir (D6): the readout SAYS "no permission" (its size is only the dir's
+        // own entry — contents are unreadable), with the path shown in the bottom bar.
+        if tile.kind == .denied {
+            return "\(name)  ·  no permission"
+        }
         let alloc = Self.sizeFormatter.string(fromByteCount: tile.allocatedBytes)
-        let logical = Self.sizeFormatter.string(fromByteCount: tile.logicalBytes)
-        return "\(tile.nodeId)\nallocated \(alloc)   ·   logical \(logical)"
+        if tile.logicalBytes != tile.allocatedBytes {
+            let logical = Self.sizeFormatter.string(fromByteCount: tile.logicalBytes)
+            return "\(name)  ·  \(alloc)  (logical \(logical))"
+        }
+        return "\(name)  ·  \(alloc)"
+    }
+
+    /// The bottom-bar hover text: the hovered node's FULL path, or — for the synthetic
+    /// unaccounted tile — its DECOMPOSED accounting (human directive 2026-08-16):
+    /// "purgeable X + other users / unknown Y", phrased as space no scan from this POSIX
+    /// account can see (FDA never crosses user boundaries — VISION).
+    private func hoverPathText(for tile: TileRect) -> String {
+        guard tile.kind == .synthetic else { return tile.nodeId }
+        let purgeable = latestScene?.purgeableBytes ?? 0
+        let (p, unknown) = SyntheticTile.decompose(unaccounted: tile.allocatedBytes, purgeable: purgeable)
+        let ps = Self.sizeFormatter.string(fromByteCount: p)
+        let us = Self.sizeFormatter.string(fromByteCount: unknown)
+        return "Unaccounted — purgeable \(ps) + other users / unknown \(us) (space no scan from this account can see)"
+    }
+
+    @objc private func explainSyntheticFromMenu() {
+        showSyntheticExplainer(atPx: syntheticAnchorPx ?? Point(x: viewport.width / 2, y: viewport.height / 2))
+    }
+
+    /// Show the "About Unaccounted space" explainer popover anchored at `p` (device px).
+    /// The unaccounted tile is a volume-accounting residual, not a folder — this is the
+    /// short explanation the packet requires clicking it to surface (D7).
+    private func showSyntheticExplainer(atPx p: Point) {
+        let pop = explainerPopover ?? Self.makeExplainerPopover()
+        explainerPopover = pop
+        let scale = Double(canvas.window?.backingScaleFactor ?? 2.0)
+        let xPt = p.x / scale
+        let yUp = Double(canvas.bounds.height) - (p.y / scale) // device px (y-down) → view pts (y-up)
+        let rect = NSRect(x: xPt - 1, y: yUp - 1, width: 2, height: 2)
+        pop.show(relativeTo: rect, of: canvas, preferredEdge: .maxY)
+    }
+
+    private static func makeExplainerPopover() -> NSPopover {
+        let text = NSTextField(wrappingLabelWithString:
+            "Unaccounted space\n\nThis isn’t a folder — it’s the gap between the volume’s used space and everything Terrazzo could measure from this account. It covers reclaimable (purgeable) space plus files no scan from your user can see: other users’ home folders and system snapshots.\n\nFull Disk Access lets Terrazzo read TCC-protected files, but it never crosses POSIX user boundaries, so this residual is the closest estimate of other users’ disk usage. It can’t be opened or revealed in Finder.")
+        text.font = .systemFont(ofSize: 11)
+        text.translatesAutoresizingMaskIntoConstraints = false
+        text.preferredMaxLayoutWidth = 300
+        let container = NSView()
+        container.addSubview(text)
+        NSLayoutConstraint.activate([
+            text.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
+            text.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
+            text.topAnchor.constraint(equalTo: container.topAnchor, constant: 14),
+            text.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -14),
+            text.widthAnchor.constraint(equalToConstant: 300),
+        ])
+        let vc = NSViewController()
+        vc.view = container
+        let pop = NSPopover()
+        pop.contentViewController = vc
+        pop.behavior = .transient
+        return pop
     }
 }

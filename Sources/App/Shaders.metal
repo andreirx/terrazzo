@@ -36,7 +36,7 @@ struct GPUQuad {
     float r;
     float g;
     float b;
-    float style; // 0 normal, 1 pending (outlined-dim), 2 denied
+    float style; // 0 normal, 1 pending (outlined-dim), 2 denied, 3 synthetic (hatched)
 };
 
 // CPU mirror: QuadRenderer.Uniforms. Field order + sizes MUST match.
@@ -111,6 +111,17 @@ fragment float4 quad_fragment(VOut in [[stage_in]]) {
             c *= 2.2;                                        // bright edge
         } else {
             c *= 0.55;                                       // dim interior
+        }
+    } else if (in.style > 2.5) {
+        // SYNTHETIC (unaccounted): reserved steel-grey fill with a diagonal HATCH so it
+        // reads unmistakably as "not a folder" (VISION §"invisible space is first-class").
+        // Hatch = periodic bright stripes along (x+y); a thin darker border like data tiles.
+        float stripe = fmod(p.x + p.y, 12.0);
+        if (stripe < 2.0) {
+            c *= 1.7;                                        // bright hatch line
+        }
+        if (minSide > 3.0 && d < 1.0) {
+            c *= 0.35;                                       // border
         }
     } else {
         // NORMAL data tile and DENIED tile: thin darker border so nested tiles

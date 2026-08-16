@@ -107,6 +107,19 @@ public struct ScanReducer {
     private var nodes: [String: Node]
     private let rootId: String
 
+    /// Count of filesystem entries the walker has STAT'd so far — the numerator of the
+    /// file-count progress bar (TZ-4, PLAN ratified). Incremented exactly once per node
+    /// the first time it receives its OWN size (`sizeUpdated`), which the walker emits
+    /// once per stat'd entry: files, symlinks, directories' own entries, and sized
+    /// bundles. This counts BOTH files AND directories (each is one `stat`, one inode),
+    /// so the numerator and the statfs used-inode denominator (`f_files − f_ffree`)
+    /// count the same population — the consistency argument the progress ratio needs.
+    /// Derived from a monotonic first-write flag, so it stays order-independent like the
+    /// rest of the reducer (a size event arrives at most once per node by walker
+    /// contract). A denied directory is still counted (its parent stat'd its own entry
+    /// before the denial), matching an inode that exists but could not be enumerated.
+    public private(set) var processedCount: Int = 0
+
     /// - Parameters:
     ///   - rootId: the scan root's stable id (its absolute path). The walker emits
     ///     events tagged with ids derived from the same root, so they match.
@@ -142,6 +155,11 @@ public struct ScanReducer {
 
         case let .sizeUpdated(nodeId, allocated, logical):
             var node = nodes[nodeId] ?? Node(name: "")
+            // Count this entry as "processed" exactly once (the first own-size write).
+            // The walker emits one size event per stat'd node, but count from the
+            // false→true transition so the tally is robust to a duplicate/replayed
+            // batch and stays a pure function of the accumulated state.
+            if !node.hasSize { processedCount += 1 }
             node.ownAllocated = allocated
             node.ownLogical = logical
             node.hasSize = true
@@ -227,6 +245,12 @@ public struct ScanReducer {
             return .complete
         case .pending:
             return .pending
+        case .synthetic:
+            // The reducer never derives a synthetic node (only the composition layer
+            // injects one AFTER projection); this arm exists solely for exhaustiveness
+            // so adding the kind deliberately surfaced this site. A synthetic tile's
+            // accounting is final by construction.
+            return .complete
         }
     }
 }

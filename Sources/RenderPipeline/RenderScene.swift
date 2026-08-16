@@ -115,11 +115,20 @@ public struct RenderScene: Equatable, Sendable {
     public let belowPixelCount: Int
     /// Whether the scan is still streaming (drives the status indicator).
     public let running: Bool
+    /// Entries stat'd so far (`ScanReducer.processedCount`) — the NUMERATOR of the
+    /// file-count progress bar (TZ-4). O(1) off the reducer; the App divides it by the
+    /// statfs used-inode denominator it read at scan start. Rides on the scene because
+    /// the reducer lives on the pipeline actor; main never touches the reducer.
+    public let filesProcessed: Int
+    /// The volume's purgeable (reclaimable) bytes, carried so the App can DECOMPOSE the
+    /// unaccounted tile's hover readout ("purgeable X + other users / unknown Y", human
+    /// directive 2026-08-16) without a second volume query on main. 0 when unknown.
+    public let purgeableBytes: Int64
 
     public init(generation: Int, focusId: String, viewport: Rect,
                 tiles: [TileRect], nodeIds: [String], quads: [GPUQuad], settleFrom: [GPUQuad],
                 labels: [SceneLabel], tree: SizeTree, belowPixelCount: Int,
-                running: Bool) {
+                running: Bool, filesProcessed: Int = 0, purgeableBytes: Int64 = 0) {
         self.generation = generation
         self.focusId = focusId
         self.viewport = viewport
@@ -131,6 +140,8 @@ public struct RenderScene: Equatable, Sendable {
         self.tree = tree
         self.belowPixelCount = belowPixelCount
         self.running = running
+        self.filesProcessed = filesProcessed
+        self.purgeableBytes = purgeableBytes
     }
 
     /// Full recursive scanned total (root allocated) — the status bar's "Scanned".

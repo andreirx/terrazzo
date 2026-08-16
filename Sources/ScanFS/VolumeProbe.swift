@@ -14,6 +14,7 @@
 //
 
 import Foundation
+import Darwin // statfs — the used-inode denominator for the file-count progress bar
 
 public enum VolumeProbe {
 
@@ -60,6 +61,26 @@ public enum VolumeProbe {
             availableBytes: Int64(v.volumeAvailableCapacity ?? 0),
             availableForImportantBytes: v.volumeAvailableCapacityForImportantUsage ?? 0
         )
+    }
+
+    /// The volume's USED inode count at this instant: `statfs.f_files − f_ffree`
+    /// (total inodes minus free inodes). This is the DENOMINATOR of the file-count
+    /// progress bar (TZ-4, PLAN ratified): the walker's `processedCount` divided by
+    /// this estimates how much of the volume's entry population has been stat'd. Read
+    /// ONCE at scan start (ScanFS owns the syscall — CLAUDE.md constraint 1); zero cost,
+    /// nothing persisted.
+    ///
+    /// APPROXIMATION, surfaced as such: this is volume-WIDE — it includes inodes the
+    /// scan can never reach from this account (other users' homes, TCC-denied areas) —
+    /// so the numerator can plateau below it; the progress model (`ScanProgress`) clamps
+    /// for exactly this reason. Returns `nil` if `statfs` fails; a returned value is
+    /// clamped ≥ 0 (a transient count where free momentarily exceeds total is an honest
+    /// zero, not a negative).
+    public static func usedInodes(for url: URL) -> Int64? {
+        var s = statfs()
+        guard statfs(url.path, &s) == 0 else { return nil }
+        let used = Int64(bitPattern: UInt64(s.f_files)) - Int64(bitPattern: UInt64(s.f_ffree))
+        return max(0, used)
     }
 
     /// The user's home directory URL. Lives here so the App never calls a

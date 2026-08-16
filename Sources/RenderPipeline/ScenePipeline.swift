@@ -103,6 +103,15 @@ public actor ScenePipeline {
     private var dirty = true
     private var generation = 0
 
+    /// Volume accounting (TZ-4), pushed once by the App at scan start. Drives the
+    /// synthetic UNACCOUNTED tile (`capacity − free − scanned`) injected into the root,
+    /// and the purgeable value carried on the scene for the tile's decomposed readout.
+    /// All zero until the App posts real figures — with `capacity == 0`, `augment` is a
+    /// no-op, so a pipeline with no accounting (every existing test) behaves as before.
+    private var volumeCapacity: Int64 = 0
+    private var volumeFree: Int64 = 0
+    private var volumePurgeable: Int64 = 0
+
     /// The PREVIOUS emitted scene's quads, keyed by nodeId — the source for the next
     /// scene's `settleFrom` (the streaming settle "from", aligned HERE on the actor so
     /// main never does the String-keyed match). Reset on a focus change: across a
@@ -167,6 +176,16 @@ public actor ScenePipeline {
         if focusChanged || depthChanged { emit(force: true) }
     }
 
+    /// Volume accounting for the UNACCOUNTED tile (TZ-4), posted by the App at scan
+    /// start once the volume probe returns. Recomputes the synthetic tile on the next
+    /// emit; force one now so it appears without waiting a cadence.
+    public func setVolumeAccounting(capacity: Int64, free: Int64, purgeable: Int64) {
+        volumeCapacity = capacity
+        volumeFree = free
+        volumePurgeable = purgeable
+        emit(force: true)
+    }
+
     /// New viewport (resize) — re-fit and emit immediately.
     public func setViewport(_ vp: Rect) {
         guard vp != viewport else { return }
@@ -180,7 +199,13 @@ public actor ScenePipeline {
         guard force || dirty else { return }
         guard let vp = viewport, vp.width > 0, vp.height > 0 else { return }
 
-        let tree = reducer.makeTree(depthWindow: projectionDepth)
+        let scanned = reducer.makeTree(depthWindow: projectionDepth)
+        // Inject the per-volume synthetic UNACCOUNTED tile as a child of the root
+        // (VISION §"invisible space is first-class"; recomputed every emit as `scanned`
+        // grows). A no-op when volume accounting is unknown or the residual is zero, and
+        // it preserves the root's totals — so `scannedBytes` below stays the REAL scanned
+        // total, not scanned + unaccounted.
+        let tree = SyntheticTile.augment(root: scanned, capacity: volumeCapacity, free: volumeFree)
         let laidOut = TreemapScene.layout(tree: tree, focusId: focusId,
                                           depthWindow: Self.renderWindow, viewport: vp)
         guard !laidOut.isEmpty else { return } // focus not present yet — keep last scene
@@ -231,7 +256,8 @@ public actor ScenePipeline {
         continuation.yield(RenderScene(
             generation: generation, focusId: focusId, viewport: vp,
             tiles: tiles, nodeIds: nodeIds, quads: quads, settleFrom: settleFrom,
-            labels: labels, tree: tree, belowPixelCount: belowPixelCount, running: running))
+            labels: labels, tree: tree, belowPixelCount: belowPixelCount, running: running,
+            filesProcessed: reducer.processedCount, purgeableBytes: volumePurgeable))
     }
 
     /// Compose a label (name + human size) for each top-level (dimLevel 1) tile.

@@ -28,6 +28,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
     private var canvas: CanvasView!
     private var statusBar: StatusBar!
+    private var controlBar: ControlBar!
+    private var banner: FDABanner!
+    private var container: ChromeContainer!
     private var navigation: NavigationController!
     private var controller: ScanController!
 
@@ -44,24 +47,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.setFrameAutosaveName("TerrazzoMainWindow")
         window.center()
 
-        // Container: canvas fills above a fixed-height status strip at the bottom.
-        let container = NSView(frame: frame)
+        // Chrome (top→bottom): ControlBar (volume picker + rescan + progress/ETA),
+        // an optional FDA banner, the canvas, and the volume StatusBar. The
+        // ChromeContainer lays these out explicitly because the banner appears/vanishes
+        // and must re-flow the canvas — a dynamic vertical stack autoresizing masks
+        // cannot express (see ChromeContainer).
+        controlBar = ControlBar(frame: NSRect(x: 0, y: 0, width: frame.width, height: ControlBar.height))
+        banner = FDABanner(frame: NSRect(x: 0, y: 0, width: frame.width, height: FDABanner.height))
+        statusBar = StatusBar(frame: NSRect(x: 0, y: 0, width: frame.width, height: StatusBar.height))
+        canvas = CanvasView(frame: NSRect(x: 0, y: 0, width: frame.width, height: frame.height))
+        container = ChromeContainer(controlBar: controlBar, banner: banner, canvas: canvas, statusBar: statusBar)
+        container.frame = frame
         container.autoresizingMask = [.width, .height]
-
-        let sh = StatusBar.height
-        statusBar = StatusBar(frame: NSRect(x: 0, y: 0, width: frame.width, height: sh))
-        statusBar.autoresizingMask = [.width]
-
-        canvas = CanvasView(frame: NSRect(x: 0, y: sh, width: frame.width, height: frame.height - sh))
-        canvas.autoresizingMask = [.width, .height]
-
-        container.addSubview(canvas)
-        container.addSubview(statusBar)
         window.contentView = container
 
         // Navigation owns focus/camera/hover; wired to canvas + status bar.
         navigation = NavigationController(canvas: canvas, bottomBar: statusBar)
         canvas.escapeHandler = { [weak navigation] in navigation?.ascend() } // Esc → zoom out
+
+        // TZ-4 chrome actions (Main-assembly wiring): rescan (toolbar + FDA banner) and
+        // volume selection both funnel to the scan helpers below.
+        controlBar.onRescan = { [weak self] in self?.rescanCurrentVolume() }
+        banner.onRescan = { [weak self] in self?.rescanCurrentVolume() }
+        controlBar.volumePicker.onSelect = { [weak self] descriptor in self?.scanVolume(descriptor.url) }
 
         // Menu is built AFTER `navigation` exists: buildMenu() bakes `navigation`
         // as the explicit target of the ⌘R / ⌘↑ items at install time, so it must
@@ -102,7 +110,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller = ScanController(
             root: root, policy: .default,
             onScene: { [weak self] scene in self?.navigation.onScene(scene) },
-            onStatus: { [weak self] status in self?.statusBar.update(status) }
+            onStatus: { [weak self] status in
+                self?.statusBar.update(status)
+                self?.controlBar.update(status.progress) // progress bar + ETA (TZ-4 D4)
+            }
         )
         navigation.scanController = controller
         controller.start()
@@ -111,6 +122,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // wired, so post the current viewport now that the wiring exists — otherwise
         // no scene is ever emitted and the canvas stays black.
         navigation.pushViewport()
+        updateChromeForScan(root: root)
+    }
+
+    // MARK: - TZ-4 scan actions (VolumePicker / Rescan)
+
+    /// Scan a chosen volume's root (VolumePicker, D2). Resets the map + progress sampling
+    /// so the new volume starts clean, then streams as always.
+    private func scanVolume(_ url: URL) {
+        controlBar.resetProgressSampling()
+        navigation.resetForNewScan()
+        controller.scan(root: url)
+        navigation.pushViewport()
+        updateChromeForScan(root: url)
+    }
+
+    /// Rescan the CURRENT volume (Rescan button / FDA banner, D3). The map is a snapshot
+    /// of scan time; rescan re-runs it (e.g. after granting Full Disk Access).
+    private func rescanCurrentVolume() {
+        let root = controller.root
+        controlBar.resetProgressSampling()
+        navigation.resetForNewScan()
+        controller.rescan()
+        navigation.pushViewport()
+        updateChromeForScan(root: root)
+    }
+
+    /// Refresh the volume picker selection and decide whether the FDA banner is warranted
+    /// for `root` (D2/D5). All volume enumeration + the FDA probe live in ScanFS
+    /// (CLAUDE.md constraint 1); this is one-time work at scan start, not node-count work.
+    private func updateChromeForScan(root: URL) {
+        let volumes = VolumeEnumerator.selectableVolumes()
+        let volumePaths = Set(volumes.map { $0.url.path })
+        // If the scan root is a volume root, select it; otherwise (e.g. the ~ first-paint
+        // scan) select the boot volume the home directory lives on.
+        let selected = volumePaths.contains(root.path) ? root.path : "/"
+        controlBar.volumePicker.setVolumes(volumes, selectedPath: selected)
+        // FDA banner ONLY when mapping a whole volume AND a protected probe path is denied
+        // — never for a sub-folder scan, and never blocking (D5).
+        let isVolumeRoot = VolumeSkipPolicy.isVolumeRoot(path: root.path, volumePaths: volumePaths)
+        container.showsBanner = isVolumeRoot && FDAProbe.probe() == .denied
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -149,5 +200,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         zoomOut.target = navigation
 
         NSApp.mainMenu = mainMenu
+    }
+}
+
+/// The window's content view: lays out the TZ-4 chrome top→bottom — ControlBar, an
+/// optional FDA banner, the canvas (fills the remainder), and the StatusBar. Explicit
+/// layout (not autoresizing masks) because the banner appears/disappears and must
+/// re-flow the canvas height; a fixed autoresizing stack cannot express a member that
+/// toggles between zero and its height.
+///
+/// ABSTRACTION LEDGER: one concrete view, one user (AppDelegate). Axis of variation: the
+/// FDA banner's dynamic presence re-flows the canvas — a real layout need, not imagined.
+/// Rejected simpler alternative — autoresizing masks on plain subviews — cannot collapse
+/// the banner's row and re-give its height to the canvas without exactly this custom
+/// layout; a stack view (NSStackView) is heavier machinery for a four-item fixed column.
+@MainActor
+final class ChromeContainer: NSView {
+    private let controlBar: ControlBar
+    private let banner: FDABanner
+    private let canvas: CanvasView
+    private let statusBar: StatusBar
+
+    /// Whether the FDA banner is shown (D5). Toggling re-flows the canvas.
+    var showsBanner = false {
+        didSet {
+            guard showsBanner != oldValue else { return }
+            banner.isHidden = !showsBanner
+            relayout()
+        }
+    }
+
+    init(controlBar: ControlBar, banner: FDABanner, canvas: CanvasView, statusBar: StatusBar) {
+        self.controlBar = controlBar
+        self.banner = banner
+        self.canvas = canvas
+        self.statusBar = statusBar
+        super.init(frame: .zero)
+        wantsLayer = true
+        banner.isHidden = true
+        addSubview(controlBar)
+        addSubview(banner)
+        addSubview(canvas)
+        addSubview(statusBar)
+    }
+
+    required init?(coder: NSCoder) { fatalError("ChromeContainer is code-only") }
+
+    /// Top-left origin so the vertical stack reads top→bottom in frame math.
+    override var isFlipped: Bool { true }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        relayout()
+    }
+
+    override func layout() {
+        super.layout()
+        relayout()
+    }
+
+    private func relayout() {
+        let w = bounds.width, h = bounds.height
+        let ctrlH = ControlBar.height, statusH = StatusBar.height, bannerH = FDABanner.height
+        controlBar.frame = NSRect(x: 0, y: 0, width: w, height: ctrlH)
+        var top = ctrlH
+        if showsBanner {
+            banner.frame = NSRect(x: 0, y: top, width: w, height: bannerH)
+            top += bannerH
+        }
+        let canvasHeight = max(0, h - top - statusH)
+        canvas.frame = NSRect(x: 0, y: top, width: w, height: canvasHeight)
+        statusBar.frame = NSRect(x: 0, y: h - statusH, width: w, height: statusH)
     }
 }

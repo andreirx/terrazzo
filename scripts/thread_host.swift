@@ -46,6 +46,7 @@ final class ThreadHarness {
     private var controller: ScanController!
 
     private var scenes = 0
+    private var lastScene: RenderScene?
     private var lastGen = 0
     private var monotonic = true
     private var running = true
@@ -57,6 +58,22 @@ final class ThreadHarness {
     /// bounded by the viewport, not the tree's node count.
     private var maxRenderedTiles = 0
     private var maxCulled = 0
+
+    // TZ-4 acceptance evidence (all read from the VIEWPORT-BOUNDED scene, never a tree
+    // walk — so this observability adds no node-count work to the measured main thread):
+    //   - progress ratio advancing (filesProcessed / statfs used-inodes),
+    //   - denied tiles from other users' homes at root scale (kind == .denied),
+    //   - the unaccounted synthetic tile tracking capacity − free − scanned.
+    private var lastFraction: Double?
+    private var lastFilesProcessed = 0
+    private var lastTotalInodes: Int64 = 0
+    private var lastScanned: Int64 = 0
+    private var lastCapacity: Int64 = 0
+    private var lastFree: Int64 = 0
+    private var maxDeniedTiles = 0
+    private var lastUnaccounted: Int64 = 0
+    private var deniedSamples: [String] = []
+    private var lastProgressPrint = 0.0
 
     private var navTimer: Timer?
     private var capTimer: Timer?
@@ -81,7 +98,7 @@ final class ThreadHarness {
         controller = ScanController(
             root: root, policy: .default,
             onScene: { [weak self] scene in self?.observe(scene); self?.navigation.onScene(scene) },
-            onStatus: { _ in })
+            onStatus: { [weak self] status in self?.observeStatus(status) })
         navigation.scanController = controller
         controller.start()
         // Off-window there is no window event to trigger the drawable sizing, so force
@@ -118,11 +135,57 @@ final class ThreadHarness {
     /// detect scan completion. O(1); never scales with node count.
     private func observe(_ scene: RenderScene) {
         scenes += 1
+        lastScene = scene
         if scene.generation <= lastGen { monotonic = false }
         lastGen = scene.generation
         maxRenderedTiles = max(maxRenderedTiles, scene.tiles.count)
         maxCulled = max(maxCulled, scene.belowPixelCount)
+
+        // Denied + synthetic evidence, read off the viewport-bounded tile list (NOT a
+        // tree walk — stays O(rendered), the law's bound).
+        var denied = 0
+        for t in scene.tiles {
+            if t.kind == .denied {
+                denied += 1
+                // Sample a few denied paths — at root scale these are other users' homes.
+                if deniedSamples.count < 6, !deniedSamples.contains(t.nodeId) {
+                    deniedSamples.append(t.nodeId)
+                }
+            } else if t.kind == .synthetic {
+                lastUnaccounted = t.allocatedBytes
+            }
+        }
+        maxDeniedTiles = max(maxDeniedTiles, denied)
+        lastScanned = scene.scannedBytes
+
+        // Periodic progress/unaccounted trace so "the ratio advancing / the unaccounted
+        // tile tracking capacity − free − scanned" is visible during the scan.
+        let now = elapsedSeconds()
+        if now - lastProgressPrint >= 2.0 {
+            lastProgressPrint = now
+            let pct = lastFraction.map { String(format: "%.1f%%", $0 * 100) } ?? "—"
+            print("TZTRACE progress \(lastFilesProcessed)/\(lastTotalInodes) inodes (\(pct))  denied-tiles \(denied)  unaccounted \(lastUnaccounted) B  scanned \(lastScanned) B")
+            fflush(stdout)
+        }
         if !scene.running { finish(reason: "scan complete") }
+    }
+
+    /// Post-scan denied-node collector (evidence only; not on the measured hot path).
+    private func collectDenied(_ node: SizeTree, into out: inout [String], cap: Int) {
+        if out.count >= cap { return }
+        if node.kind == .denied { out.append(node.id) }
+        for c in node.children { collectDenied(c, into: &out, cap: cap) }
+    }
+
+    /// Capture the progress + volume figures the App would show (O(1)).
+    private func observeStatus(_ status: ScanStatus) {
+        lastFilesProcessed = status.filesProcessed
+        lastTotalInodes = status.totalInodes
+        lastFraction = status.progress.fraction
+        if let v = status.volume {
+            lastCapacity = v.capacityBytes
+            lastFree = v.availableBytes
+        }
     }
 
     private func finish(reason: String) {
@@ -145,6 +208,28 @@ final class ThreadHarness {
         print("TZTHREAD max rendered tiles/scene (post-cull): \(maxRenderedTiles)  max sub-pixel culled/scene: \(maxCulled)")
         print("TZTHREAD dive/ascend posts during scan: \(focusPosts)  (scenes kept flowing across them: \(flowed ? "yes" : "n/a"))")
         print("TZTHREAD WORST MAIN-THREAD GAP (HitchMonitor): \(String(format: "%.1f", worstGapMs)) ms  (target < 100 ms)")
+
+        // TZ-4 acceptance evidence summary.
+        let pct = lastFraction.map { String(format: "%.1f%%", $0 * 100) } ?? "—"
+        print("TZTHREAD TZ-4 progress: \(lastFilesProcessed)/\(lastTotalInodes) inodes stat'd (\(pct))")
+        print("TZTHREAD TZ-4 denied tiles at root (max RENDERED in a scene): \(maxDeniedTiles)")
+        if !deniedSamples.isEmpty {
+            print("TZTHREAD TZ-4 rendered denied samples:")
+            for p in deniedSamples { print("TZTHREAD     denied: \(p)") }
+        }
+        // Denied NODES in the last projected tree — a post-scan O(n) walk (NOT on the
+        // measured hot path), so denials that are sub-pixel/CULLED (e.g. an empty
+        // other-user home) are still surfaced honestly, not silently dropped.
+        if let tree = lastScene?.tree {
+            var deniedIds: [String] = []
+            collectDenied(tree, into: &deniedIds, cap: 12)
+            print("TZTHREAD TZ-4 denied NODES in tree (incl. culled sub-pixel): \(deniedIds.count)\(deniedIds.count == 12 ? "+" : "")")
+            for p in deniedIds { print("TZTHREAD     denied-node: \(p)") }
+        }
+        // Unaccounted should track capacity − free − scanned (clamped ≥ 0).
+        let expectedUnaccounted = max(0, lastCapacity - lastFree - lastScanned)
+        print("TZTHREAD TZ-4 unaccounted tile: \(lastUnaccounted) B  (capacity \(lastCapacity) − free \(lastFree) − scanned \(lastScanned) = \(expectedUnaccounted) B)")
+
         let pass = worstGapMs < 100 && monotonic && scenes > 0
         print("TZTHREAD verdict: \(pass ? "PASS" : "REVIEW")")
         fflush(stdout)
