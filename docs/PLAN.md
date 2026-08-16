@@ -152,13 +152,28 @@ VolumePicker (all mounted volumes); **default scan root becomes `/`**
 toolbar/status area (human directive 2026-08-16 — the map is a snapshot of
 scan time; rescan re-runs the current volume+focus scan, streaming as
 usual); root scan with FDA guided flow (probe → explain → open System
-Settings pane → rescan); depth setting UI (default 5); unaccounted-space
-tile verified against volume accounting; denied tiles for other users'
-homes. ACCEPTANCE = the founding use case: map the boot volume as each
+Settings pane → rescan); unaccounted-space tile verified against volume
+accounting; denied tiles for other users' homes. ACCEPTANCE = the founding use case: map the boot volume as each
 user, see where the space disagreement lives, find what Storage Settings
 hides. (The founding mystery itself was solved during TZ-2/3 field use —
 a stale pinned TM snapshot; TZ-4 makes such answers visible by design.)
 Output: the answer to "what is going on."
+
+### TZ-5 — Explorer controls: hide/unhide, depth setting (PROTOTYPE)
+Human directive 2026-08-16. **Hide** button on every sufficiently large
+tile (same min-width rule as labels; also in the context menu for small
+ones): hiding excludes the tile from layout so its SIBLINGS renormalize
+into the freed area (LOCAL renormalization — operator decision: the rest
+of the map stays stable; ancestors keep their areas). Hidden tiles appear
+in a **side panel ledger** (name, size, hue chip, UNHIDE button each);
+the panel exists only while non-empty and disappears when depleted.
+Hiding is a VISUALIZATION lens only: pure TreemapCore input (hidden path
+set), scan tree untouched, session-only (not persisted), and the status
+bar shows "N hidden · X GB excluded" while any tile is hidden (the
+invisible-space principle applies to user-hidden mass too). Depth setting
+UI (default 5) moves here from TZ-4. Tests: layout with hidden set
+(sibling renormalization exactness, ancestors unchanged), hide→unhide
+round-trip restores the original layout.
 
 ## Slice → relay mapping
 
