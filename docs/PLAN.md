@@ -78,6 +78,27 @@ Abstraction ledger:
   (513.70 = 124.73 + 388.97) — the two-users free-space discrepancy is
   these two answers to the same question.
 
+## Threading model (ratified 2026-08-16, after the beachball field report)
+
+```
+walker tasks (N per top level) ──batches──▶ serial background actor:
+                                             reduce → makeTree → squarify →
+                                             build immutable RenderScene
+                                             (instance arrays, labels data)
+                                                      │ one value handoff
+                                                      ▼
+                                             main actor: input, camera
+                                             animation, Metal encode ONLY
+```
+
+Law: **nothing on the main thread may scale with node count.** The pure
+cores exist precisely so the whole reduce/layout/scene pipeline runs on a
+background actor over value types with no locks; main receives finished
+immutable scenes. The system beachball is the failure signature of
+violating this (there is no spinner in the app; macOS shows the wait
+cursor when main stalls ≥ ~2 s) — any beachball during scan is a bug by
+definition.
+
 ## Rendering scale
 
 Depth-5 tree of a full disk ≈ 10⁴–10⁶ rects. Instanced quads in one draw
