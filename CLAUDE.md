@@ -8,11 +8,20 @@
 
 ## Hard constraints
 
-1. **Two engines, one crossing point.** `ScanCore`+`ScanFS` (scanning) and
-   `TreemapCore`+`App` (visualization) meet ONLY at the `SizeTree` DTO.
-   Core libs (`ScanCore`, `TreemapCore`) are pure Swift — Foundation value
-   types only; no FileManager, no AppKit, no Metal. All syscalls in
+1. **Two engines, one crossing point, one composition layer.**
+   `ScanCore`+`ScanFS` (scanning) and `TreemapCore` (visualization math)
+   meet ONLY at the `SizeTree` DTO. Core libs are pure Swift — Foundation
+   value types only; no FileManager, no AppKit, no Metal. All syscalls in
    `ScanFS`; all UI/GPU in `Sources/App/`.
+   **`RenderPipeline`** (ratified 2026-08-16, human decision
+   pipeline-module-boundary) is the ONLY module allowed to import both
+   cores: a PURE COMPOSITION layer hosting the background pipeline actor
+   (reduce → tree → layout → immutable RenderScene). Charter, enforced by
+   review token-search every slice: zero I/O, zero AppKit/Metal/ScreenSaver
+   imports; composes the engines only through `SizeTree`; the cores never
+   import it; `App` shrinks to instantiation, input, and Metal encode.
+   Anything beyond composition drifting into RenderPipeline is a
+   boundary violation.
 2. **Invisible space is first-class.** `denied`, `pending`, and
    `unaccounted` are rendered states, never silent omissions. A tile kind
    that means "we don't know" must SAY "we don't know".
