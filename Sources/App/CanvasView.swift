@@ -110,6 +110,16 @@ final class CanvasView: NSView {
     private let calloutChip = CalloutChip()
     private var tileLabelViews: [NSTextField] = []
     private var currentTileLabels: [TileLabel] = []
+    /// The denied-overflow disclosure POPOVER (TZ-4b OPERATOR_NOTE #3.2, review-4 change 3 —
+    /// the ratified "click shows the list (popover)", replacing the earlier NSMenu). One
+    /// reused instance: `.transient` so a click elsewhere dismisses it; its content view
+    /// controller is rebuilt per disclosure. Held strongly so it is not deallocated while shown.
+    private lazy var deniedPopover: NSPopover = {
+        let p = NSPopover()
+        p.behavior = .transient
+        p.animates = true
+        return p
+    }()
 
     /// The viewport (device px) the currently-installed quads were LAID OUT for. Set on
     /// every scene present; read by `applyStretchCamera` during a live resize to scale
@@ -269,6 +279,74 @@ final class CanvasView: NSView {
 
     /// Hide the hover callout chip.
     func clearCallout() { calloutChip.isHidden = true }
+
+    /// Disclose the collapsed denied list of a clicked denied-overflow AGGREGATE badge (TZ-4b
+    /// OPERATOR_NOTE #3.2, review-4 change 3). The ratified affordance is a POPOVER anchored at the
+    /// cursor listing the denied item names + the aggregate's implied (lower-bound) size — so every
+    /// denied fact the badge stands for is reachable, not merely counted. `impliedText` is the
+    /// caller-formatted "≥ N (contents unreadable)" qualifier. `p` is the cursor in DEVICE PIXELS
+    /// (top-left origin), converted here to the view's y-up point space. Bounded (long lists
+    /// truncate with a "… N more" tail — never a wall of items).
+    func showDeniedList(title: String, items: [String], impliedText: String, atPx p: Point) {
+        let vc = Self.makeDeniedListVC(title: title, impliedText: impliedText, items: items)
+        deniedPopover.contentViewController = vc
+        deniedPopover.contentSize = vc.preferredContentSize
+        let scale = Double(window?.backingScaleFactor ?? 2.0)
+        // Device px (top-left, y-down) → view points (bottom-left, y-up) — inverse of layoutPoint.
+        let viewPt = NSPoint(x: p.x / scale, y: Double(bounds.height) - p.y / scale)
+        // A 1×1 anchor rect at the cursor; the popover chooses a non-clipping edge itself.
+        let anchor = NSRect(x: viewPt.x, y: viewPt.y, width: 1, height: 1)
+        deniedPopover.show(relativeTo: anchor, of: self, preferredEdge: .maxY)
+    }
+
+    /// Build the disclosure popover's content: a bold title, the implied-size qualifier, and the
+    /// denied item names (bounded to 40 with a "… N more" tail). A plain vertical stack in a view
+    /// controller — presentation only; the CONTENT (names + implied size) is resolved by the pure,
+    /// unit-tested `TreemapScene.deniedInventory`, so this method carries no untested logic.
+    private static func makeDeniedListVC(title: String, impliedText: String,
+                                         items: [String]) -> NSViewController {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 3
+        stack.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        stack.addArrangedSubview(titleLabel)
+
+        let impliedLabel = NSTextField(labelWithString: impliedText)
+        impliedLabel.font = .systemFont(ofSize: 11)
+        impliedLabel.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(impliedLabel)
+
+        let shown = items.prefix(40)
+        for name in shown {
+            let row = NSTextField(labelWithString: name)
+            row.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+            stack.addArrangedSubview(row)
+        }
+        if items.count > shown.count {
+            let more = NSTextField(labelWithString: "… and \(items.count - shown.count) more")
+            more.font = .systemFont(ofSize: 11)
+            more.textColor = .tertiaryLabelColor
+            stack.addArrangedSubview(more)
+        }
+
+        // Give the stack a concrete size from its content: an offscreen NSPopover has no
+        // window to resolve Auto Layout against, so `contentSize` must be set explicitly or it
+        // renders zero-sized. `fittingSize` computes from the arranged subviews' intrinsic sizes
+        // without a window; we clamp the width so a long path does not make a runaway-wide popover.
+        stack.layoutSubtreeIfNeeded()
+        var size = stack.fittingSize
+        size.width = min(max(size.width, 180), 520)
+        stack.frame = NSRect(origin: .zero, size: size)
+
+        let vc = NSViewController()
+        vc.view = stack
+        vc.preferredContentSize = size
+        return vc
+    }
 
     /// Anchor the callout chip near the cursor, clamped strictly inside the view. Placed
     /// down-right of the cursor by default, flipping to the opposite side when it would

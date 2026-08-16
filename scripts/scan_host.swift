@@ -38,10 +38,10 @@ private let viewportB = (w: 1300, h: 520)
 struct ScanHost {
     static func main() async {
         let args = CommandLine.arguments
-        guard args.count == 4 else {
-            die("usage: \(args.first ?? "scan_host") <shaders.metal> <out1.png> <out2.png>")
+        guard args.count == 5 else {
+            die("usage: \(args.first ?? "scan_host") <shaders.metal> <out1.png> <out2.png> <promoted.png>")
         }
-        let shaderPath = args[1], out1 = args[2], out2 = args[3]
+        let shaderPath = args[1], out1 = args[2], out2 = args[3], outPromoted = args[4]
 
         // 1. Build the fixture tree.
         let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -73,7 +73,80 @@ struct ScanHost {
         renderFrame(device: device, renderer: renderer, tree: tree,
                     px: viewportB.w, py: viewportB.h, out: out2)
 
-        print("SCAN_HOST OK: walked \(tree.nodeCount) nodes, allocated \(tree.allocatedBytes) bytes; wrote \(out1) + \(out2)")
+        // 5. ROOT-PROMOTION frame (TZ-4b): scan a child dir, promote to its parent via the
+        //    real reReoot graft + sibling-exclusion walk, and render the promoted map — the
+        //    old child as ONE tile among the new siblings, INCLUDING a denied minimum-area
+        //    badge tile. Deterministic: the promotion parent contains only what we build.
+        await renderPromotedFrame(device: device, renderer: renderer, out: outPromoted)
+
+        print("SCAN_HOST OK: walked \(tree.nodeCount) nodes, allocated \(tree.allocatedBytes) bytes; wrote \(out1) + \(out2) + \(outPromoted)")
+    }
+
+    // MARK: - Root promotion frame (TZ-4b)
+
+    /// Build `promoteParent/{home/…, sibling/c.txt, locked(000)}`, scan `home`, promote to
+    /// `promoteParent` (graft + sibling-exclusion walk), assert the promoted structure +
+    /// the denied badge's minimum area, then render one frame.
+    static func renderPromotedFrame(device: MTLDevice, renderer: QuadRenderer, out: String) async {
+        let fm = FileManager.default
+        let parent = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("terrazzo-promote-\(UUID().uuidString)", isDirectory: true)
+        let home = parent.appendingPathComponent("home", isDirectory: true)
+        let locked = parent.appendingPathComponent("locked", isDirectory: true)
+        func mkdir(_ u: URL) { try? fm.createDirectory(at: u, withIntermediateDirectories: true) }
+        func write(_ u: URL, _ s: String) { try? Data(s.utf8).write(to: u) }
+        defer {
+            try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: locked.path)
+            try? fm.removeItem(at: parent)
+        }
+
+        // A meaningful `home` subtree, a real sibling, and a denied (chmod-000) sibling.
+        let docs = home.appendingPathComponent("Docs", isDirectory: true)
+        mkdir(docs); write(docs.appendingPathComponent("a.txt"), String(repeating: "a", count: 4096))
+        write(home.appendingPathComponent("b.txt"), String(repeating: "b", count: 2048))
+        let sibling = parent.appendingPathComponent("sibling", isDirectory: true)
+        mkdir(sibling); write(sibling.appendingPathComponent("c.txt"), String(repeating: "c", count: 8192))
+        mkdir(locked); write(locked.appendingPathComponent("secret"), "top secret")
+        try? fm.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked.path)
+
+        // Scan `home`, then promote to `parent`: graft + sibling-exclusion walk.
+        var reducer = ScanReducer(rootId: home.path, rootName: home.lastPathComponent)
+        for await batch in FileSystemWalker.scan(root: home) { reducer.apply(batch) }
+        reducer.reRoot(to: parent.path, newRootName: parent.lastPathComponent)
+        for await batch in FileSystemWalker.scanSiblings(
+            newRoot: parent, newRootId: parent.path, excludingChildId: home.path) {
+            reducer.apply(batch)
+        }
+        let ptree = reducer.makeTree(depthWindow: window)
+
+        // Assert the promoted structure: old child grafted + new siblings + denied badge.
+        guard ptree.id == parent.path else { die("promoted root id is not the parent") }
+        let names = ptree.children.map(\.name).sorted()
+        guard names == ["home", "locked", "sibling"] else {
+            die("promoted children unexpected: \(names)")
+        }
+        guard ptree.children.first(where: { $0.name == "locked" })?.kind == .denied else {
+            die("the promoted map's denied sibling did not surface as denied")
+        }
+        guard ptree.children.first(where: { $0.name == "home" })?.children.isEmpty == false else {
+            die("the grafted `home` subtree was lost across promotion")
+        }
+
+        // Rider 1: the denied badge is floored to EXACTLY the minimum area at this scale
+        // (review-0 finding 3 — the true floor, not half of it).
+        let viewport = Rect(x: 0, y: 0, width: Double(viewportA.w), height: Double(viewportA.h))
+        let tiles = TreemapScene.layout(tree: ptree, viewport: viewport)
+        guard let deniedTile = tiles.first(where: { $0.kind == .denied }) else {
+            die("no denied tile in the promoted layout")
+        }
+        let floorTolerance = TreemapScene.minBadgeArea * 1e-3
+        guard deniedTile.rect.area >= TreemapScene.minBadgeArea - floorTolerance else {
+            die("denied badge is below the minimum (\(deniedTile.rect.area) < \(TreemapScene.minBadgeArea)) — rider 1 floor failed")
+        }
+
+        renderFrame(device: device, renderer: renderer, tree: ptree,
+                    px: viewportA.w, py: viewportA.h, out: out)
+        print("  promoted frame \(out): root=\(parent.lastPathComponent), children=\(names), denied badge area=\(Int(deniedTile.rect.area))px²")
     }
 
     // MARK: - Fixture (mirrors Tests/FixtureFS/FixtureWalkTests)

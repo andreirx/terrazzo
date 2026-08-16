@@ -5,9 +5,11 @@
 //  Shows the numbers the founding mystery is about (VISION §"Purgeable vs
 //  free"): the volume's capacity, its free space via BOTH availability APIs
 //  (their difference is purgeable), the scanned-so-far total, and whether the
-//  scan is still running. TZ-2 shows these figures; the synthetic UNACCOUNTED
-//  tile that reconciles scanned-vs-free is TZ-4 (out of scope here) — so this
-//  strip is the honest interim place the two accountings sit side by side.
+//  scan is still running. Since TZ-4b (HUMAN FIELD RULING #1) it ALSO carries the
+//  "Unaccounted" reconciliation figure (`capacity − free − scanned`, decomposed) —
+//  which was briefly a synthetic MAP TILE and is now, by binding ruling, a
+//  status-bar figure ONLY (a volume quantity has no honest rectangle inside a
+//  subtree map). So this strip is where the two accountings sit side by side.
 //
 //  Pure presentation: it receives a `ScanStatus` value (raw Int64 bytes crossing
 //  from ScanFS's VolumeProbe DTO) and formats it. No filesystem access.
@@ -46,12 +48,19 @@ struct ScanStatus {
     var filesProcessed: Int = 0
     /// Volume used-inode count at scan start (progress-bar denominator); 0 ⇒ unknown.
     var totalInodes: Int64 = 0
+    /// Whether the scan ROOT is a selectable volume's root (ScanFS
+    /// `VolumeSkipPolicy.isVolumeRoot`). Gates the percentage/ETA honesty rule
+    /// (OPERATOR_NOTE #2 item 2): a subtree scan shows files/sec + a count, not a fraction
+    /// against the volume-wide inode denominator.
+    var isVolumeRoot: Bool = false
 
     /// The file-count progress derived from this status (TZ-4). The ControlBar renders
-    /// its clamped fraction + ETA; kept here so the arithmetic (pure `ScanProgress`)
-    /// stays testable and out of the AppKit view.
+    /// its clamped fraction + ETA (volume-root scan) or files/sec + count (subtree scan);
+    /// kept here so the arithmetic (pure `ScanProgress`) stays testable and out of the
+    /// AppKit view.
     var progress: ScanProgress {
-        ScanProgress(filesProcessed: filesProcessed, usedInodes: totalInodes, running: running)
+        ScanProgress(filesProcessed: filesProcessed, usedInodes: totalInodes,
+                     running: running, isVolumeRoot: isVolumeRoot)
     }
 }
 
@@ -74,12 +83,13 @@ final class StatusBar: NSView {
     /// The volume accounting line (TZ-2), now one NSTextField per field so each
     /// carries its own hover tooltip (deliverable 5d) — trailing, monospaced digits.
     private let volumeStack = NSStackView()
-    /// Reused pool of field labels (max 7: Capacity/Free/Reclaimable/Available up
-    /// to/Scanned + the optional "N tiles below pixel size" + the scan indicator).
-    /// Fixed and small → reuse, no per-update churn (the CanvasView.setTileLabels
-    /// pattern). `fields(_:)` returns a variable-length subset; extra labels hide.
+    /// Reused pool of field labels (max 8: Capacity/Free/Reclaimable/Available up
+    /// to/Scanned + the optional "Unaccounted …" figure + the optional "N tiles below
+    /// pixel size" + the scan indicator). Fixed and small → reuse, no per-update churn
+    /// (the CanvasView.setTileLabels pattern). `fields(_:)` returns a variable-length
+    /// subset; extra labels hide.
     private var fieldLabels: [NSTextField] = []
-    private static let maxFields = 7
+    private static let maxFields = 8
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -205,6 +215,22 @@ final class StatusBar: NSView {
         out.append(VolumeField(
             value: "Scanned \(b(s.scannedBytes))",
             tooltip: "Total size Terrazzo has measured so far."))
+        // UNACCOUNTED (TZ-4b, HUMAN FIELD RULING #1: status-bar figure, NEVER a map tile).
+        // The residual `capacity − free − scanned`, decomposed as purgeable + other/unknown
+        // (space no scan from this POSIX account can see — FDA never crosses user
+        // boundaries, VISION). Computed by the pure, tested `UnaccountedSpace.figure` (which
+        // guarantees purgeable + other/unknown == the total, so this readout always adds up).
+        // ALWAYS shown when volume accounting is known, INCLUDING zero (VISION §"Purgeable vs
+        // free": "The number is always shown" — a reconciled volume reads "Unaccounted 0",
+        // not a vanished field; review-4 change 2). Only a failed/absent probe (no `s.volume`)
+        // omits it, because then there is no capacity to reconcile against.
+        if let v = s.volume {
+            let u = UnaccountedSpace.figure(capacity: v.capacityBytes, free: v.availableBytes,
+                                            scanned: s.scannedBytes, purgeable: v.purgeableBytes)
+            out.append(VolumeField(
+                value: "Unaccounted \(b(u.total)) (purgeable \(b(u.purgeable)) + other/unknown \(b(u.unknown)))",
+                tooltip: "Volume space Terrazzo could not measure: capacity − free − scanned. Split into reclaimable (purgeable) space and files no scan from this account can see — other users’ home folders and snapshots (Full Disk Access never crosses user boundaries). The two parts always add up to the total. Not a folder; never drawn on the map."))
+        }
         // Sub-pixel cull count — shown only when non-zero (no "0 tiles" clutter on a
         // small map). PLAN §"Rendering scale": culled tiles are REPORTED, never silently
         // dropped — the invisible-space principle applied to below-pixel mass.

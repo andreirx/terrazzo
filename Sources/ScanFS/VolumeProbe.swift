@@ -77,8 +77,19 @@ public enum VolumeProbe {
     /// clamped ≥ 0 (a transient count where free momentarily exceeds total is an honest
     /// zero, not a negative).
     public static func usedInodes(for url: URL) -> Int64? {
+        // FIRMLINK TRAP (operator fix 2026-08-16, seen in TZ-4b promotion evidence):
+        // statfs("/") describes the SEALED SYSTEM volume (~460k inodes), but a scan
+        // rooted at "/" walks the DATA volume's population through firmlinks
+        // (/Users, /Library, /private…). Using the system volume's count made the
+        // promoted-to-/ progress denominator ~10x too small (clamped at 99%).
+        // For the boot root, read the Data role volume instead; fall back to the
+        // literal path if that mount is absent (non-boot volumes are unaffected —
+        // their path IS their data volume).
+        let probePath = url.path == "/" ? "/System/Volumes/Data" : url.path
         var s = statfs()
-        guard statfs(url.path, &s) == 0 else { return nil }
+        if statfs(probePath, &s) != 0 {
+            guard probePath != url.path, statfs(url.path, &s) == 0 else { return nil }
+        }
         let used = Int64(bitPattern: UInt64(s.f_files)) - Int64(bitPattern: UInt64(s.f_ffree))
         return max(0, used)
     }

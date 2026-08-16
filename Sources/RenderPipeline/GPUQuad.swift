@@ -68,8 +68,9 @@ public struct GPUQuad: Equatable, Sendable {
     public var g: Float
     public var b: Float
     /// Fragment-shader style branch: 0 = normal data tile (darkened border),
-    /// 1 = pending (outlined-dim), 2 = denied (reserved colour). A Float so the CPU
-    /// mirror stays all-Float (no hidden alignment padding).
+    /// 1 = pending (outlined-dim), 2 = denied (reserved colour), 3 = denied-overflow
+    /// AGGREGATE ("N denied items" — a hatched denied badge, TZ-4b OPERATOR_NOTE #3.2).
+    /// A Float so the CPU mirror stays all-Float (no hidden alignment padding).
     public var style: Float
 
     public init(x: Float, y: Float, w: Float, h: Float,
@@ -91,15 +92,12 @@ public enum QuadBuilder {
     // Denied space: its OWN warm amber-red, deliberately off the data ramp (VISION
     // §"invisible space is first-class"; name honesty — never approximated as data).
     private static let deniedColor: (Float, Float, Float) = (0.86, 0.34, 0.24)
+    // Denied-overflow AGGREGATE: a deeper, desaturated amber so the "N denied items" badge
+    // reads as related-to-but-distinct-from a single denied tile; the shader adds a hatch.
+    private static let deniedAggregateColor: (Float, Float, Float) = (0.62, 0.30, 0.26)
     // Pending fill: a very dim blue-grey; the shader adds a bright outline so a
     // not-yet-known region reads as an outlined placeholder, not empty canvas.
     private static let pendingColor: (Float, Float, Float) = (0.30, 0.36, 0.46)
-    // SYNTHETIC (unaccounted) tile: a desaturated steel grey, deliberately OFF the data
-    // hue wheel AND distinct from denied amber / pending blue-grey, so a volume-accounting
-    // residual is never mistaken for a folder (VISION §"invisible space is first-class";
-    // packet 7: "must NEVER be confused with a real folder"). The shader (style 3) adds a
-    // diagonal hatch to reinforce "not real data".
-    private static let syntheticColor: (Float, Float, Float) = (0.34, 0.37, 0.42)
 
     /// Resolve every tile to a render-ready quad, 1:1 and in order.
     public static func build(tiles: [TileRect]) -> [GPUQuad] {
@@ -110,15 +108,17 @@ public enum QuadBuilder {
     }
 
     /// The colour precedence QuadRenderer used to compute per draw, now once per
-    /// scene: synthetic (kind) → denied (kind) → pending (scanState) → normal data
-    /// (hue · dim ladder). Synthetic and denied are KIND facts; pending is a STATE fact
-    /// (not finished) — all first-class, never silent. Synthetic is checked FIRST: it is
-    /// a reserved accounting tile whose reserved colour must win over any hue.
+    /// scene: denied-aggregate → denied (kind) → pending (scanState) → normal data
+    /// (hue · dim ladder). Denied is a KIND fact; pending is a STATE fact (not finished)
+    /// — both first-class, never silent. Style 3 (once the retired `.synthetic`
+    /// unaccounted hatch — HUMAN FIELD RULING #1) is REVIVED with a new meaning: the
+    /// denied-overflow AGGREGATE badge (TZ-4b OPERATOR_NOTE #3.2), distinguished by
+    /// `TileRect.deniedAggregateCount > 0`.
     public static func quad(for t: TileRect) -> GPUQuad {
         let color: (Float, Float, Float)
         let style: Float
-        if t.kind == .synthetic {
-            color = syntheticColor; style = 3
+        if t.kind == .denied && t.deniedAggregateCount > 0 {
+            color = deniedAggregateColor; style = 3
         } else if t.kind == .denied {
             color = deniedColor; style = 2
         } else if t.scanState != .complete {

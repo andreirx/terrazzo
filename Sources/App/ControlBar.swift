@@ -9,7 +9,11 @@
 //    - Progress bar    — file-count progress (filesProcessed / statfs used-inodes),
 //                        clamped below 100 % while denied files inflate the denominator,
 //                        snapping to done on completion; tooltip says "estimate".
-//    - ETA label       — a rolling files/sec-derived estimate next to the bar.
+//                        ONLY for a volume-root scan; a subtree scan shows a barber-pole.
+//    - ETA / readout   — a rolling files/sec-derived ETA next to the bar for a volume-root
+//                        scan; for a SUBTREE scan (OPERATOR_NOTE #2 item 2, binding) the
+//                        volume-inode denominator is not the workload, so there is NO
+//                        percentage and NO ETA — the readout is "N files · R/sec" instead.
 //
 //  THE PROGRESS ARITHMETIC IS PURE (`ScanCore.ScanProgress`): this view only measures
 //  the rolling rate (two timed samples) and formats. The clamp rule ("never claim 100 %
@@ -101,27 +105,34 @@ final class ControlBar: NSView {
 
     @objc private func rescanClicked() { onRescan?() }
 
-    /// Update the progress bar + ETA from a scan-progress snapshot (TZ-4). Indeterminate
-    /// denominator ⇒ a barber-pole; otherwise the clamped fraction. ETA uses a rolling
-    /// files/sec rate measured here and the pure `ScanProgress.etaSeconds` formula.
+    /// Update the progress bar + readout from a scan-progress snapshot (TZ-4 / TZ-4b).
+    ///
+    /// TWO HONEST MODES (OPERATOR_NOTE #2 item 2 — the volume-inode denominator is the
+    /// workload of a VOLUME-ROOT scan, not a `~`/subtree scan):
+    ///   - VOLUME-ROOT scan: `progress.fraction` is non-nil ⇒ determinate bar + an ETA.
+    ///   - SUBTREE scan: `progress.fraction`/`etaSeconds` are nil by design ⇒ a
+    ///     barber-pole (activity, not a fake %) + a "N files · R/sec" readout. NO
+    ///     percentage, NO ETA against a denominator that is not this scan's workload.
+    /// The rolling files/sec rate is measured here (stateful, two samples) and feeds BOTH
+    /// the ETA (volume-root) and the subtree readout.
     func update(_ progress: ScanProgress) {
+        sampleRate(progress)
         if let fraction = progress.fraction {
             if progressBar.isIndeterminate { progressBar.isIndeterminate = false }
             progressBar.doubleValue = fraction
         } else {
-            // No denominator yet — show motion, not a fake 0 %.
+            // Subtree scan (or no denominator yet) — show motion, not a fake 0 %.
             if !progressBar.isIndeterminate {
                 progressBar.isIndeterminate = true
                 progressBar.startAnimation(nil)
             }
         }
-        etaLabel.stringValue = etaText(for: progress)
+        etaLabel.stringValue = readout(for: progress)
     }
 
-    /// Measure the rolling rate and format the ETA line. Kept private; the pure ETA
-    /// formula is `ScanProgress.etaSeconds`.
-    private func etaText(for progress: ScanProgress) -> String {
-        guard progress.running else { return "done" }
+    /// Measure the rolling files/sec rate into `smoothedRate` (EMA over two timed
+    /// samples). Presentation-only; no effect on the pure `ScanProgress`.
+    private func sampleRate(_ progress: ScanProgress) {
         let now = CACurrentMediaTime()
         if lastSampleTime > 0 {
             let dt = now - lastSampleTime
@@ -137,10 +148,34 @@ final class ControlBar: NSView {
             lastSampleTime = now
             lastFiles = progress.filesProcessed
         }
-        guard let seconds = progress.etaSeconds(filesPerSecond: smoothedRate) else {
-            return "estimating…"
+    }
+
+    /// The trailing readout: ETA for a volume-root scan; files/sec + a processed count for
+    /// a subtree scan (the honest substitute when there is no meaningful percentage/ETA).
+    /// The mode is decided by the pure `ScanProgress` (`fraction`/`etaSeconds` return nil
+    /// for a subtree), so this view never re-derives the volume-root rule.
+    private func readout(for progress: ScanProgress) -> String {
+        guard progress.running else { return "done" }
+        // Volume-root scan: an honest ETA (nil ⇒ still estimating the rate).
+        if progress.isVolumeRoot {
+            guard let seconds = progress.etaSeconds(filesPerSecond: smoothedRate) else {
+                return "estimating…"
+            }
+            return "~\(Self.formatDuration(seconds)) left"
         }
-        return "~\(Self.formatDuration(seconds)) left"
+        // Subtree scan: files processed + rate, NO percentage, NO ETA.
+        let files = Self.count(progress.filesProcessed)
+        guard smoothedRate > 0 else { return "\(files) files" }
+        return "\(files) files · \(Self.count(Int(smoothedRate.rounded())))/sec"
+    }
+
+    /// Grouped integer ("1,234,567") for the file/rate readout.
+    private static let counter: NumberFormatter = {
+        let f = NumberFormatter(); f.numberStyle = .decimal; f.maximumFractionDigits = 0
+        return f
+    }()
+    private static func count(_ n: Int) -> String {
+        counter.string(from: NSNumber(value: n)) ?? "\(n)"
     }
 
     /// "1h 04m", "3m 20s", "45s" — a coarse remaining-time string.

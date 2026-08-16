@@ -36,7 +36,8 @@ struct GPUQuad {
     float r;
     float g;
     float b;
-    float style; // 0 normal, 1 pending (outlined-dim), 2 denied, 3 synthetic (hatched)
+    float style; // 0 normal, 1 pending (outlined-dim), 2 denied,
+                 // 3 denied-overflow AGGREGATE ("N denied items" — hatched, TZ-4b #3.2)
 };
 
 // CPU mirror: QuadRenderer.Uniforms. Field order + sizes MUST match.
@@ -113,16 +114,12 @@ fragment float4 quad_fragment(VOut in [[stage_in]]) {
             c *= 0.55;                                       // dim interior
         }
     } else if (in.style > 2.5) {
-        // SYNTHETIC (unaccounted): reserved steel-grey fill with a diagonal HATCH so it
-        // reads unmistakably as "not a folder" (VISION §"invisible space is first-class").
-        // Hatch = periodic bright stripes along (x+y); a thin darker border like data tiles.
-        float stripe = fmod(p.x + p.y, 12.0);
-        if (stripe < 2.0) {
-            c *= 1.7;                                        // bright hatch line
-        }
-        if (minSide > 3.0 && d < 1.0) {
-            c *= 0.35;                                       // border
-        }
+        // DENIED-OVERFLOW AGGREGATE (style 3, TZ-4b #3.2): a hatched denied badge so a
+        // "N denied items" tile reads as MANY-denied, distinct from a single denied tile.
+        // Diagonal stripes in device pixels; a thin darker border like the other tiles.
+        float stripe = fract((p.x + p.y) / 8.0);             // 8px diagonal period
+        if (stripe < 0.5) { c *= 1.35; } else { c *= 0.6; }  // bright/dark hatch bands
+        if (minSide > 3.0 && d < 1.0) { c *= 0.35; }
     } else {
         // NORMAL data tile and DENIED tile: thin darker border so nested tiles
         // read as distinct rectangles (slivers stay solid — no border swallow).

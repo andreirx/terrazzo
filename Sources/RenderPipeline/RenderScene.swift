@@ -19,9 +19,11 @@
 //  tree on main — TileRect now carries the display metadata (name + allocated/logical
 //  bytes) they need, denormalized on the actor at layout time, so those lookups touch
 //  only the viewport-bounded rendered tile the user is on (the ratified law forbids
-//  main work that scales with node count). `tree` rides along now only for the O(1)
-//  `scannedBytes` (root allocated) the status bar shows, and to let the pipeline test
-//  introspect the projected structure. It stays a raw value; nothing on main walks it.
+//  main work that scales with node count). `tree` rides along now only to let the
+//  pipeline test introspect the projected structure. It stays a raw value; nothing on
+//  main walks it. SINCE TZ-4b it is rooted at the FOCUS (focus-rooted projection), not
+//  the scan root — so the status bar's "Scanned" total can no longer be read off its
+//  root; `scannedBytes` carries the scan-root total explicitly (see below).
 //
 //  ABSTRACTION LEDGER: `RenderScene`/`SceneLabel` are DTOs, not abstractions —
 //  concrete current users: `ScenePipeline` (producer) and the App's ScanController/
@@ -101,11 +103,16 @@ public struct RenderScene: Equatable, Sendable {
     public let settleFrom: [GPUQuad]
     /// Pre-composed top-level labels (dimLevel 1 tiles).
     public let labels: [SceneLabel]
-    /// The projected tree. Main uses it ONLY for the O(1) `scannedBytes` (root
-    /// allocated); hover/menu read denormalized TileRect metadata instead of walking
-    /// it (review-3 item 1). Also lets the pipeline test introspect the projected
+    /// The projected tree, rooted at the FOCUS since TZ-4b's focus-rooted projection.
+    /// Hover/menu read denormalized TileRect metadata instead of walking it (review-3
+    /// item 1); this rides along only to let the pipeline test introspect the projected
     /// structure. Never traversed on main, never used for layout.
     public let tree: SizeTree
+    /// Full recursive scanned total (SCAN ROOT allocated) — the status bar's "Scanned".
+    /// Carried EXPLICITLY (not read off `tree.allocatedBytes`) because `tree` is now rooted
+    /// at the focus, which under a dive is a subfolder, not the scan root. The pipeline
+    /// computes it from the reducer's scan-root total (a cheap Int64 sum, off main).
+    public let scannedBytes: Int64
     /// How many laid-out tiles were dropped as sub-pixel before this scene was built
     /// (PLAN §"Rendering scale": "cull rects < ~2 px … no silent truncation"). Carried
     /// so the count is REPORTABLE (status line / evidence), never silently swallowed —
@@ -120,15 +127,12 @@ public struct RenderScene: Equatable, Sendable {
     /// statfs used-inode denominator it read at scan start. Rides on the scene because
     /// the reducer lives on the pipeline actor; main never touches the reducer.
     public let filesProcessed: Int
-    /// The volume's purgeable (reclaimable) bytes, carried so the App can DECOMPOSE the
-    /// unaccounted tile's hover readout ("purgeable X + other users / unknown Y", human
-    /// directive 2026-08-16) without a second volume query on main. 0 when unknown.
-    public let purgeableBytes: Int64
 
     public init(generation: Int, focusId: String, viewport: Rect,
                 tiles: [TileRect], nodeIds: [String], quads: [GPUQuad], settleFrom: [GPUQuad],
                 labels: [SceneLabel], tree: SizeTree, belowPixelCount: Int,
-                running: Bool, filesProcessed: Int = 0, purgeableBytes: Int64 = 0) {
+                running: Bool, filesProcessed: Int = 0,
+                scannedBytes: Int64? = nil) {
         self.generation = generation
         self.focusId = focusId
         self.viewport = viewport
@@ -141,9 +145,9 @@ public struct RenderScene: Equatable, Sendable {
         self.belowPixelCount = belowPixelCount
         self.running = running
         self.filesProcessed = filesProcessed
-        self.purgeableBytes = purgeableBytes
+        // Default to the tree root's total for the WHOLE-TREE (focus == root) case and for
+        // test constructors that don't distinguish; the pipeline always passes the true
+        // scan-root total explicitly under a focus-rooted (dived) projection.
+        self.scannedBytes = scannedBytes ?? tree.allocatedBytes
     }
-
-    /// Full recursive scanned total (root allocated) — the status bar's "Scanned".
-    public var scannedBytes: Int64 { tree.allocatedBytes }
 }

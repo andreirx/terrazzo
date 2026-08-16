@@ -55,8 +55,11 @@
 //  absorbed by the settle — the geometric inverse of dive. AscendHandoffTests pins
 //  the t=0 all-shared-tile match within epsilon.
 //
-//  DETAIL ON DEMAND (decision 4): diving deeper posts a higher projection depth to
-//  the pipeline, which re-projects the already-scanned tree deeper — never a rescan.
+//  DETAIL ON DEMAND (decision 4): diving posts the new focus to the pipeline, which
+//  RE-PROJECTS the already-scanned (retained) tree at the new focus — never a rescan.
+//  The projection window is a FIXED depth the pipeline owns (focus-rooted projection,
+//  OPERATOR_NOTE #2); the controller posts only the focus id (review-4 change 4 removed
+//  the inert per-focus depth this used to compute and thread through).
 //
 //  ABSTRACTION LEDGER: one concrete coordinator, one caller (AppDelegate). It is the
 //  CanvasInputDelegate (its one implementer). No protocol beyond that input seam.
@@ -66,9 +69,6 @@ import AppKit
 
 @MainActor
 final class NavigationController: CanvasInputDelegate {
-    /// Render window below the focus (levels of child detail). Matches the scene's
-    /// default so the projected tree always carries enough detail to fill the window.
-    private static let renderWindow = TreemapScene.defaultDepthWindow
 
     // MARK: Scroll-feel constants (TZ-3b rider 2). One INTENTIONAL zoom step per
     // gesture unit; sustained scrolling steps rhythmically because a step can only
@@ -138,13 +138,14 @@ final class NavigationController: CanvasInputDelegate {
     /// arrived: the NEXT scene at that focus drives the commit morph from `flightBase`
     /// rather than from its own (stale, cross-focus) `settleFrom`.
     private var awaitingFocusScene = false
+    /// Armed between requesting a root PROMOTION and the promoted scene arriving (TZ-4b):
+    /// the new root to land on, the old root (now a child) to shrink into, and the exact
+    /// prebuilt map that filled the screen at the old root — the promotion camera's t=0
+    /// world. The promoted scene (force-emitted by the pipeline re-root) is recognized in
+    /// `onScene` by `newRootId` and drives the inverse-of-dive camera instead of snapping.
+    private var pendingPromotion: (newRootId: String, oldRootId: String, oldDisplayed: DisplaySnapshot)?
     /// Path targeted by the right-click context menu item (deepest tile under click).
     private var contextTargetPath: String?
-    /// Anchor (device px) for the synthetic-tile explainer popover — captured at the
-    /// click / context-menu location so a menu action fired later still has a position.
-    private var syntheticAnchorPx: Point?
-    /// The reused "About Unaccounted space" explainer popover (TZ-4 D7). Lazily built.
-    private var explainerPopover: NSPopover?
 
     private static let sizeFormatter: ByteCountFormatter = {
         let f = ByteCountFormatter(); f.countStyle = .file; f.allowsNonnumericFormatting = false
@@ -166,12 +167,13 @@ final class NavigationController: CanvasInputDelegate {
         if Self.traceEnabled { print("TZTRACE \(s)"); fflush(stdout) }
     }
 
-    /// Post the current focus + its projection depth to the pipeline (detail on
-    /// demand). Called on every dive/ascend so the pipeline lays out the new focus.
+    /// Post the current focus to the pipeline. Called on every dive/ascend so the pipeline
+    /// lays out the new focus. The pipeline projects a FIXED render window from the focus
+    /// (focus-rooted projection, OPERATOR_NOTE #2), so no depth is threaded through — the
+    /// former `requestedDetailDepth` was inert and was removed (review-4 change 4).
     private func applyFocusToPipeline() {
         guard let focusId = focusStack.last else { return }
-        let focusDepth = max(0, focusStack.count - 1)
-        scanController?.setFocus(focusId, projectionDepth: focusDepth + Self.renderWindow)
+        scanController?.setFocus(focusId)
     }
 
     /// Post the current viewport to the pipeline (startup + resize). Called by
@@ -192,6 +194,14 @@ final class NavigationController: CanvasInputDelegate {
         }
         // Do not disturb an in-flight camera animation; it presents on commit.
         guard !isAnimatingCamera else { return }
+        // Root promotion (TZ-4b): the promoted scene the pipeline re-root force-emitted.
+        // Recognized by the pending new-root id; drives the inverse-of-dive camera (the
+        // old map shrinks into its slot among the new siblings) rather than snapping in.
+        if let promo = pendingPromotion, scene.focusId == promo.newRootId {
+            pendingPromotion = nil
+            runPromotionCamera(scene: scene, promo: promo)
+            return
+        }
         // Ignore a scene laid out for a focus we have already left (in flight when
         // the user dived/ascended). The matching scene follows immediately.
         guard scene.focusId == focusStack.last else { return }
@@ -276,10 +286,10 @@ final class NavigationController: CanvasInputDelegate {
         hoverChain = HitTest.hit(tiles: displayed.tiles, at: p)
         canvas.setHighlightIndex(currentHighlightIndex())
         if let tile = hoverChain?.deepest {
-            // Callout chip anchored ON the tile near the cursor (D9); full path (or the
-            // decomposed unaccounted explanation) in the bottom bar.
+            // Callout chip anchored ON the tile near the cursor (D9); the hovered node's
+            // full path in the bottom bar (a node id IS its absolute path under the scan).
             canvas.setCallout(text: calloutText(for: tile), hue: tile.hue, atPx: p)
-            bottomBar.setHoverPath(hoverPathText(for: tile))
+            bottomBar.setHoverPath(tile.nodeId)
         } else {
             canvas.clearCallout()
             bottomBar.setHoverPath(nil)
@@ -295,10 +305,52 @@ final class NavigationController: CanvasInputDelegate {
 
     func canvasDidClick(atPx p: Point) {
         guard !isAnimatingCamera else { return }
-        guard let top = HitTest.hit(tiles: displayed.tiles, at: p)?.topLevelUnderFocus else { return }
-        // The UNACCOUNTED tile is not a folder — never dive it; explain instead (D7).
-        if top.kind == .synthetic { syntheticAnchorPx = p; showSyntheticExplainer(atPx: p); return }
+        guard let chain = HitTest.hit(tiles: displayed.tiles, at: p) else { return }
+        // Denied-overflow AGGREGATE (TZ-4b #3.2): a click DISCLOSES the collapsed denied list
+        // (the ratified "click shows the list") rather than diving — the badge is a synthetic
+        // tile, not a folder to enter.
+        if chain.deepest.deniedAggregateCount > 0 {
+            discloseDeniedAggregate(chain.deepest, atPx: p)
+            return
+        }
+        guard let top = chain.topLevelUnderFocus else { return }
         dive(to: top.nodeId)
+    }
+
+    /// Disclose a clicked denied-overflow aggregate: the denied item names under its parent AND
+    /// their implied (lower-bound) size.
+    ///
+    /// REVIEW-5 CORRECTION (blocking): the names/size resolution now runs ON THE PIPELINE ACTOR
+    /// (`ScanController.deniedDisclosure` → `ScenePipeline.deniedDisclosure`), off main. It
+    /// previously walked the emitted scene tree HERE (`latestScene.tree.node(withId:)` +
+    /// `TreemapScene.deniedDisclosure`) — an O(retained-in-window)+O(parent fanout) traversal on
+    /// the main actor that violated the ratified main-thread law and `SizeTree.node(withId:)`'s
+    /// documented "never on main" contract; a high-fanout denied parent could stall interaction
+    /// while opening its disclosure. This method now does NO tree traversal: it recovers the
+    /// parent name from the synthetic nodeId (a pure O(1) string op) for the title, dispatches the
+    /// lookup to the actor, and — back on main with the raw `DeniedDisclosure` DTO — only formats
+    /// and presents. If the parent is no longer retained (or there is no pipeline) it falls back to
+    /// a count-only disclosure read straight off the clicked tile (no traversal).
+    private func discloseDeniedAggregate(_ tile: TileRect, atPx p: Point) {
+        let count = tile.deniedAggregateCount
+        let fallbackBytes = tile.allocatedBytes
+        let parentName = TreemapScene.deniedAggregateParentId(from: tile.nodeId)
+            .map { ($0 as NSString).lastPathComponent } ?? ""
+        let title = parentName.isEmpty ? "\(count) denied items" : "Denied in \(parentName)"
+        scanController?.deniedDisclosure(aggregateNodeId: tile.nodeId) { [weak self] disclosure in
+            guard let self else { return }
+            let names = disclosure?.names ?? []
+            let impliedBytes = disclosure?.impliedBytes ?? fallbackBytes
+            // Contract v2: the list is the parent's FULL denied inventory; the badge stands in
+            // for `count` of them. Say both numbers so neither can be mistaken for the other.
+            let summary = names.count > count
+                ? "\(names.count) denied items · \(count) collapsed into this badge"
+                : "\(max(names.count, count)) denied items"
+            self.canvas.showDeniedList(
+                title: title, items: names,
+                impliedText: "\(summary) · ≥ \(Self.sizeFormatter.string(fromByteCount: impliedBytes)) (contents unreadable)",
+                atPx: p)
+        }
     }
 
     func canvasDidScroll(deltaY: Double, precise: Bool, atPx p: Point) {
@@ -309,9 +361,7 @@ final class NavigationController: CanvasInputDelegate {
         scrollAccum += deltaY
         if scrollAccum >= step {
             scrollAccum = 0
-            // Scroll-in dives — but never into the synthetic unaccounted tile (D7).
-            if let top = HitTest.hit(tiles: displayed.tiles, at: p)?.topLevelUnderFocus,
-               top.kind != .synthetic {
+            if let top = HitTest.hit(tiles: displayed.tiles, at: p)?.topLevelUnderFocus {
                 dive(to: top.nodeId)
             }
         } else if scrollAccum <= -step {
@@ -323,18 +373,8 @@ final class NavigationController: CanvasInputDelegate {
     func canvasContextMenu(atPx p: Point) -> NSMenu? {
         guard let deepest = HitTest.hit(tiles: displayed.tiles, at: p)?.deepest else { return nil }
         let menu = NSMenu()
-        // The unaccounted tile is not revealable in Finder (no real path) — offer the
-        // explainer instead (D7). Name/kind come PREBUILT on the hit tile (denormalized
-        // off main at layout time) — no tree traversal on the main actor.
-        if deepest.kind == .synthetic {
-            contextTargetPath = nil
-            syntheticAnchorPx = p
-            let item = NSMenuItem(title: "About Unaccounted space…",
-                                  action: #selector(explainSyntheticFromMenu), keyEquivalent: "")
-            item.target = self
-            menu.addItem(item)
-            return menu
-        }
+        // Name comes PREBUILT on the hit tile (denormalized off main at layout time) — no
+        // tree traversal on the main actor.
         contextTargetPath = deepest.nodeId
         let name = deepest.name.isEmpty ? deepest.nodeId : deepest.name
         let item = NSMenuItem(title: "Reveal “\(name)” in Finder",
@@ -352,9 +392,6 @@ final class NavigationController: CanvasInputDelegate {
     private func dive(to childId: String) {
         guard childId != focusStack.last else { return }
         guard let childTile = displayed.tiles.first(where: { $0.nodeId == childId }) else { return }
-        // Defense in depth: the synthetic unaccounted tile is never a dive target (D7);
-        // the click/scroll paths already gate on it, this guards any other caller.
-        guard childTile.kind != .synthetic else { return }
         let childRect = childTile.rect
         trace("dive -> \(childId)")
         let base = displayed // already prebuilt — no QuadBuilder on main (OPERATOR_NOTE gap 1)
@@ -382,7 +419,9 @@ final class NavigationController: CanvasInputDelegate {
     /// scene the pipeline emits (TZ-3b rider 1, review-0 gap 3).
     func ascend() {
         guard !isAnimatingCamera else { return }
-        guard focusStack.count > 1 else { return }
+        // At the scan root there is no parent tile in the map — zoom-out PROMOTES the
+        // root one level instead (TZ-4b root promotion), repeatable to the volume root.
+        guard focusStack.count > 1 else { promote(); return }
         let childId = focusStack[focusStack.count - 1]
         let parentId = focusStack[focusStack.count - 2]
 
@@ -424,6 +463,60 @@ final class NavigationController: CanvasInputDelegate {
                 // parent scene streams in via onScene shortly.
                 self.presentSnapshot(cachedParent)
             }
+            self.scanController?.setPhase("scanning")
+        }
+    }
+
+    /// PROMOTE the scan root one level up (zoom-out AT the scan root, TZ-4b root
+    /// promotion). Ask ScanController to re-root the pipeline + walk the new siblings; it
+    /// returns the new root id (or nil at the volume root — nothing above to promote to).
+    /// We land focus on the new root and arm `pendingPromotion`, so the promoted scene the
+    /// re-root force-emits runs the inverse-of-dive camera in `onScene`. No camera starts
+    /// here: we have not yet seen the promoted layout, so we do not know the old root's new
+    /// slot; the promoted scene carries it.
+    private func promote() {
+        // One promotion in flight at a time: a rapid second scroll-out (or the threading
+        // harness's repeated ascends) must not stack re-roots before the first resolves.
+        guard pendingPromotion == nil else { return }
+        guard focusStack.count == 1, let oldRootId = focusStack.first else { return }
+        guard let newRootId = scanController?.promoteRoot() else {
+            trace("promote \(oldRootId) -> <at volume root, ignored>")
+            return
+        }
+        trace("promote \(oldRootId) -> \(newRootId)")
+        pendingPromotion = (newRootId: newRootId, oldRootId: oldRootId, oldDisplayed: displayed)
+        // Land on the new root; the old root is now one child among the new siblings.
+        focusStack = [newRootId]
+        sceneStack = []
+    }
+
+    /// Run the PROMOTION camera: the inverse of a dive. The promoted `scene` is the new
+    /// root's freshly-laid map, in which the old root is one tile (its slot `childRect`).
+    /// We embed the old displayed map into that slot (so t=0 IS the old map exactly, no
+    /// snap — the same `QuadGeometry.embedChild` ascend uses), then fly the camera from
+    /// the slot filling the viewport out to identity: the old map shrinks into its parent
+    /// tile as the new siblings settle around it. On commit we morph onto the freshest
+    /// new-root scene.
+    private func runPromotionCamera(
+        scene: RenderScene,
+        promo: (newRootId: String, oldRootId: String, oldDisplayed: DisplaySnapshot)
+    ) {
+        latestScene = scene
+        guard let childTile = scene.tiles.first(where: { $0.nodeId == promo.oldRootId }) else {
+            // The old root is not in the promoted scene (unexpected) — snap in honestly.
+            presentScene(scene, from: scene.settleFrom, animated: false)
+            return
+        }
+        let childRect = childTile.rect
+        let vp = viewport
+        let (baseQuads, baseNodeIds) = QuadGeometry.embedChild(
+            childQuads: promo.oldDisplayed.quads, childNodeIds: promo.oldDisplayed.nodeIds,
+            into: childRect, parentQuads: scene.quads, parentNodeIds: scene.nodeIds,
+            childId: promo.oldRootId)
+        animateCamera(fromFrame: childRect, toFrame: vp,
+                      baseQuads: baseQuads, baseNodeIds: baseNodeIds) { [weak self] in
+            guard let self else { return }
+            self.commitToLatestScene()
             self.scanController?.setPhase("scanning")
         }
     }
@@ -520,14 +613,16 @@ final class NavigationController: CanvasInputDelegate {
     func driveNavigationStep(dive: Bool) {
         guard !isAnimatingCamera else { return }
         if dive {
-            // Dive into the LARGEST top-level folder — the deepest subtree, so the
+            // Dive into the LARGEST top-level DIRECTORY — the deepest subtree, so the
             // camera base built on main (and the pipeline's re-projection) is the most
-            // demanding case, not a trivial leaf. This scan is over the VIEWPORT-CULLED
-            // `displayed.tiles` (bounded by viewport/threshold, not node count), and is
-            // HARNESS-ONLY (not on any app input path) — it stands in for the human's
-            // pick of a tile, which the conduct rule forbids simulating with real input.
+            // demanding case, not a trivial leaf. Restricted to `.dir` tiles: a denied/file
+            // tile has no children — picking one would make dive() a no-op and the harness
+            // would never descend. This
+            // scan is over the VIEWPORT-CULLED `displayed.tiles` (bounded by viewport/threshold,
+            // not node count), and is HARNESS-ONLY (not on any app input path) — it stands in
+            // for the human's pick of a tile, which the conduct rule forbids simulating.
             let biggest = displayed.tiles
-                .filter { $0.dimLevel == 1 }
+                .filter { $0.dimLevel == 1 && $0.kind == .dir }
                 .max { $0.rect.area < $1.rect.area }?.nodeId
             if let biggest { self.dive(to: biggest) }
         } else {
@@ -544,8 +639,6 @@ final class NavigationController: CanvasInputDelegate {
     /// ⌘R: reveal the currently hovered tile's deepest node (VISION §Experience 5).
     @objc func revealHovered() {
         guard let tile = hoverChain?.deepest else { trace("reveal(hover) -> <no hover>"); return }
-        // The synthetic unaccounted tile has no real path — never send it to Finder (D7).
-        guard tile.kind != .synthetic else { trace("reveal(hover) -> <synthetic, ignored>"); return }
         trace("reveal(hover) -> \(tile.nodeId)"); FinderActions.revealInFinder(path: tile.nodeId)
     }
 
@@ -561,6 +654,7 @@ final class NavigationController: CanvasInputDelegate {
         cameraTimer?.invalidate(); cameraTimer = nil
         isAnimatingCamera = false
         awaitingFocusScene = false
+        pendingPromotion = nil
         latestScene = nil
         focusStack = []
         sceneStack = []
@@ -574,17 +668,21 @@ final class NavigationController: CanvasInputDelegate {
         bottomBar.setHoverPath(nil)
     }
 
-    // MARK: - Hover callout / path text (TZ-4 D9) + synthetic explainer (D7)
+    // MARK: - Hover callout / path text (TZ-4 D9)
 
     /// The on-tile callout chip text: name + allocated size (+ logical only when it
     /// differs). Read straight off the hit `TileRect` (name/sizes denormalized onto the
     /// tile on the pipeline actor at layout time, TZ-3b) — NO tree traversal on main.
     private func calloutText(for tile: TileRect) -> String {
-        if tile.kind == .synthetic {
-            let name = tile.name.isEmpty ? SyntheticTile.unaccountedName : tile.name
-            return "\(name)  ·  \(Self.sizeFormatter.string(fromByteCount: tile.allocatedBytes))"
-        }
         let name = tile.name.isEmpty ? (tile.nodeId as NSString).lastPathComponent : tile.name
+        // Denied-overflow AGGREGATE (TZ-4b #3.2, review-4 change 3): the hover states BOTH the
+        // count AND the implied size — the sum of the collapsed denied dirs' KNOWN bytes, a
+        // LOWER bound (their contents are unreadable), so it is qualified with "≥" and never
+        // presented as a measured total. The click then discloses the list (popover).
+        if tile.deniedAggregateCount > 0 {
+            let implied = Self.sizeFormatter.string(fromByteCount: tile.allocatedBytes)
+            return "\(tile.deniedAggregateCount) denied items  ·  ≥ \(implied)  ·  click to list"
+        }
         // Denied dir (D6): the readout SAYS "no permission" (its size is only the dir's
         // own entry — contents are unreadable), with the path shown in the bottom bar.
         if tile.kind == .denied {
@@ -596,58 +694,5 @@ final class NavigationController: CanvasInputDelegate {
             return "\(name)  ·  \(alloc)  (logical \(logical))"
         }
         return "\(name)  ·  \(alloc)"
-    }
-
-    /// The bottom-bar hover text: the hovered node's FULL path, or — for the synthetic
-    /// unaccounted tile — its DECOMPOSED accounting (human directive 2026-08-16):
-    /// "purgeable X + other users / unknown Y", phrased as space no scan from this POSIX
-    /// account can see (FDA never crosses user boundaries — VISION).
-    private func hoverPathText(for tile: TileRect) -> String {
-        guard tile.kind == .synthetic else { return tile.nodeId }
-        let purgeable = latestScene?.purgeableBytes ?? 0
-        let (p, unknown) = SyntheticTile.decompose(unaccounted: tile.allocatedBytes, purgeable: purgeable)
-        let ps = Self.sizeFormatter.string(fromByteCount: p)
-        let us = Self.sizeFormatter.string(fromByteCount: unknown)
-        return "Unaccounted — purgeable \(ps) + other users / unknown \(us) (space no scan from this account can see)"
-    }
-
-    @objc private func explainSyntheticFromMenu() {
-        showSyntheticExplainer(atPx: syntheticAnchorPx ?? Point(x: viewport.width / 2, y: viewport.height / 2))
-    }
-
-    /// Show the "About Unaccounted space" explainer popover anchored at `p` (device px).
-    /// The unaccounted tile is a volume-accounting residual, not a folder — this is the
-    /// short explanation the packet requires clicking it to surface (D7).
-    private func showSyntheticExplainer(atPx p: Point) {
-        let pop = explainerPopover ?? Self.makeExplainerPopover()
-        explainerPopover = pop
-        let scale = Double(canvas.window?.backingScaleFactor ?? 2.0)
-        let xPt = p.x / scale
-        let yUp = Double(canvas.bounds.height) - (p.y / scale) // device px (y-down) → view pts (y-up)
-        let rect = NSRect(x: xPt - 1, y: yUp - 1, width: 2, height: 2)
-        pop.show(relativeTo: rect, of: canvas, preferredEdge: .maxY)
-    }
-
-    private static func makeExplainerPopover() -> NSPopover {
-        let text = NSTextField(wrappingLabelWithString:
-            "Unaccounted space\n\nThis isn’t a folder — it’s the gap between the volume’s used space and everything Terrazzo could measure from this account. It covers reclaimable (purgeable) space plus files no scan from your user can see: other users’ home folders and system snapshots.\n\nFull Disk Access lets Terrazzo read TCC-protected files, but it never crosses POSIX user boundaries, so this residual is the closest estimate of other users’ disk usage. It can’t be opened or revealed in Finder.")
-        text.font = .systemFont(ofSize: 11)
-        text.translatesAutoresizingMaskIntoConstraints = false
-        text.preferredMaxLayoutWidth = 300
-        let container = NSView()
-        container.addSubview(text)
-        NSLayoutConstraint.activate([
-            text.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 14),
-            text.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -14),
-            text.topAnchor.constraint(equalTo: container.topAnchor, constant: 14),
-            text.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -14),
-            text.widthAnchor.constraint(equalToConstant: 300),
-        ])
-        let vc = NSViewController()
-        vc.view = container
-        let pop = NSPopover()
-        pop.contentViewController = vc
-        pop.behavior = .transient
-        return pop
     }
 }

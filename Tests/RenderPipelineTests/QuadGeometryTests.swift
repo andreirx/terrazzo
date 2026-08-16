@@ -19,11 +19,13 @@
 //      t=0 camera (childRect → viewport) is the exact inverse of that embed, so at t=0
 //      EVERY shared child-subtree tile maps back onto the committed child scene within
 //      Float epsilon — all shared tiles, no focus-only carve-out, no viewport tolerance.
-//   2. DIVE COMMITS EXACTLY on the focus. `commitFrom` places each committed tile where
-//      its node sat in the camera's last frame; the focus tile lands filling the
-//      viewport with zero deviation (the mass the eye tracks does not jump), a node
-//      absent from the base carries its own committed quad, and the result is
-//      index-parallel with the committed scene.
+//   2. DIVE COMMITS EXACTLY on the focus, AND RE-TINTS AT COMMIT. `commitFrom` places each
+//      committed tile where its node sat in the camera's last frame (geometry) but snaps its
+//      COLOUR/STYLE to the committed focus-relative scene (review-1 finding 2), so the focus
+//      tile lands filling the viewport with zero deviation (the mass the eye tracks does not
+//      jump), a shared node's hue changes to its new-focus tint from frame 0, a node absent
+//      from the base carries its own committed quad, and the result is index-parallel with
+//      the committed scene.
 //
 
 import XCTest
@@ -151,13 +153,29 @@ final class QuadGeometryTests: XCTestCase {
                     "committed node \(id) absent from the flight base falls back to its own quad")
                 checkedAbsent = true
             }
-            // A shared node present in the base morphs FROM its transformed base position.
+            // A shared node present in the base morphs FROM its camera-last-frame GEOMETRY
+            // but with the COMMITTED scene's COLOUR/STYLE snapped in (review-1 finding 2: the
+            // focus-relative re-tint lands AT commit, not after the settle).
             let baseById = Dictionary(uniqueKeysWithValues: zip(parent.nodeIds, parent.quads))
+            var sawReTint = false
             for (i, id) in child.nodeIds.enumerated() where baseById[id] != nil && id != childId {
-                let expected = QuadGeometry.transform(baseById[id]!, by: finalCam)
-                XCTAssertEqual(from[i], expected,
+                let endGeom = QuadGeometry.transform(baseById[id]!, by: finalCam)
+                // Geometry: still the camera's last frame (the settle's spatial morph source).
+                XCTAssertLessThan(geomDev(from[i], endGeom), eps,
                     "shared node \(id) morphs from its camera-last-frame position")
+                // Colour/style: the COMMITTED scene, NOT the stale flight-base colour.
+                XCTAssertEqual(from[i].r, child.quads[i].r, "commit snaps red to the committed scene (\(id))")
+                XCTAssertEqual(from[i].g, child.quads[i].g, "commit snaps green to the committed scene (\(id))")
+                XCTAssertEqual(from[i].b, child.quads[i].b, "commit snaps blue to the committed scene (\(id))")
+                XCTAssertEqual(from[i].style, child.quads[i].style, "commit snaps style to the committed scene (\(id))")
+                // The re-tint is OBSERVABLE: at least one shared node's committed colour
+                // differs from its old (flight-base) colour — a real focus-relative recolour,
+                // not merely a changed target scene.
+                if (baseById[id]!.r, baseById[id]!.g, baseById[id]!.b)
+                    != (child.quads[i].r, child.quads[i].g, child.quads[i].b) { sawReTint = true }
             }
+            XCTAssertTrue(sawReTint,
+                "commit CHANGES colours (not only geometry): a shared node is re-tinted to its new focus-relative hue (\(childId))")
             _ = checkedAbsent // the tree is deep enough that this fires for at least one child
         }
     }

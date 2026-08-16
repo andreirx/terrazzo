@@ -85,6 +85,159 @@ public enum FileSystemWalker {
         }
     }
 
+    /// SIBLING-EXCLUSION WALK (layer b of root promotion, TZ-4b). Walk `newRoot` and
+    /// stream `ScanEvent`s for its NEW children only — the already-scanned child
+    /// `excludingChildId` (the previous scan root, now grafted under `newRoot` in the
+    /// reducer) is emitted as a GRAFT REFERENCE: its stub appears in `newRoot`'s
+    /// `childrenDiscovered` so the parent links to it, but it is NEVER re-sized or
+    /// re-entered (disjointness invariant 5 — the single enumeration point emits a graft
+    /// reference at the already-scanned child). This is what makes promotion "nothing
+    /// discarded, nothing re-scanned": the grafted subtree keeps its reducer state, and
+    /// only the siblings do fresh I/O.
+    ///
+    /// ONE SCAN = ONE DEVICE (disjointness invariant 4). A child on a DIFFERENT st_dev
+    /// than `newRoot` is a BOUNDARY STUB: shown (a tile the map admits exists) and sized
+    /// by its own directory entry, but never entered. This is the firmlink / mount guard
+    /// the invariant names — at the volume root `/` (System volume), the Data volume mount
+    /// `/System/Volumes/Data` and the firmlinked data dirs resolve to a different device
+    /// and so are not descended into, killing the /System/Volumes/Data double-count and
+    /// skipping /Volumes external mounts and network mounts. CONSEQUENCE, documented and
+    /// honest: promoting all the way to `/` shows firmlinked data dirs OTHER than the one
+    /// you promoted from as un-entered boundary stubs (their bytes fall into the
+    /// Unaccounted tile), rather than double-counting them. Full multi-volume scanning is
+    /// a named extension point (VISION §"Root-privileged scan mode"), out of this slice.
+    ///
+    /// `newRootId` is the id the reducer was re-rooted to (its absolute path); descendant
+    /// ids are `joinId(newRootId, name)`, so the whole promoted tree keeps one identity
+    /// prefix exactly as the primary scan does. Symlinks are never followed (same policy).
+    public static func scanSiblings(newRoot: URL, newRootId: String,
+                                    excludingChildId excluded: String,
+                                    policy: ScanPolicy = .default) -> AsyncStream<[ScanEvent]> {
+        AsyncStream { continuation in
+            let work = Task {
+                let batcher = EventBatcher { continuation.yield($0) }
+                let ticker = Task {
+                    while !Task.isCancelled {
+                        try? await Task.sleep(nanoseconds: BatchLimits.flushIntervalNanos)
+                        await batcher.flush()
+                    }
+                }
+                await walkNewRoot(newRoot, newRootId: newRootId, excluding: excluded,
+                                  policy: policy, batcher: batcher)
+                ticker.cancel()
+                await batcher.flush()
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in work.cancel() }
+        }
+    }
+
+    /// The new root's single enumeration point (invariant 1): emit the new root's own
+    /// size + child STRUCTURE, then fan out one task per NEW top-level directory / bundle.
+    /// The grafted child is a stub-only graft reference; a cross-device child is a
+    /// boundary stub. Sibling subtrees below the top level reuse the ordinary
+    /// `walkDirectory`/`sizeBundle` descent — the device guard is applied at the
+    /// promotion's enumeration point (where the firmlink/mount siblings live).
+    private static func walkNewRoot(_ root: URL, newRootId: String, excluding excluded: String,
+                                    policy: ScanPolicy, batcher: EventBatcher) async {
+        let (a, l) = measure(root)
+        await batcher.add([.sizeUpdated(nodeId: newRootId, allocated: a, logical: l)])
+
+        var rootStat = stat()
+        let rootDev: dev_t? = stat(root.path, &rootStat) == 0 ? rootStat.st_dev : nil
+
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey]
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: root, includingPropertiesForKeys: keys, options: []) else {
+            await batcher.add([.accessDenied(nodeId: newRootId)])
+            return
+        }
+
+        var stubs: [ChildStub] = []
+        var sizeEvents: [ScanEvent] = []
+        var boundaryEvents: [ScanEvent] = []
+        var dirsToRecurse: [(URL, String)] = []
+        var bundlesToSize: [(URL, String)] = []
+
+        for entry in entries.sorted(by: { $0.path < $1.path }) {
+            let name = entry.lastPathComponent
+            let cid = Self.joinId(newRootId, name)
+
+            // The already-scanned child: a GRAFT REFERENCE. Its stub links the new root
+            // to the preserved subtree; it is NEVER re-sized or re-entered (invariant 5).
+            if cid == excluded {
+                stubs.append(ChildStub(id: cid, name: name, kind: .dir))
+                continue
+            }
+
+            let vals = try? entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            let isSymlink = vals?.isSymbolicLink ?? false
+            let isDir = vals?.isDirectory ?? false
+            let (alloc, logi) = measure(entry)
+
+            if isSymlink {
+                stubs.append(ChildStub(id: cid, name: name, kind: .file))
+                sizeEvents.append(.sizeUpdated(nodeId: cid, allocated: alloc, logical: logi))
+                continue
+            }
+
+            // One scan = one device (invariant 4): a directory on a different st_dev is a
+            // boundary stub — shown + sized by its own entry, never entered.
+            if isDir, let rootDev {
+                var cst = stat()
+                if lstat(entry.path, &cst) == 0, cst.st_dev != rootDev {
+                    stubs.append(ChildStub(id: cid, name: name, kind: .dir))
+                    boundaryEvents.append(.sizeUpdated(nodeId: cid, allocated: alloc, logical: logi))
+                    boundaryEvents.append(.subtreeCompleted(nodeId: cid))
+                    continue
+                }
+            }
+
+            if isDir && policy.isBundleLeaf(name: name) {
+                stubs.append(ChildStub(id: cid, name: name, kind: .bundleLeaf))
+                bundlesToSize.append((entry, cid))
+            } else if isDir {
+                stubs.append(ChildStub(id: cid, name: name, kind: .dir))
+                sizeEvents.append(.sizeUpdated(nodeId: cid, allocated: alloc, logical: logi))
+                dirsToRecurse.append((entry, cid))
+            } else {
+                stubs.append(ChildStub(id: cid, name: name, kind: .file))
+                sizeEvents.append(.sizeUpdated(nodeId: cid, allocated: alloc, logical: logi))
+            }
+        }
+
+        await batcher.add([.childrenDiscovered(parentId: newRootId, children: stubs)])
+        if !sizeEvents.isEmpty { await batcher.add(sizeEvents) }
+        if !boundaryEvents.isEmpty { await batcher.add(boundaryEvents) }
+
+        await withTaskGroup(of: Void.self) { group in
+            for (url, id) in dirsToRecurse {
+                // Propagate the promoted-root device DOWN the whole sibling descent so
+                // ONE SCAN = ONE DEVICE holds throughout, not only for the promoted root's
+                // direct children (review-0 finding 2, PLAN disjointness invariant 4). A
+                // mount/firmlink anywhere below a new sibling is a boundary stub, never
+                // entered.
+                group.addTask {
+                    await walkDirectory(url, id: id, policy: policy, batcher: batcher,
+                                        boundaryDevice: rootDev)
+                }
+            }
+            for (url, id) in bundlesToSize {
+                group.addTask {
+                    await sizeBundle(url, id: id, batcher: batcher, boundaryDevice: rootDev)
+                }
+            }
+        }
+        await batcher.add([.subtreeCompleted(nodeId: newRootId)])
+    }
+
+    /// The `st_dev` of an entry itself (never following a symlink), or `nil` if it could
+    /// not be stat'd. Used to enforce the one-device invariant during descent.
+    private static func lstatDevice(_ url: URL) -> dev_t? {
+        var st = stat()
+        return lstat(url.path, &st) == 0 ? st.st_dev : nil
+    }
+
     /// Join a parent node id and a child name into the child's node id. A plain
     /// path join with exactly one separator — handles a root id of "/" (root scan,
     /// TZ-4) without producing "//child". This is the ONE place descendant ids are
@@ -159,11 +312,18 @@ public enum FileSystemWalker {
     /// Nested-bundle sizing is sequential here (not its own task): it only delays
     /// THIS subtree's own worker, never the other top-level tiles, so the
     /// ratified per-top-level-folder concurrency still holds.
+    ///
+    /// `boundaryDevice` (non-nil only in the sibling-exclusion promotion descent) enforces
+    /// ONE SCAN = ONE DEVICE: `classifyChildren` turns any child dir on a different device
+    /// into a boundary stub and keeps it out of `dirsToRecurse`, so it is never entered.
+    /// The primary scan passes `nil` — its behavior is unchanged.
     private static func walkDirectory(_ url: URL, id: String,
-                                      policy: ScanPolicy, batcher: EventBatcher) async {
+                                      policy: ScanPolicy, batcher: EventBatcher,
+                                      boundaryDevice: dev_t? = nil) async {
         if Task.isCancelled { return }
 
-        guard let classified = classifyChildren(of: url, parentId: id, policy: policy) else {
+        guard let classified = classifyChildren(of: url, parentId: id, policy: policy,
+                                                boundaryDevice: boundaryDevice) else {
             await batcher.add([.accessDenied(nodeId: id)])
             return
         }
@@ -173,11 +333,13 @@ public enum FileSystemWalker {
 
         for (childURL, childId) in classified.dirsToRecurse {
             if Task.isCancelled { return }
-            await walkDirectory(childURL, id: childId, policy: policy, batcher: batcher)
+            await walkDirectory(childURL, id: childId, policy: policy, batcher: batcher,
+                                boundaryDevice: boundaryDevice)
         }
         for (bundleURL, bundleId) in classified.bundlesToSize {
             if Task.isCancelled { return }
-            await sizeBundle(bundleURL, id: bundleId, batcher: batcher)
+            await sizeBundle(bundleURL, id: bundleId, batcher: batcher,
+                             boundaryDevice: boundaryDevice)
         }
         await batcher.add([.subtreeCompleted(nodeId: id)])
     }
@@ -192,8 +354,9 @@ public enum FileSystemWalker {
     /// exactly like any un-enterable directory — it is sized by its OWN entry and
     /// marked `accessDenied`: a "we don't know" tile, never a silently-truncated
     /// total (VISION §"invisible space is first-class").
-    private static func sizeBundle(_ url: URL, id: String, batcher: EventBatcher) async {
-        guard let (ba, bl, fullyRead) = bundleTotal(url) else { return } // cancelled
+    private static func sizeBundle(_ url: URL, id: String, batcher: EventBatcher,
+                                   boundaryDevice: dev_t? = nil) async {
+        guard let (ba, bl, fullyRead) = bundleTotal(url, boundaryDevice: boundaryDevice) else { return } // cancelled
         if fullyRead {
             await batcher.add([.sizeUpdated(nodeId: id, allocated: ba, logical: bl),
                                .subtreeCompleted(nodeId: id)])
@@ -206,7 +369,11 @@ public enum FileSystemWalker {
 
     // MARK: - Classification
 
-    private struct Classified {
+    /// Internal (not private) so the promotion one-device decision is testable without a
+    /// real cross-device mount (which needs root/hdiutil): a test calls `classifyChildren`
+    /// with a `boundaryDevice` that differs from the fixture's real device and asserts the
+    /// cross-device branch fires. Justified test seam (review-0 finding 2).
+    struct Classified {
         var stubs: [ChildStub] = []
         /// Immediate own-entry sizes for everything sized SYNCHRONOUSLY during
         /// classification: files, symlinks, and directories' own entries. Bundle
@@ -229,8 +396,16 @@ public enum FileSystemWalker {
     /// Entries are sorted by path so a single worker's emission order is
     /// deterministic; the reducer re-sorts by name regardless, so this only aids
     /// reproducibility of the stream itself.
-    private static func classifyChildren(of dir: URL, parentId: String,
-                                         policy: ScanPolicy) -> Classified? {
+    ///
+    /// `boundaryDevice` (non-nil only in the promotion descent) enforces ONE SCAN = ONE
+    /// DEVICE: a child directory whose own `st_dev` differs is emitted as a BOUNDARY STUB —
+    /// shown, sized by its own entry, marked `subtreeCompleted` (so it renders complete,
+    /// not pending) — and kept OUT of `dirsToRecurse`/`bundlesToSize`, so it is never
+    /// entered (PLAN invariant 4). Internal so a test can drive this decision (see
+    /// `Classified`).
+    static func classifyChildren(of dir: URL, parentId: String,
+                                 policy: ScanPolicy,
+                                 boundaryDevice: dev_t? = nil) -> Classified? {
         let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey]
         // Hidden entries are ALWAYS enumerated (never `.skipsHiddenFiles`):
         // surfacing "typically hidden" paths IS the product (VISION). This is a
@@ -264,6 +439,14 @@ public enum FileSystemWalker {
                 // Never followed: a leaf sized by the link itself.
                 out.stubs.append(ChildStub(id: cid, name: name, kind: .file))
                 out.sizeEvents.append(.sizeUpdated(nodeId: cid, allocated: alloc, logical: logi))
+            } else if isDir, let boundaryDevice, let childDev = lstatDevice(entry),
+                      childDev != boundaryDevice {
+                // One device (invariant 4): a cross-device directory — a mount or firmlink
+                // — is a boundary stub. Shown + sized by its own entry + marked complete,
+                // but NEVER entered (kept out of dirsToRecurse/bundlesToSize).
+                out.stubs.append(ChildStub(id: cid, name: name, kind: .dir))
+                out.sizeEvents.append(.sizeUpdated(nodeId: cid, allocated: alloc, logical: logi))
+                out.sizeEvents.append(.subtreeCompleted(nodeId: cid))
             } else if isDir && policy.isBundleLeaf(name: name) {
                 // Opaque leaf. Its stub appears NOW (so the tile shows immediately,
                 // rendered pending), but its recursive sizing is DEFERRED to
@@ -304,7 +487,8 @@ public enum FileSystemWalker {
     /// cancelled deep bundle stops promptly instead of walking to completion.
     /// `nil` is distinct from `fullyRead == false`: cancelled means "stop, emit
     /// nothing"; not-fully-read means "denied, emit the honest we-don't-know tile".
-    private static func bundleTotal(_ url: URL) -> (allocated: Int64, logical: Int64, fullyRead: Bool)? {
+    private static func bundleTotal(_ url: URL, boundaryDevice: dev_t? = nil)
+        -> (allocated: Int64, logical: Int64, fullyRead: Bool)? {
         if Task.isCancelled { return nil }
         let (selfA, selfL) = measure(url)
         var totalA = selfA, totalL = selfL
@@ -321,7 +505,11 @@ public enum FileSystemWalker {
                 let (a, l) = measure(entry)
                 totalA += a; totalL += l
             } else if vals?.isDirectory == true {
-                guard let (a, l, sub) = bundleTotal(entry) else { return nil }
+                // One device (invariant 4): a cross-device dir inside a bundle belongs to
+                // another volume — never summed, never entered. Rare, but keeps a promoted
+                // bundle's total honest to its own device.
+                if let boundaryDevice, let d = lstatDevice(entry), d != boundaryDevice { continue }
+                guard let (a, l, sub) = bundleTotal(entry, boundaryDevice: boundaryDevice) else { return nil }
                 totalA += a; totalL += l
                 fullyRead = fullyRead && sub
             } else {

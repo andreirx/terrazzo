@@ -21,6 +21,18 @@
 //  timed samples) and lives in the App's control strip, which feeds its measured rate
 //  into `etaSeconds` here. No time source, no I/O — a value function of its inputs.
 //
+//  ETA HONESTY FOR SUBTREE SCANS (OPERATOR_NOTE 2026-08-16 #2 item 2, binding field
+//  ruling). The statfs used-inode denominator is the WHOLE VOLUME's population — it is
+//  the workload of a VOLUME-ROOT scan, NOT of a `~`/subtree scan (a `~` scan touches a
+//  small fraction of those inodes, so dividing by the volume total produced a nonsense
+//  "4h left"). Rule: a percentage + ETA are shown ONLY when the scan root IS the volume
+//  root; for a subtree scan `fraction`/`etaSeconds` return nil (the App then shows
+//  files/sec + a processed count instead — motion and a real number, no fabricated
+//  fraction). `isVolumeRoot` carries that fact from the App (it reads it once at scan
+//  start, ScanFS `VolumeSkipPolicy.isVolumeRoot` — the same judgment the FDA banner uses).
+//  Root promotion makes the volume-root case the common one, so the percentage/ETA return
+//  as the scan reaches the volume root.
+//
 //  ABSTRACTION LEDGER: a pure value + static functions, no protocol, no state machine.
 //  Concrete users: the App's ControlBar (renders fraction + ETA) and ScanProgressTests
 //  (pins the clamp + ETA). Rejected simpler alternative — compute the ratio inline in
@@ -38,11 +50,17 @@ public struct ScanProgress: Equatable, Sendable {
     public let usedInodes: Int64
     /// Whether the scan is still streaming. Drives the snap-to-done rule.
     public let running: Bool
+    /// Whether the scan ROOT is the volume root. The volume-wide inode denominator is the
+    /// workload of a volume-root scan only, so a percentage + ETA are honest ONLY here; a
+    /// subtree scan (`isVolumeRoot == false`) suppresses both (OPERATOR_NOTE #2 item 2).
+    public let isVolumeRoot: Bool
 
-    public init(filesProcessed: Int, usedInodes: Int64, running: Bool) {
+    public init(filesProcessed: Int, usedInodes: Int64, running: Bool,
+                isVolumeRoot: Bool = false) {
         self.filesProcessed = filesProcessed
         self.usedInodes = usedInodes
         self.running = running
+        self.isVolumeRoot = isVolumeRoot
     }
 
     /// The running fraction is capped here, strictly below 1, so a volume-wide
@@ -50,10 +68,13 @@ public struct ScanProgress: Equatable, Sendable {
     /// while the scan is still going.
     public static let maxRunningFraction: Double = 0.99
 
-    /// Fraction in `[0, 1]`, or `nil` when the denominator is unknown (indeterminate
-    /// bar). Completed ⇒ 1 (snap to done). Running ⇒ `min(raw, maxRunningFraction)`,
-    /// and never negative.
+    /// Fraction in `[0, 1]`, or `nil` when there is no honest percentage to show:
+    /// the scan root is NOT the volume root (a subtree scan — the volume-wide inode
+    /// denominator is not its workload, OPERATOR_NOTE #2 item 2), OR the denominator is
+    /// unknown (no statfs). Completed ⇒ 1 (snap to done). Running ⇒
+    /// `min(raw, maxRunningFraction)`, and never negative.
     public var fraction: Double? {
+        guard isVolumeRoot else { return nil } // subtree scan: no percentage
         guard usedInodes > 0 else { return nil }
         guard running else { return 1.0 }
         let raw = Double(filesProcessed) / Double(usedInodes)
@@ -68,9 +89,12 @@ public struct ScanProgress: Equatable, Sendable {
     }
 
     /// Estimated seconds remaining, given a measured `filesPerSecond` rate. `nil` when
-    /// indeterminate (no denominator), already done, or the rate is non-positive (no
-    /// basis to extrapolate — show "estimating…" rather than a fabricated number).
+    /// the scan root is not the volume root (a subtree scan has no honest volume-inode
+    /// ETA — OPERATOR_NOTE #2 item 2), indeterminate (no denominator), already done, or
+    /// the rate is non-positive (no basis to extrapolate — show "estimating…" rather than
+    /// a fabricated number).
     public func etaSeconds(filesPerSecond: Double) -> Double? {
+        guard isVolumeRoot else { return nil } // subtree scan: no ETA
         guard running, filesPerSecond > 0, let remaining = remainingInodes, remaining > 0
         else { return nil }
         return Double(remaining) / filesPerSecond

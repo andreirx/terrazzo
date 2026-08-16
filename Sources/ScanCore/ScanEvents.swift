@@ -98,6 +98,24 @@ public struct ScanReducer {
         var ownLogical: Int64 = 0
         /// Child ids as a set — arrival order is discarded; `makeTree` sorts.
         var childIds: Set<String> = []
+        /// This node's id in its parent's `childIds` — set EXACTLY ONCE, when the
+        /// incoming edge is added (the parent's `childrenDiscovered`, or `reRoot`'s
+        /// graft). `nil` for the current scan root (no parent) and for a node whose
+        /// parent edge has not arrived yet. Used only to propagate retained-total
+        /// deltas upward (`bumpSubtree`); a node has exactly one parent by
+        /// filesystem structure (ids are absolute paths).
+        var parentId: String?
+        /// RETAINED EXACT subtree totals = own + Σ (linked children's retained
+        /// totals), maintained INCREMENTALLY by `bumpSubtree` on every own-size
+        /// write and every edge addition. Order-independent because the only
+        /// mutations are additive deltas pushed up the parent chain, and addition
+        /// commutes — so the invariant `subtree == own + Σ children.subtree` holds
+        /// after ANY interleaving, at EVERY snapshot (partial totals included).
+        /// This is what lets `build` read a beyond-window total in O(1) instead of
+        /// traversing every hidden descendant (the focus-rooted-projection bound the
+        /// operator ratified: work is O(focus subtree ∩ window), not O(retained)).
+        var subtreeAllocated: Int64 = 0
+        var subtreeLogical: Int64 = 0
         var hasSize = false
         var discoveredChildren = false
         var denied = false
@@ -105,7 +123,10 @@ public struct ScanReducer {
     }
 
     private var nodes: [String: Node]
-    private let rootId: String
+    /// The scan root's id. MUTABLE since TZ-4b: root promotion re-roots the reducer
+    /// in place (`reRoot`) — the whole node map is preserved and a new parent is
+    /// grafted above the old root. Everywhere else this is written once at init.
+    private var rootId: String
 
     /// Count of filesystem entries the walker has STAT'd so far — the numerator of the
     /// file-count progress bar (TZ-4, PLAN ratified). Incremented exactly once per node
@@ -120,6 +141,20 @@ public struct ScanReducer {
     /// before the denial), matching an inode that exists but could not be enumerated.
     public private(set) var processedCount: Int = 0
 
+    /// The SCAN ROOT's full recursive allocated/logical totals — the status bar's "Scanned",
+    /// maintained INCREMENTALLY (O(1) per event) so it does not re-sum the whole map on every
+    /// emit. A node's own size is written at most once (walker contract + the `hasSize`
+    /// false→true guard), and the root's recursive total is exactly Σ of every node's OWN
+    /// size, so accumulating each first own-size write yields the root total directly. This is
+    /// the same monotonic first-write accounting `processedCount` uses, and it is
+    /// root-AGNOSTIC: `reRoot` only re-parents nodes (it never changes any own size), so the
+    /// accumulator stays correct across promotion — it is Σ over ALL retained nodes, which is
+    /// always the current root's full recursive total. Decoupled from the projected tree,
+    /// which since focus-rooted projection is rooted at the FOCUS, not the scan root.
+    /// (Only the allocated total is accumulated — the status bar's "Scanned" is allocated;
+    /// logical is shown per-node in hover detail, not as a scan-root aggregate.)
+    public private(set) var rootAllocatedBytes: Int64 = 0
+
     /// - Parameters:
     ///   - rootId: the scan root's stable id (its absolute path). The walker emits
     ///     events tagged with ids derived from the same root, so they match.
@@ -127,6 +162,51 @@ public struct ScanReducer {
     public init(rootId: String, rootName: String) {
         self.rootId = rootId
         self.nodes = [rootId: Node(name: rootName, stubKind: .dir)]
+    }
+
+    // MARK: - Root promotion (TZ-4b — "root promotion", ratified)
+
+    /// FULL-STATE RE-ROOT GRAFT (layer a of root promotion). Promote the scan one
+    /// level up: the current root becomes an ordinary CHILD of `newRootId`, and the
+    /// reducer's root id moves to `newRootId`. The ENTIRE existing node map is kept
+    /// verbatim — nothing is discarded, nothing is replayed. The only mutations are:
+    ///   1. create/merge the new root node (name + `.dir` stub) and add the OLD root
+    ///      id to its children, and
+    ///   2. move `rootId` to `newRootId`.
+    /// Every previously-scanned node keeps its id, sizes, child set, and flags, so the
+    /// grafted subtree projects byte-identically under the new root (the graft test
+    /// pins subtree identity/sizes/scanStates exactly). `processedCount` is untouched:
+    /// nothing was re-stat'd. The new root's OWN size and its NEW siblings arrive later
+    /// via the ScanFS sibling-exclusion walk (`FileSystemWalker.scanSiblings`), folded
+    /// through the normal `apply` path — a size event for the already-grafted child
+    /// would be a no-op on `processedCount` (its `hasSize` is already true), so a
+    /// re-emission (there is none by contract) could not double-count either.
+    ///
+    /// Idempotent-safe merge: `newRootId` may already exist as a node (e.g. it was
+    /// discovered as an ancestor stub); we merge onto it rather than overwrite, so no
+    /// prior state under that id is lost.
+    public mutating func reRoot(to newRootId: String, newRootName: String) {
+        guard newRootId != rootId else { return } // already there — nothing to promote
+        let oldRootId = rootId
+        var newRoot = nodes[newRootId] ?? Node(name: newRootName, stubKind: .dir)
+        newRoot.name = newRootName
+        newRoot.stubKind = .dir
+        let grafted = newRoot.childIds.insert(oldRootId).inserted // graft the old root as a child
+        nodes[newRootId] = newRoot
+        // Graft is an edge addition, so it uses the SAME retained-total propagation as any
+        // other edge (see `bumpSubtree`): the old root's full retained subtree total folds
+        // into the new root exactly once. Guarded by `.inserted` so a repeated promotion to
+        // an already-grafted parent (idempotent) cannot double-count. `parentId` is set on the
+        // old root here — it had none (it was the root) — completing the upward chain the new
+        // siblings' size events will later climb.
+        if grafted {
+            nodes[oldRootId]?.parentId = newRootId
+            let old = nodes[oldRootId]
+            bumpSubtree(from: newRootId,
+                        allocated: old?.subtreeAllocated ?? 0,
+                        logical: old?.subtreeLogical ?? 0)
+        }
+        rootId = newRootId
     }
 
     // MARK: - Fold
@@ -150,20 +230,48 @@ public struct ScanReducer {
             }
             var parent = nodes[parentId] ?? Node(name: "")
             parent.discoveredChildren = true
-            for stub in children { parent.childIds.insert(stub.id) }
+            // Track which edges are GENUINELY NEW (Set.insert reports it): only a new edge
+            // may fold a child's retained subtree total into the parent, so a re-stated stub
+            // (the idempotent graft reference the sibling walk emits, or any duplicate batch)
+            // cannot double-count.
+            var newlyLinked: [String] = []
+            for stub in children where parent.childIds.insert(stub.id).inserted {
+                newlyLinked.append(stub.id)
+            }
             nodes[parentId] = parent
+            // Set the parent pointer on each newly-linked child and push its CURRENT retained
+            // total up through the parent's ancestor chain. If the child's own/descendant sizes
+            // arrive LATER, their deltas climb this same chain (the child's `parentId` now
+            // points here) — so the order of "edge vs sizes" never changes the final totals.
+            for cid in newlyLinked {
+                nodes[cid]?.parentId = parentId
+                let child = nodes[cid]
+                bumpSubtree(from: parentId,
+                            allocated: child?.subtreeAllocated ?? 0,
+                            logical: child?.subtreeLogical ?? 0)
+            }
 
         case let .sizeUpdated(nodeId, allocated, logical):
             var node = nodes[nodeId] ?? Node(name: "")
-            // Count this entry as "processed" exactly once (the first own-size write).
-            // The walker emits one size event per stat'd node, but count from the
-            // false→true transition so the tally is robust to a duplicate/replayed
-            // batch and stays a pure function of the accumulated state.
-            if !node.hasSize { processedCount += 1 }
+            // Count this entry as "processed" exactly once (the first own-size write), and
+            // accumulate its own size into the scan-root total on the SAME transition. The
+            // walker emits one size event per stat'd node, but count/accumulate from the
+            // false→true transition so both stay robust to a duplicate/replayed batch and a
+            // pure function of the accumulated state.
+            if !node.hasSize {
+                processedCount += 1
+                rootAllocatedBytes += allocated
+            }
+            // The retained-total delta is the CHANGE in own size (normally 0→size on the first
+            // write; a re-stated same size is a no-op delta). Push it up the ancestor chain so
+            // every ancestor's retained subtree total stays exact.
+            let dAllocated = allocated - node.ownAllocated
+            let dLogical = logical - node.ownLogical
             node.ownAllocated = allocated
             node.ownLogical = logical
             node.hasSize = true
             nodes[nodeId] = node
+            bumpSubtree(from: nodeId, allocated: dAllocated, logical: dLogical)
 
         case let .accessDenied(nodeId):
             var node = nodes[nodeId] ?? Node(name: "")
@@ -179,51 +287,172 @@ public struct ScanReducer {
 
     // MARK: - Projection
 
-    /// Snapshot the accumulated state into a `SizeTree`.
+    /// Snapshot the accumulated state into a `SizeTree`, ROOTED AT `focusId`.
+    ///
+    /// FOCUS-ROOTED PROJECTION (TZ-4b, OPERATOR_NOTE 2026-08-16 #2 — the resolution of
+    /// the cycle-3 escalate). Before this slice `makeTree` always built from the SCAN
+    /// ROOT and the visualization layer navigated down to the focus; projection cost
+    /// therefore scaled with the WHOLE retained tree (measured 6.9 s on a full-volume
+    /// live scan — the field regression: a dive showed a flat fill for seconds). Now the
+    /// projection walks ONLY from the focus node down through the depth window, so a dive
+    /// commits in O(focus subtree ∩ window), not O(retained nodes). Equivalence is exact:
+    /// the focus-rooted result is byte-identical to the old full-build-then-navigate for
+    /// the same focus (pinned by the projection-equivalence test) — only the WORK differs.
     ///
     /// - `allocatedBytes`/`logicalBytes` are ALWAYS the full recursive totals
-    ///   (sizes true — ratified decision 4), computed bottom-up.
-    /// - Children are included only while `depth < depthWindow`; below that,
-    ///   detail FOLDS INTO the ancestor's total (which already counts it) and the
-    ///   `children` array is empty. Totals are unchanged by the window — that is
-    ///   the invariant the depth-window test pins.
+    ///   (sizes true — ratified decision 4). They are READ from each node's RETAINED
+    ///   subtree total (`Node.subtreeAllocated/Logical`), maintained incrementally during
+    ///   the fold — NOT recomputed here. So `build` never traverses a node below the
+    ///   window: the projection is O(focus subtree ∩ window), independent of how much mass
+    ///   is retained beneath the boundary. (This is the review-3 correction: the earlier
+    ///   boundary code summed hidden descendants via a recursive `subtreeTotals`, which
+    ///   reintroduced O(whole subtree) cost and contradicted the ratified bound.)
+    /// - Children are materialized only while `depth < depthWindow`; below that the
+    ///   `children` array is empty but the node's total STILL counts every hidden
+    ///   descendant (it is the retained total). Totals are unchanged by the window — the
+    ///   invariant the depth-window test pins.
     ///
-    /// - Parameter depthWindow: max retained child depth (root is depth 0).
-    public func makeTree(depthWindow: Int = ScanPolicy.default.depthDetailWindow) -> SizeTree {
-        build(id: rootId, depth: 0, depthWindow: depthWindow)
+    /// - Parameters:
+    ///   - focusId: the node to root the projection at. `nil` ⇒ the scan root (the
+    ///     original whole-tree behavior; used by the root view and the reducer's own tests).
+    ///   - depthWindow: max retained child depth (the focus is depth 0).
+    public func makeTree(focusId: String? = nil,
+                         depthWindow: Int = ScanPolicy.default.depthDetailWindow) -> SizeTree {
+        var pruned = 0
+        return build(id: focusId ?? rootId, depth: 0, depthWindow: depthWindow,
+                     area: 0, minRenderArea: 0, prunedBelowArea: &pruned)
     }
 
-    private func build(id: String, depth: Int, depthWindow: Int) -> SizeTree {
+    /// AREA-BOUNDED focus-rooted projection for the RENDER path (TZ-4b cycle-6 resolution).
+    /// Identical to `makeTree` EXCEPT a child subtree whose ESTIMATED rendered area (the
+    /// `viewportArea` split down by retained-total weight, level by level) falls below
+    /// `minRenderArea` is NOT materialized — it would be sub-pixel-culled by the composition
+    /// layer anyway, so omitting it leaves the RENDERED scene unchanged while bounding projection
+    /// cost by what is VISIBLE, not by every node in the window. That is what makes even a
+    /// VOLUME-ROOT emit O(visible tiles) rather than O(all-in-window): the ratified ≤200 ms held
+    /// for a small dive since OPERATOR_NOTE #2, but the root/near-root projection still
+    /// materialized tens of thousands of sub-pixel nodes (~900 ms measured live at -O), which
+    /// this collapses to the visible set.
+    ///
+    /// Returns the tree AND `prunedBelowArea` — how many subtrees were dropped as sub-pixel — so
+    /// the caller folds it into `belowPixelCount` and the drop is NEVER SILENT (the
+    /// invisible-space / no-silent-truncation contract). It is a FLOOR on the true dropped node
+    /// count: a pruned subtree is counted ONCE at its root, not per hidden descendant (the old
+    /// layout cull likewise took a culled parent's children with it).
+    public func makeRenderTree(focusId: String, depthWindow: Int,
+                               minRenderArea: Double, viewportArea: Double)
+        -> (tree: SizeTree, prunedBelowArea: Int) {
+        var pruned = 0
+        let t = build(id: focusId, depth: 0, depthWindow: depthWindow,
+                      area: viewportArea, minRenderArea: minRenderArea, prunedBelowArea: &pruned)
+        return (t, pruned)
+    }
+
+    private func build(id: String, depth: Int, depthWindow: Int,
+                       area: Double, minRenderArea: Double, prunedBelowArea: inout Int) -> SizeTree {
         let node = nodes[id] ?? Node(name: id)
         let kind = outputKind(node)
 
-        // Sort children canonically so enumeration order never leaks in.
-        let sortedChildIds = node.childIds.sorted { a, b in
-            let na = nodes[a]?.name ?? a
-            let nb = nodes[b]?.name ?? b
-            return na == nb ? a < b : na < nb
+        // Children are MATERIALIZED only inside the window; below it the array is empty.
+        // Either way the node's totals come from its RETAINED subtree total — read in O(1),
+        // never recomputed — so `build` visits only nodes strictly inside the window. This
+        // is the focus-rooted bound the operator ratified (review-3 correction).
+        let retained: [SizeTree]
+        if depth < depthWindow {
+            if minRenderArea > 0 && area > 0 {
+                // AREA-BOUNDED PROJECTION. Split this node's area among children in proportion
+                // to their retained totals — the SAME weighting the layer's Squarify uses — and
+                // recurse only into children that could render. The estimate is an UPPER bound
+                // on the child's true rendered area (badge-flooring only STEALS area from
+                // non-badge siblings, never grants more; the inset border only shrinks it), so a
+                // pruned child is provably sub-pixel and would be culled — never a visible tile.
+                // DENIED children are ALWAYS kept: their area is a floored badge, not
+                // proportional to their (unknown) size, and the App discloses the full denied
+                // list from the retained tree.
+                //
+                // PRUNE BEFORE SORTING (the O(visible) bound the ≤200 ms target needs). A
+                // high-fanout directory (a cache dir with tens of thousands of entries in the
+                // window) must NOT pay an O(K log K) canonical sort of children that all prune
+                // away — that sort, with its per-comparison name lookups, was the dominant cost
+                // of the volume-root emit (~900 ms live). So: one O(children) pass to total the
+                // weights and drop the sub-pixel subtrees, THEN sort only the survivors (whose
+                // count is viewport-bounded: a rect of area `area` holds at most `area/minArea`
+                // children ≥ minArea).
+                var totalW = 0.0
+                for cid in node.childIds { totalW += Double(max(0, nodes[cid]?.subtreeAllocated ?? 0)) }
+                var kept: [(id: String, area: Double)] = []
+                for cid in node.childIds {
+                    let child = nodes[cid]
+                    let w = Double(max(0, child?.subtreeAllocated ?? 0))
+                    let childArea = totalW > 0 ? area * w / totalW : 0
+                    if !(child?.denied ?? false) && childArea < minRenderArea {
+                        prunedBelowArea += 1 // count the dropped subtree (a floor — see makeRenderTree)
+                    } else {
+                        kept.append((cid, childArea))
+                    }
+                }
+                kept.sort { a, b in
+                    let na = nodes[a.id]?.name ?? a.id
+                    let nb = nodes[b.id]?.name ?? b.id
+                    return na == nb ? a.id < b.id : na < nb
+                }
+                retained = kept.map {
+                    build(id: $0.id, depth: depth + 1, depthWindow: depthWindow,
+                          area: $0.area, minRenderArea: minRenderArea, prunedBelowArea: &prunedBelowArea)
+                }
+            } else {
+                // Full projection: sort children canonically so enumeration order never leaks in.
+                let sortedChildIds = node.childIds.sorted { a, b in
+                    let na = nodes[a]?.name ?? a
+                    let nb = nodes[b]?.name ?? b
+                    return na == nb ? a < b : na < nb
+                }
+                retained = sortedChildIds.map {
+                    build(id: $0, depth: depth + 1, depthWindow: depthWindow,
+                          area: 0, minRenderArea: 0, prunedBelowArea: &prunedBelowArea)
+                }
+            }
+        } else {
+            retained = []
         }
-        let builtChildren = sortedChildIds.map {
-            build(id: $0, depth: depth + 1, depthWindow: depthWindow)
-        }
-
-        // Full recursive totals — computed regardless of the window.
-        let totalAllocated = builtChildren.reduce(node.ownAllocated) { $0 + $1.allocatedBytes }
-        let totalLogical = builtChildren.reduce(node.ownLogical) { $0 + $1.logicalBytes }
-
-        // Fold detail beyond the window: keep the total, drop the child tiles.
-        let retained = depth < depthWindow ? builtChildren : []
 
         return SizeTree(
             id: id,
             name: node.name,
             kind: kind,
-            allocatedBytes: totalAllocated,
-            logicalBytes: totalLogical,
+            allocatedBytes: node.subtreeAllocated,
+            logicalBytes: node.subtreeLogical,
             children: retained,
             scanState: outputState(node, kind: kind)
         )
     }
+
+    /// Add `allocated`/`logical` to the RETAINED subtree total of `id` and of every ANCESTOR
+    /// currently linked above it (inclusive of `id` itself). Walks the `parentId` chain — O(the
+    /// node's current depth), a small bounded constant in a filesystem — and is the ONLY place
+    /// retained totals change. Two callers push deltas here: a node's own-size write (delta =
+    /// change in own size) and an edge addition (delta = the newly-linked child's whole retained
+    /// total). Because every mutation is an additive delta and addition commutes, the invariant
+    /// `subtree == own + Σ linked children.subtree` holds after any interleaving — the reducer's
+    /// order-independence, preserved. No cycles: a `parentId` chain is strictly shallower each
+    /// step (a child id is deeper than its parent), and each edge is added at most once.
+    private mutating func bumpSubtree(from id: String, allocated: Int64, logical: Int64) {
+        if allocated == 0 && logical == 0 { return } // no-op delta (e.g. a re-stated same size)
+        var cursor: String? = id
+        while let cid = cursor, var n = nodes[cid] {
+            n.subtreeAllocated += allocated
+            n.subtreeLogical += logical
+            nodes[cid] = n
+            cursor = n.parentId
+        }
+    }
+
+    /// Whether the reducer has ever recorded `id` (via any event). The composition layer
+    /// gates emission on this: a focus-rooted projection of an id the scan has never
+    /// produced would fabricate a lone placeholder tile; the old root-rooted-then-navigate
+    /// path returned an empty layout there and the pipeline kept the last good scene. This
+    /// preserves that streaming behavior (never flash a bare fill for an unknown focus).
+    public func contains(_ id: String) -> Bool { nodes[id] != nil }
 
     /// Kind is DERIVED, order-independent: denial wins (we could not enter, so it
     /// is not an ordinary dir), else the stub's kind, else `.pending` for a node
@@ -246,10 +475,10 @@ public struct ScanReducer {
         case .pending:
             return .pending
         case .synthetic:
-            // The reducer never derives a synthetic node (only the composition layer
-            // injects one AFTER projection); this arm exists solely for exhaustiveness
-            // so adding the kind deliberately surfaced this site. A synthetic tile's
-            // accounting is final by construction.
+            // The reducer never derives a synthetic node, and nothing produces one anymore
+            // (the unaccounted tile was retracted — HUMAN FIELD RULING #1; the case is a
+            // reserved, currently-unused kind, see `NodeKind.synthetic`). This arm exists
+            // solely for exhaustiveness so any future re-introduction is compiler-surfaced.
             return .complete
         }
     }

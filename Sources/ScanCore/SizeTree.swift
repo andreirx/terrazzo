@@ -43,15 +43,17 @@ public enum NodeKind: String, Codable, Sendable {
     case denied
     /// A node discovered but not yet sized/expanded by the streaming scan.
     case pending
-    /// A SYNTHETIC accounting tile INJECTED by the composition layer
-    /// (`RenderPipeline.SyntheticTile`) — NOT produced by scanning. The per-volume
-    /// "Unaccounted" tile is the only current instance: its bytes are a volume
-    /// accounting residual (`capacity − free − scanned`), not a filesystem entry, so
-    /// it has NO real path and is never divable or revealable. First-class per VISION
-    /// §"invisible space is first-class" — the map SAYS "we don't know" rather than
-    /// omitting the gap. The walker NEVER emits this kind; the reducer never derives
-    /// it; exhaustive `switch`es carry it only so a new synthetic use breaks them
-    /// deliberately (TZ-4).
+    /// A SYNTHETIC accounting node NOT produced by scanning. RESERVED, CURRENTLY UNUSED
+    /// (TZ-4b, HUMAN FIELD RULING #1): the sole former instance — the per-volume
+    /// "Unaccounted" tile — was RETRACTED (it drew a volume-level residual inside a
+    /// subtree map, a category error), and the figure moved to a status-bar field
+    /// (`ScanCore.UnaccountedSpace`). Nothing produces `.synthetic` now: the walker
+    /// never emits it, the reducer never derives it, and no layout/render path lays it
+    /// out. The case is KEPT rather than deleted because removing a variant from this
+    /// core sum type is a boundary-shape change across the `SizeTree` DTO (CLAUDE.md:
+    /// stop-and-ask on a data shape crossing a boundary) — deferred, not done here. It
+    /// remains covered by exhaustive `switch`es so any future re-introduction is a
+    /// deliberate, compiler-surfaced decision.
     case synthetic
 }
 

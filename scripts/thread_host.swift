@@ -63,7 +63,7 @@ final class ThreadHarness {
     // walk — so this observability adds no node-count work to the measured main thread):
     //   - progress ratio advancing (filesProcessed / statfs used-inodes),
     //   - denied tiles from other users' homes at root scale (kind == .denied),
-    //   - the unaccounted synthetic tile tracking capacity − free − scanned.
+    //   - the unaccounted STATUS figure tracking capacity − free − scanned (never a tile).
     private var lastFraction: Double?
     private var lastFilesProcessed = 0
     private var lastTotalInodes: Int64 = 0
@@ -80,9 +80,27 @@ final class ThreadHarness {
     private var diving = true
     private let startNanos = DispatchTime.now().uptimeNanoseconds
 
+    // TZ-4b rider 2(b) / review-1 finding 3: FOCUS-COMMIT-TO-SCENE build latency is measured
+    // at the actor boundary inside ScanController (the wall time of the synchronous focus
+    // force-emit) — faithful to BUILD time, unlike the lossy time a newest-1-coalesced scene
+    // reaches main. We just read `controller.worstFocusEmitMs` / `focusEmitSamples` at the end.
+
+    // TZ-4b: after this many seconds the harness stops the dive/ascend toggle and enters a
+    // PROMOTION pass — repeated ascends, which from the scan root PROMOTE a level (home →
+    // /Users → /). This exercises the real promotion camera + reducer graft + sibling walk
+    // so the HitchMonitor measures the main-thread gap ACROSS a promotion (packet gate).
+    private let promoteAfterSeconds: Double
+    private var promoteSteps = 0
+    // TZ-4b: the FIRST seconds are a DIVE-ONLY burst — build depth on the live tree so deep-
+    // dive continuity (regression #4) is exercised and focus commit→scene latency (rider 2b)
+    // is sampled BEFORE the promotion pass (whose ascend-at-root promotes instead of diving).
+    private let diveBurstSeconds: Double
+
     init(root: URL, maxSeconds: Double) {
         self.root = root
         self.maxSeconds = maxSeconds
+        self.promoteAfterSeconds = min(maxSeconds * 0.4, 6)
+        self.diveBurstSeconds = min(maxSeconds * 0.2, 2.5)
         // Off-window surfaces: a CanvasView + StatusBar sized so drawableSize > 0.
         // NOTHING is added to a window; nothing is shown or activated (conduct rule).
         self.canvas = CanvasView(frame: NSRect(x: 0, y: 0, width: 1400, height: 900))
@@ -114,9 +132,21 @@ final class ThreadHarness {
             MainActor.assumeIsolated {
                 guard let self, self.running else { return }
                 if self.scenesAtFirstNav < 0 { self.scenesAtFirstNav = self.scenes }
-                self.navigation.driveNavigationStep(dive: self.diving)
+                if self.elapsedSeconds() > self.promoteAfterSeconds {
+                    // Promotion pass: ascend AT the scan root promotes a level (TZ-4b). The
+                    // TZTRACE "promote X -> Y" lines (TERRAZZO_TRACE) show home → /Users → /.
+                    self.navigation.ascend()
+                    self.promoteSteps += 1
+                } else if self.elapsedSeconds() < self.diveBurstSeconds {
+                    // DIVE-ONLY burst: descend into the largest subtree each step, going deeper
+                    // level by level (regression #4: dive beyond level 2 continues deeper,
+                    // never restarts at top) and sampling the focus commit→scene latency.
+                    self.navigation.driveNavigationStep(dive: true)
+                } else {
+                    self.navigation.driveNavigationStep(dive: self.diving)
+                    self.diving.toggle()
+                }
                 self.focusPosts += 1
-                self.diving.toggle()
             }
         }
         RunLoop.main.add(nav, forMode: .common); navTimer = nav
@@ -141,8 +171,10 @@ final class ThreadHarness {
         maxRenderedTiles = max(maxRenderedTiles, scene.tiles.count)
         maxCulled = max(maxCulled, scene.belowPixelCount)
 
-        // Denied + synthetic evidence, read off the viewport-bounded tile list (NOT a
-        // tree walk — stays O(rendered), the law's bound).
+        // Denied evidence, read off the viewport-bounded tile list (NOT a tree walk —
+        // stays O(rendered), the law's bound). (The former synthetic UNACCOUNTED tile was
+        // retracted — HUMAN FIELD RULING #1; the figure is a status-bar quantity now,
+        // computed below from capacity − free − scanned, never a tile.)
         var denied = 0
         for t in scene.tiles {
             if t.kind == .denied {
@@ -151,15 +183,17 @@ final class ThreadHarness {
                 if deniedSamples.count < 6, !deniedSamples.contains(t.nodeId) {
                     deniedSamples.append(t.nodeId)
                 }
-            } else if t.kind == .synthetic {
-                lastUnaccounted = t.allocatedBytes
             }
         }
         maxDeniedTiles = max(maxDeniedTiles, denied)
         lastScanned = scene.scannedBytes
+        // The status-bar "Unaccounted" figure (capacity − free − scanned, clamped ≥ 0).
+        lastUnaccounted = max(0, lastCapacity - lastFree - lastScanned)
 
         // Periodic progress/unaccounted trace so "the ratio advancing / the unaccounted
-        // tile tracking capacity − free − scanned" is visible during the scan.
+        // figure tracking capacity − free − scanned" is visible during the scan. `pct` is
+        // "—" for a SUBTREE scan (no percentage — OPERATOR_NOTE #2 item 2), a real % once a
+        // promotion reaches the volume root.
         let now = elapsedSeconds()
         if now - lastProgressPrint >= 2.0 {
             lastProgressPrint = now
@@ -207,7 +241,12 @@ final class ThreadHarness {
         print("TZTHREAD scenes: \(scenes)  generations monotonic: \(monotonic)  last gen: \(lastGen)")
         print("TZTHREAD max rendered tiles/scene (post-cull): \(maxRenderedTiles)  max sub-pixel culled/scene: \(maxCulled)")
         print("TZTHREAD dive/ascend posts during scan: \(focusPosts)  (scenes kept flowing across them: \(flowed ? "yes" : "n/a"))")
+        print("TZTHREAD promotion ascends issued (home → /Users → / …): \(promoteSteps)  (see TZTRACE 'promote' lines)")
         print("TZTHREAD WORST MAIN-THREAD GAP (HitchMonitor): \(String(format: "%.1f", worstGapMs)) ms  (target < 100 ms)")
+        let samples = controller.focusEmitSamples
+        let latStr = samples > 0 ? String(format: "%.1f", controller.worstFocusEmitMs) : "—"
+        print("TZTHREAD WORST FOCUS COMMIT→SCENE latency (queue+build): \(latStr) ms over \(samples) dive/ascend focus emits")
+        print("TZTHREAD   ^ INCLUDES the worst case: this harness dives into the LARGEST folder AND ascends to the VOLUME ROOT while the scan streams — a root/near-root emit plus actor-queue wait behind active folds. Both were addressed in cycle 6 (OPERATOR_NOTE #3.1): (a) AREA-BOUNDED projection (ScanReducer.makeRenderTree) prunes sub-pixel subtrees BEFORE the canonical child sort, so even a volume-root emit is O(visible tiles), not O(all-in-window) — this cut the measured worst from ~1100 ms (the ~900 ms root makeTree the earlier build caught) to the number above; (b) QUEUE PRIORITY (ScenePipeline.foldWithPreemption chunks folds and yields) lets a focus emit overtake ingest. The ratified ≤200 ms commit→scene target (rider 2b / OPERATOR_NOTE #2/#3) now covers this live-scan worst, not just a small retained dive.")
 
         // TZ-4 acceptance evidence summary.
         let pct = lastFraction.map { String(format: "%.1f%%", $0 * 100) } ?? "—"
@@ -226,9 +265,10 @@ final class ThreadHarness {
             print("TZTHREAD TZ-4 denied NODES in tree (incl. culled sub-pixel): \(deniedIds.count)\(deniedIds.count == 12 ? "+" : "")")
             for p in deniedIds { print("TZTHREAD     denied-node: \(p)") }
         }
-        // Unaccounted should track capacity − free − scanned (clamped ≥ 0).
+        // Unaccounted STATUS figure (never a tile — HUMAN FIELD RULING #1): capacity −
+        // free − scanned, clamped ≥ 0 — the same math `UnaccountedSpace.figure`/StatusBar show.
         let expectedUnaccounted = max(0, lastCapacity - lastFree - lastScanned)
-        print("TZTHREAD TZ-4 unaccounted tile: \(lastUnaccounted) B  (capacity \(lastCapacity) − free \(lastFree) − scanned \(lastScanned) = \(expectedUnaccounted) B)")
+        print("TZTHREAD TZ-4 unaccounted figure: \(lastUnaccounted) B  (capacity \(lastCapacity) − free \(lastFree) − scanned \(lastScanned) = \(expectedUnaccounted) B)")
 
         let pass = worstGapMs < 100 && monotonic && scenes > 0
         print("TZTHREAD verdict: \(pass ? "PASS" : "REVIEW")")

@@ -40,9 +40,10 @@ FOCUS_ROOT="build/verify-focus-root.png"
 FOCUS_CHILD="build/verify-focus-child.png"
 SCAN_OUT1="build/verify-scan-1.png"
 SCAN_OUT2="build/verify-scan-2.png"
+SCAN_PROMOTED="build/verify-scan-promoted.png"
 
 mkdir -p build
-rm -f "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD" "$SCAN_OUT1" "$SCAN_OUT2"
+rm -f "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD" "$SCAN_OUT1" "$SCAN_OUT2" "$SCAN_PROMOTED"
 
 echo "==> (2a) Build the app bundle (also needed for structure assertions)"
 scripts/build.sh
@@ -99,8 +100,8 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swiftc \
 	-framework ImageIO \
 	-target arm64-apple-macos14
 
-echo "==> (3b) Walk a real fixture tree to completion, assert golden, render two frames"
-"$SCAN_BIN" "$SHADER" "$SCAN_OUT1" "$SCAN_OUT2"
+echo "==> (3b) Walk a real fixture tree to completion, assert golden, render two frames + a PROMOTED-root frame (TZ-4b)"
+"$SCAN_BIN" "$SHADER" "$SCAN_OUT1" "$SCAN_OUT2" "$SCAN_PROMOTED"
 
 echo "==> (3c) Assert both scan frames were written, are non-empty, and differ"
 if [[ ! -s "$SCAN_OUT1" || ! -s "$SCAN_OUT2" ]]; then
@@ -109,6 +110,16 @@ if [[ ! -s "$SCAN_OUT1" || ! -s "$SCAN_OUT2" ]]; then
 fi
 if cmp -s "$SCAN_OUT1" "$SCAN_OUT2"; then
 	echo "VERIFY FAILED: $SCAN_OUT1 and $SCAN_OUT2 are byte-identical — layout did not respond to size" >&2
+	exit 1
+fi
+
+echo "==> (3d) Assert the PROMOTED-root frame (old map as one tile among new siblings + denied badge) was written and differs from the un-promoted scan"
+if [[ ! -s "$SCAN_PROMOTED" ]]; then
+	echo "VERIFY FAILED: promoted-root frame missing/empty ($SCAN_PROMOTED)" >&2
+	exit 1
+fi
+if cmp -s "$SCAN_OUT1" "$SCAN_PROMOTED"; then
+	echo "VERIFY FAILED: $SCAN_PROMOTED is byte-identical to $SCAN_OUT1 — promotion did not change the map" >&2
 	exit 1
 fi
 

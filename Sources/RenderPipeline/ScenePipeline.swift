@@ -22,8 +22,11 @@
 //  THE TWO DECOUPLED FLOWS (why a slow main never stalls the walker)
 //  ----------------------------------------------------------------
 //   1. INGEST: `ingest(_:)` folds walker batches as fast as they arrive, in its own
-//      Task. It suspends only at `await` on the next batch, so the actor stays free
-//      to service focus/viewport changes and cadence ticks between batches.
+//      Task, via `foldWithPreemption` — which chunks each fold and `await Task.yield()`s
+//      between chunks/batches so a queued focus/viewport message OVERTAKES the ingest at
+//      the next suspension point (TZ-4b OPERATOR_NOTE #3.1 queue priority). Without those
+//      yields a tight fold over an already-buffered stream holds the actor for the whole
+//      drain and a focus commit waits behind it (the escalate's 1059 ms).
 //   2. EMIT: scenes are yielded into an AsyncStream buffered `.bufferingNewest(1)`.
 //      `yield` on a newest-1 stream NEVER suspends the producer — a slow (or absent)
 //      consumer just drops stale scenes; it never applies backpressure. So folding
@@ -90,11 +93,25 @@ public actor ScenePipeline {
     /// meaningful hover target.
     static let minRenderAreaPx: Double = 4.0
 
-    private let rootId: String
+    /// The scan root's id. MUTABLE since TZ-4b: `reRoot` promotes the pipeline one
+    /// level up (rootId becomes the new parent), coherently with the reducer graft and
+    /// the focus/settle reset. Written once at init otherwise.
+    private var rootId: String
     private var reducer: ScanReducer
-    /// Retained/rendered child depth passed to `makeTree` (focus depth + render
-    /// window) — the detail-on-demand knob (decision 4), set by the App on dive.
-    private var projectionDepth: Int
+    /// Number of walker streams currently folding into this pipeline. `running` is
+    /// derived from this so a SECOND concurrent walk — the sibling-exclusion walk root
+    /// promotion spawns while the original walk may still be draining — does not let the
+    /// first walk's completion falsely report the scan finished. A walk increments on
+    /// entry to `ingest` and decrements on exit; `running == (activeWalks > 0)`.
+    private var activeWalks = 0
+    // REMOVED (TZ-4b review-4 change 4): the `requestedDetailDepth` parameter/state. Since the
+    // focus-rooted projection (OPERATOR_NOTE #2), `emit` always projects a FIXED `renderWindow`
+    // from the focus, so a requested depth never reached `makeTree` — it was functionally inert
+    // (its only effect was a re-emit trigger, and in the App the requested depth was a pure
+    // function of the focus, so it never changed without the focus also changing). A name that
+    // claims to "request detail" while only re-emitting is a name-honesty defect (CLAUDE.md 5);
+    // the honest fix is to delete it, not rename it. `setFocus` now simply posts the focus and
+    // emits its scene immediately (see below).
     private var focusId: String
     private var viewport: Rect?
     private var running = true
@@ -103,14 +120,11 @@ public actor ScenePipeline {
     private var dirty = true
     private var generation = 0
 
-    /// Volume accounting (TZ-4), pushed once by the App at scan start. Drives the
-    /// synthetic UNACCOUNTED tile (`capacity − free − scanned`) injected into the root,
-    /// and the purgeable value carried on the scene for the tile's decomposed readout.
-    /// All zero until the App posts real figures — with `capacity == 0`, `augment` is a
-    /// no-op, so a pipeline with no accounting (every existing test) behaves as before.
-    private var volumeCapacity: Int64 = 0
-    private var volumeFree: Int64 = 0
-    private var volumePurgeable: Int64 = 0
+    // NOTE (TZ-4b, HUMAN FIELD RULING #1): the pipeline no longer holds volume accounting.
+    // The synthetic UNACCOUNTED tile it fed was removed (a volume quantity drawn inside a
+    // subtree map — a category error); the "Unaccounted" figure is now a STATUS-BAR field
+    // the App composes from `VolumeProbe` + `scannedBytes` (see `UnaccountedSpace`). So the
+    // pipeline composes tiles from the SizeTree ONLY — no capacity/free/purgeable state.
 
     /// The PREVIOUS emitted scene's quads, keyed by nodeId — the source for the next
     /// scene's `settleFrom` (the streaming settle "from", aligned HERE on the actor so
@@ -127,10 +141,9 @@ public actor ScenePipeline {
     /// is not Sendable, so it must not be shared across concurrency domains.
     private let sizeFormatter: ByteCountFormatter
 
-    public init(rootId: String, rootName: String, projectionDepth: Int) {
+    public init(rootId: String, rootName: String) {
         self.rootId = rootId
         self.focusId = rootId
-        self.projectionDepth = projectionDepth
         self.reducer = ScanReducer(rootId: rootId, rootName: rootName)
         let f = ByteCountFormatter()
         f.countStyle = .file
@@ -148,12 +161,131 @@ public actor ScenePipeline {
     /// final settle scene. Runs as its own Task (the App spawns it); reentrant with
     /// the setters/tick at each `await`.
     public func ingest(_ stream: AsyncStream<[ScanEvent]>) async {
-        for await batch in stream {
-            reducer.apply(batch)
-            dirty = true
-        }
-        running = false
+        activeWalks += 1
+        running = true
+        await foldWithPreemption(stream)
+        activeWalks -= 1
+        if activeWalks == 0 { running = false } // last walk to drain marks the scan done
         emit(force: true) // final settle — reflects everything folded
+    }
+
+    /// Number of events folded between focus-preemption points. See `foldWithPreemption`.
+    private static let ingestChunk = 2048
+
+    /// Fold `stream` into the reducer WITH FOCUS PREEMPTION (TZ-4b OPERATOR_NOTE #3.1 — the
+    /// ratified queue-priority fix). The problem the escalate measured (worst focus
+    /// commit→scene 1059 ms during a live 5M-inode scan): a `setFocus`/`setViewport` message
+    /// is enqueued on THIS actor, but the fold holds the actor across long synchronous stretches
+    /// and never suspends, so the focus emit waits behind the whole in-flight ingest. Actor
+    /// isolation only lets another enqueued message run at a SUSPENSION point; a tight
+    /// `for await batch { reducer.apply(batch) }` loop over an already-buffered stream, or one
+    /// giant `apply`, has none for long spans.
+    ///
+    /// THE MECHANISM (the operator's "chunk ingest folds and check a pending-focus flag between
+    /// chunks"): fold each batch in fixed `ingestChunk`-sized slices and `await Task.yield()`
+    /// between slices AND after each batch. Each yield is a suspension point that RE-ENQUEUES
+    /// this fold BEHIND any already-pending actor message — so a queued `setFocus` (which
+    /// force-emits synchronously) OVERTAKES the ingest and its target scene commits after at
+    /// most one chunk's fold, not the whole stream. The actor's own mailbox IS the
+    /// "pending-focus flag"; the yield is what drains it. Correctness is preserved: folding is
+    /// order-INSENSITIVE across subtree batches (the reducer's interleaving-invariance
+    /// property — file header), so deferring the rest of a batch past a focus emit changes
+    /// nothing about the eventual state; the emit simply reflects a valid partial fold, exactly
+    /// as any mid-scan cadence emit already does.
+    private func foldWithPreemption(_ stream: AsyncStream<[ScanEvent]>) async {
+        for await batch in stream {
+            if batch.count <= Self.ingestChunk {
+                reducer.apply(batch)
+                dirty = true
+            } else {
+                var i = 0
+                while i < batch.count {
+                    let end = min(i + Self.ingestChunk, batch.count)
+                    reducer.apply(Array(batch[i..<end]))
+                    dirty = true
+                    i = end
+                    if i < batch.count { await Task.yield() } // let a queued focus emit overtake
+                }
+            }
+            await Task.yield() // suspension point per batch: drains any pending focus/viewport message
+        }
+    }
+
+    // MARK: - Root promotion (TZ-4b — "root promotion", ratified)
+
+    /// PROMOTE the pipeline one level up (layers a+c of root promotion) and fold the new
+    /// siblings — ONE atomic actor operation so the promoted frame and the successor-walk
+    /// registration are inseparable (review-0 finding 1).
+    ///
+    /// THE RACE THIS FIXES. The previous split (`reRoot` force-emits, then a separate
+    /// `ingest` of the siblings) let the promoted frame carry `running == false` whenever
+    /// the PRIMARY walk had already drained (`activeWalks == 0`). The App reads that scene,
+    /// concludes the scan is done, and tears down the cadence/hitch BEFORE the queued
+    /// sibling ingest even starts — so an idle-time promotion never streams its siblings.
+    /// Here the successor walk is REGISTERED (`activeWalks += 1`, `running = true`) BEFORE
+    /// the promoted force-emit, with no `await` between, so the promoted frame — and every
+    /// frame until the siblings truly drain — reports `running == true`. The counter stays
+    /// symmetric: this one method owns the matching decrement when the fold completes.
+    ///
+    /// The re-root itself (COHERENT with the focus/settle reset):
+    ///   - `reducer.reRoot` grafts the whole node map under `newRootId` (nothing lost);
+    ///   - `rootId`/`focusId` move to the new root (we always land focused on it);
+    ///   - the old subtree, now at depth 1, folds beyond the render window but keeps its full
+    ///     totals (sizes true — the projection window is a render choice, not a data limit);
+    ///   - `lastQuadById` is cleared: the pre-promotion positions are a meaningless
+    ///     same-focus settle source across a root change (the App drives the commit morph
+    ///     from the promotion camera's last frame instead, exactly as for a dive/ascend).
+    /// `generation` is NOT reset — scene generations stay strictly monotonic across the
+    /// promotion. Force one emit so the promoted frame appears without waiting a cadence;
+    /// the NEW siblings then stream in through the `sibling` walk this method folds.
+    /// (No volume accounting is threaded through anymore — HUMAN FIELD RULING #1 moved the
+    /// "Unaccounted" figure to the status bar; the App re-reads it per-promotion itself.)
+    public func promote(newRootId: String, newRootName: String,
+                        sibling: AsyncStream<[ScanEvent]>) async {
+        activeWalks += 1
+        running = true
+        reducer.reRoot(to: newRootId, newRootName: newRootName)
+        rootId = newRootId
+        focusId = newRootId
+        lastQuadById.removeAll(keepingCapacity: true)
+        dirty = true
+        emit(force: true) // promoted frame — running == true (a successor walk is committed)
+
+        await foldWithPreemption(sibling)
+        activeWalks -= 1
+        if activeWalks == 0 { running = false } // last walk to drain marks the scan done
+        emit(force: true) // final settle at the promoted root
+    }
+
+    // MARK: - Denied-overflow disclosure (TZ-4b OPERATOR_NOTE #3.2; review-5 correction)
+
+    /// Resolve a clicked denied-overflow AGGREGATE badge to its disclosure — the denied child
+    /// names + implied (lower-bound) size — ON THIS ACTOR, off main.
+    ///
+    /// WHY THIS MOVED OFF MAIN (review-5, blocking). The App used to resolve the badge on the
+    /// main actor by walking the emitted scene tree: `latestScene.tree.node(withId: parentId)`
+    /// (an O(retained-in-window) traversal) followed by `TreemapScene.deniedDisclosure` over the
+    /// parent's children (O(parent fanout)). Both scale with node/child count and so violate the
+    /// ratified main-thread law and `SizeTree.node(withId:)`'s own documented contract ("must
+    /// NEVER run on the main actor"). A high-fanout denied parent could stall interaction while
+    /// opening its disclosure — exactly the fluid-navigation regression the VISION forbids.
+    ///
+    /// THE ACTOR-SIDE PATH. The badge carries no id list; its parent id is recovered from the
+    /// synthetic nodeId (`deniedAggregateParentId`). We then project ONLY that parent ONE level
+    /// from the RETAINED reducer state (`makeTree(focusId: parentId, depthWindow: 1)` — the
+    /// parent plus its direct children, O(parent fanout), no `SizeTree` main traversal) and run
+    /// the PURE `TreemapScene.deniedInventory` over it (contract v2: the parent's FULL denied
+    /// inventory, not only the aggregate's collapsed subset — see TreemapScene doc). Returns `nil` if the parent is not in the
+    /// retained state (a stale badge after a re-root); the App then shows a count-only fallback
+    /// from the tile itself. The result is a raw `DeniedDisclosure` DTO, `Sendable` back to main.
+    /// This is the ratified "a `ScenePipeline` actor operation over its reducer, returning raw
+    /// disclosure data for the App to present." User-driven and once-per-click — never the frame
+    /// hot path — and now provably off main.
+    public func deniedDisclosure(aggregateNodeId: String) -> DeniedDisclosure? {
+        guard let parentId = TreemapScene.deniedAggregateParentId(from: aggregateNodeId),
+              reducer.contains(parentId) else { return nil }
+        let parentTree = reducer.makeTree(focusId: parentId, depthWindow: 1)
+        return TreemapScene.deniedInventory(under: parentTree)
     }
 
     // MARK: - Control inputs (posted by the App's main actor)
@@ -163,26 +295,17 @@ public actor ScenePipeline {
         emit(force: false)
     }
 
-    /// New focus (dive/ascend) + its projection depth in one hop — emit the target
-    /// scene immediately so the App's camera commit does not wait a cadence.
-    public func setFocus(_ id: String, projectionDepth depth: Int) {
-        let focusChanged = id != focusId
-        let depthChanged = depth != projectionDepth
-        focusId = id
-        projectionDepth = depth
-        // A new focus invalidates the same-focus settle source (old-focus positions).
-        if focusChanged { lastQuadById.removeAll(keepingCapacity: true) }
-        if depthChanged { dirty = true } // deeper projection is genuinely new data
-        if focusChanged || depthChanged { emit(force: true) }
-    }
-
-    /// Volume accounting for the UNACCOUNTED tile (TZ-4), posted by the App at scan
-    /// start once the volume probe returns. Recomputes the synthetic tile on the next
-    /// emit; force one now so it appears without waiting a cadence.
-    public func setVolumeAccounting(capacity: Int64, free: Int64, purgeable: Int64) {
-        volumeCapacity = capacity
-        volumeFree = free
-        volumePurgeable = purgeable
+    /// Post the current focus (dive/ascend) and emit its target scene IMMEDIATELY, so the
+    /// App's camera commit does not wait a cadence. An explicit focus post is a request for
+    /// that focus's scene now, so it force-emits unconditionally (the immediate-emit path the
+    /// App and the pipeline tests rely on). Only a genuine focus CHANGE invalidates the
+    /// same-focus settle source (the previous focus's tile positions); re-posting the SAME
+    /// focus keeps it so a redundant post still morphs cleanly from the last frame.
+    public func setFocus(_ id: String) {
+        if id != focusId {
+            focusId = id
+            lastQuadById.removeAll(keepingCapacity: true)
+        }
         emit(force: true)
     }
 
@@ -198,14 +321,33 @@ public actor ScenePipeline {
     private func emit(force: Bool) {
         guard force || dirty else { return }
         guard let vp = viewport, vp.width > 0, vp.height > 0 else { return }
+        // Never fabricate a scene for a focus the scan has not produced — keep the last good
+        // scene (the streaming contract). Under the OLD root-rooted projection the empty
+        // layout below did this implicitly; a focus-rooted projection would instead build a
+        // lone placeholder tile, so the guard is now explicit (see `ScanReducer.contains`).
+        guard reducer.contains(focusId) else { return }
 
-        let scanned = reducer.makeTree(depthWindow: projectionDepth)
-        // Inject the per-volume synthetic UNACCOUNTED tile as a child of the root
-        // (VISION §"invisible space is first-class"; recomputed every emit as `scanned`
-        // grows). A no-op when volume accounting is unknown or the residual is zero, and
-        // it preserves the root's totals — so `scannedBytes` below stays the REAL scanned
-        // total, not scanned + unaccounted.
-        let tree = SyntheticTile.augment(root: scanned, capacity: volumeCapacity, free: volumeFree)
+        // FOCUS-ROOTED PROJECTION (TZ-4b, OPERATOR_NOTE 2026-08-16 #2). Project ONLY the
+        // focus subtree through the render window — O(focus subtree ∩ window) — instead of
+        // building the whole retained tree and letting layout navigate down to the focus
+        // (the O(retained nodes) cost that made a full-volume dive take seconds). The
+        // projected tree's root IS the focus, so `TreemapScene.layout`'s focus lookup below
+        // resolves at the root in O(1) rather than searching the whole tree.
+        // The projected tree IS the scene's tree — no synthetic UNACCOUNTED tile is
+        // injected anymore (HUMAN FIELD RULING #1: it was a volume quantity drawn inside a
+        // subtree map; the figure moved to the status bar, `UnaccountedSpace`). The status
+        // bar's "Scanned" total still comes from `reducer.rootAllocatedBytes`, never from
+        // this focus-rooted tree's root.
+        // AREA-BOUNDED focus-rooted projection (TZ-4b cycle-6): pass the viewport area + the
+        // sub-pixel threshold so `makeRenderTree` skips subtrees too small to render. This makes
+        // even a VOLUME-ROOT emit O(visible tiles), not O(all-in-window) — the ~900 ms root
+        // projection the live measurement caught (24k materialized sub-pixel nodes) collapses to
+        // the visible set. The pruned subtrees are exactly those the cull below would drop, so
+        // the rendered scene is unchanged, and `prunedBelowArea` is folded into `belowPixelCount`
+        // so the drop is never SILENT (invisible-space contract).
+        let (tree, prunedBelowArea) = reducer.makeRenderTree(
+            focusId: focusId, depthWindow: Self.renderWindow,
+            minRenderArea: Self.minRenderAreaPx, viewportArea: vp.area)
         let laidOut = TreemapScene.layout(tree: tree, focusId: focusId,
                                           depthWindow: Self.renderWindow, viewport: vp)
         guard !laidOut.isEmpty else { return } // focus not present yet — keep last scene
@@ -221,11 +363,24 @@ public actor ScenePipeline {
         // Containment keeps it hierarchically consistent: a
         // culled parent's children sit inside its (sub-threshold) area, so they are
         // culled too — no orphaned child of a dropped parent.
+        // BADGES ARE NOT EXEMPTED (TZ-4b rider 1, corrected review-0 finding 3c). A
+        // `denied` tile's size is UNKNOWN, so `TreemapScene` FLOORS its layout
+        // area to `minBadgeArea` (~384 px² ≫ this ~4 px² cull threshold) — which lifts it
+        // above the ordinary cull WITHOUT a special case here. The earlier exemption
+        // (`|| kind == .denied`) let EVERY badge bypass the cull regardless
+        // of area, so a level with pathologically many unknown-size children could retain
+        // an unbounded count — defeating the viewport bound below (the main-thread law).
+        // Now the layout caps how many badges are floored (see `maxBadgeFraction`), the
+        // rest keep their sub-pixel weight, and the plain area test culls them like any
+        // tile: the per-level count stays viewport-bounded, badges included.
         var tiles = [TileRect](); tiles.reserveCapacity(laidOut.count)
         for t in laidOut where t.dimLevel == 0 || t.rect.area >= Self.minRenderAreaPx {
             tiles.append(t)
         }
-        let belowPixelCount = laidOut.count - tiles.count
+        // Total below-threshold drops = those pruned at PROJECTION (never materialized) + any the
+        // layout still produced that this pass culls. Folding both keeps the count honest (no
+        // silent truncation) even though most sub-pixel mass is now pruned before layout.
+        let belowPixelCount = prunedBelowArea + (laidOut.count - tiles.count)
 
         // Build the render-ready GPU instances HERE (off main) — the per-tile colour
         // + geometry conversion the App used to do every draw (PLAN §"Threading
@@ -257,7 +412,10 @@ public actor ScenePipeline {
             generation: generation, focusId: focusId, viewport: vp,
             tiles: tiles, nodeIds: nodeIds, quads: quads, settleFrom: settleFrom,
             labels: labels, tree: tree, belowPixelCount: belowPixelCount, running: running,
-            filesProcessed: reducer.processedCount, purgeableBytes: volumePurgeable))
+            filesProcessed: reducer.processedCount,
+            // Scan-root total (cheap Int64 sum), NOT the focus tree's root — see
+            // `RenderScene.scannedBytes` / `ScanReducer.rootAllocatedBytes`.
+            scannedBytes: reducer.rootAllocatedBytes))
     }
 
     /// Compose a label (name + human size) for each top-level (dimLevel 1) tile.

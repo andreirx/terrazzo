@@ -95,21 +95,44 @@ public enum QuadGeometry {
     }
 
     /// Build the COMMIT settle-"from": place each committed tile where its node sat in
-    /// the camera's LAST frame (the flight base under `finalCam`), matched by nodeId. A
-    /// committed node absent from the base (newly-revealed deeper detail, or a new
-    /// sibling on ascend) carries its OWN committed quad ⇒ it appears in place, no fly-in.
-    /// Result is index-parallel with `sceneQuads`. One O(base) dict + O(scene) pass, both
-    /// bounded by the viewport-culled arrays (see the main-thread-law note in the header).
+    /// the camera's LAST frame (the flight base under `finalCam`) for its GEOMETRY, but
+    /// carry the COMMITTED scene's COLOUR/STYLE (`sceneQuads[i]`). Matched by nodeId; a
+    /// committed node absent from the base (newly-revealed deeper detail, or a new sibling
+    /// on ascend) carries its OWN committed quad ⇒ it appears in place, no fly-in. Result
+    /// is index-parallel with `sceneQuads`. One O(base) dict + O(scene) pass, both bounded
+    /// by the viewport-culled arrays (see the main-thread-law note in the header).
+    ///
+    /// WHY COLOUR SNAPS TO THE COMMITTED SCENE (review-1 finding 2 — the "prompt re-tint").
+    /// Colour in Terrazzo is FOCUS-RELATIVE: the same node has one hue when it is a deep
+    /// descendant of the old focus and a DIFFERENT hue when it becomes a hue-root under the
+    /// new focus (PLAN §"Visual language"; TreemapSceneTests.testFocusRelativeReTintAtDepth).
+    /// The commit settle morphs GEOMETRY old-position → committed-position; its COLOUR must
+    /// already be the committed (new-focus) tint from frame 0, not the stale old-focus tint
+    /// carried on the flight base — otherwise the map would re-tint only after the settle.
+    /// The live Metal path already samples colour/style from the settle's TARGET buffer
+    /// (Shaders.metal: `o.color`/`o.style` = `to`), so on-screen the tint is correct today;
+    /// snapping the `from` buffer here makes BOTH buffers agree, so the invariant holds for
+    /// ANY colour-lerp the shader might later use and is pinned by QuadGeometryTests without
+    /// a GPU. Geometry (x/y/w/h) still comes from the camera-last frame, so the settle's
+    /// spatial morph is unchanged.
     public static func commitFrom(sceneQuads: [GPUQuad], sceneNodeIds: [String],
                                   baseQuads: [GPUQuad], baseNodeIds: [String],
                                   finalCam: ViewTransform) -> [GPUQuad] {
-        var endById = [String: GPUQuad](minimumCapacity: baseNodeIds.count)
+        var endGeomById = [String: GPUQuad](minimumCapacity: baseNodeIds.count)
         for i in baseNodeIds.indices {
-            endById[baseNodeIds[i]] = transform(baseQuads[i], by: finalCam)
+            endGeomById[baseNodeIds[i]] = transform(baseQuads[i], by: finalCam)
         }
         var out = [GPUQuad](); out.reserveCapacity(sceneQuads.count)
         for i in sceneNodeIds.indices {
-            out.append(endById[sceneNodeIds[i]] ?? sceneQuads[i])
+            if let placed = endGeomById[sceneNodeIds[i]] {
+                // Geometry from the camera's last frame; COLOUR/STYLE snapped to the
+                // committed (focus-relative) scene so the re-tint lands AT commit.
+                let c = sceneQuads[i]
+                out.append(GPUQuad(x: placed.x, y: placed.y, w: placed.w, h: placed.h,
+                                   r: c.r, g: c.g, b: c.b, style: c.style))
+            } else {
+                out.append(sceneQuads[i]) // absent from the base — its own committed quad
+            }
         }
         return out
     }
