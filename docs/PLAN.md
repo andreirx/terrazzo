@@ -231,7 +231,14 @@ Hiding is a VISUALIZATION lens only: pure TreemapCore input (hidden path
 set), scan tree untouched, session-only (not persisted), and the status
 bar shows "N ignored · X GB excluded" while any tile is ignored (the
 invisible-space principle applies to user-hidden mass too). Depth setting
-UI (default 5) moves here from TZ-4. **Scale toggle: LOGARITHMIC area by default, linear option** (human
+UI (default 5) moves here from TZ-4. **Chrome color audit** (human field
+report 2026-08-16: dark-grey top bar with near-black barely-visible
+text): every text element in the chrome (control bar, status bar, FDA
+banner, volume picker, popovers) uses semantic or app-palette colors —
+NEVER an unstyled NSTextField default. DURABLE RULE for all App chrome:
+text on the dark theme is labelColor-derived or app-palette; hardcoded
+blacks are defects. Acceptance: a screenshot pass over every chrome
+element at both window sizes; state each element checked. **Scale toggle: LOGARITHMIC area by default, linear option** (human
 directive 2026-08-16 — giant tiles eclipse the tail): tile weights pass
 through a monotone log transform (log(1+bytes), named constant base)
 before Squarify, per sibling set — pure TreemapCore, tiling exactness
