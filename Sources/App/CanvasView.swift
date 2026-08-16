@@ -1,30 +1,40 @@
 //
-//  CanvasView.swift — the Metal canvas: renders tiles, animates, forwards input,
-//  and hosts the two on-canvas text overlays (tile labels + hover readout).
-//  Module maturity: PROTOTYPE (slice TZ-3)
+//  CanvasView.swift — the Metal canvas: renders prebuilt tile buffers, animates via
+//  uniforms, forwards input, and hosts the two on-canvas text overlays.
+//  Module maturity: PROTOTYPE (slice TZ-3; TZ-3b: uniform-driven animation)
 //
 //  A layer-backed NSView whose backing layer is a CAMetalLayer (glyph-saver
 //  heritage: a bare CAMetalLayer, not an MTKView — we drive rendering ourselves).
 //
-//  RESPONSIBILITIES (TZ-3 narrowed them — layout moved to NavigationController):
-//   1. STREAMING settle (TZ-2, preserved): `present(animated:true)` LERPs each
-//      tile's rect old→new by node id over `lerpSeconds` — the calm scan settle.
-//   2. CAMERA frames (TZ-3): `renderCameraFrame` draws an already-transformed tile
-//      list immediately (no lerp) — NavigationController pushes ~350 ms of these.
-//   3. INPUT: it is the NSView that receives mouse/scroll/keys, converts each to
-//      DEVICE-PIXEL layout space (top-left origin, y-down — the space tiles live
-//      in), and forwards to its `input` delegate. Esc routes to `escapeHandler`.
-//   4. TEXT OVERLAYS: `setTileLabels` (top-level folder name+size, deliverable 5c)
-//      and `setReadout` (the floating `HoverReadout` label, top-left, deliverable
-//      3) — plain NSTextFields composited above the Metal layer; the strings are
-//      composed by NavigationController (it owns the tree + formatter).
+//  TZ-3b — NOTHING PER-TILE ON THE FRAME PATH (main-thread law, PLAN §"Threading
+//  model"). The scene arrives with its GPU instances ALREADY built (RenderScene.quads
+//  from the background pipeline). This view uploads that prebuilt array into an
+//  MTLBuffer ONCE per scene (a memcpy, blessed to stay on main) and then animates by
+//  varying only UNIFORMS:
+//   1. STREAMING settle: between two scenes at the same focus it lerps geometry
+//      from→to IN THE VERTEX SHADER (two prebuilt buffers + a scalar `t`). The 60 Hz
+//      tick updates `t` and redraws — O(1) on main, no per-tile CPU map.
+//   2. CAMERA frames: a dive/ascend holds one prebuilt base buffer and animates the
+//      camera AFFINE uniform (`setCamera`) — again O(1)/frame.
+//   3. HOVER highlight: a single instance-index uniform (`setHighlightIndex`).
+//  The per-tile colour/geometry conversion that used to run here every draw is gone —
+//  it happens once, off main, in RenderPipeline.QuadBuilder.
+//
+//  INPUT (unchanged): it is the NSView that receives mouse/scroll/keys, converts each
+//  to DEVICE-PIXEL layout space (top-left origin, y-down — the space tiles live in),
+//  and forwards to its `input` delegate. Esc routes to `escapeHandler`.
+//
+//  TEXT OVERLAYS (unchanged): `setTileLabels` (top-level folder name+size) and
+//  `setReadout` (the floating `HoverReadout` label) — plain NSTextFields composited
+//  above the Metal layer; the strings are composed off-view (pipeline / controller).
 //
 
 import AppKit
 import Metal
 import QuartzCore
-// App layer is monolith-only (build.sh / verify.sh): SizeTree / Rect /
-// TreemapScene / TileRect / Point resolve same-module, so no core imports here.
+import simd
+// App layer is monolith-only (build.sh / verify.sh): GPUQuad / Rect / TileRect /
+// Point / QuadRenderer resolve same-module, so no core imports here.
 
 /// What the canvas reports upward. Points are DEVICE PIXELS (top-left origin,
 /// y-down — the tile layout space); the delegate decides what they mean. Weak
@@ -35,7 +45,10 @@ protocol CanvasInputDelegate: AnyObject {
     func canvasDidHover(atPx p: Point)
     func canvasDidExit()
     func canvasDidClick(atPx p: Point)
-    func canvasDidScroll(deltaY: Double, atPx p: Point)
+    /// `precise` is `event.hasPreciseScrollingDeltas`: false for a mouse wheel
+    /// (notch-based), true for a trackpad (continuous). NavigationController thresholds
+    /// the two differently so one notch and one short swipe each = one zoom step.
+    func canvasDidScroll(deltaY: Double, precise: Bool, atPx p: Point)
     func canvasContextMenu(atPx p: Point) -> NSMenu?
 }
 
@@ -64,16 +77,27 @@ final class CanvasView: NSView {
     private let device: MTLDevice?
     private var renderer: QuadRenderer?
 
-    /// What is currently on screen (fully interpolated), in device-pixel space.
-    private var displayedTiles: [TileRect] = []
-    private var highlightedId: String?
+    // --- Prebuilt render state (the frame path reads ONLY these) ---
+    // The two instance buffers the vertex shader lerps between (from → to). Both are
+    // uploaded PRE-ALIGNED by the caller (the pipeline's `settleFrom`+`quads` for a
+    // streaming settle; a camera-end `from`+committed `to` for a dive/ascend commit),
+    // so this view does NO per-tile identity matching — the O(n) String-keyed capture
+    // that used to live here (`currentDisplayedById`, the 158 ms hitch) is gone. The
+    // view keeps only the GPU buffers; there is no CPU mirror to walk per scene.
+    private var fromBuf: MTLBuffer?
+    private var toBuf: MTLBuffer?
+    private var quadCount = 0
 
-    // Streaming transition state: interpolate displayed → target over lerpSeconds.
-    private var fromTiles: [String: TileRect] = [:]
-    private var targetTiles: [TileRect] = []
+    /// Settle-morph state: while active, `t` sweeps 0→1 over `lerpSeconds`.
+    private var settleActive = false
     private var transitionStart: CFTimeInterval = 0
-    private var animTimer: Timer?
+    /// Camera affine (world px → screen px). Identity except during a dive/ascend.
+    private var camScale = SIMD2<Float>(1, 1)
+    private var camTranslate = SIMD2<Float>(0, 0)
+    /// Hover-highlight instance index, or -1 (a uniform, not per-instance data).
+    private var highlightIndex: Int32 = -1
 
+    private var animTimer: Timer?
     private var trackingArea: NSTrackingArea?
 
     // Text overlays (composited above the Metal layer).
@@ -112,47 +136,86 @@ final class CanvasView: NSView {
         return Rect(x: 0, y: 0, width: Double(ds.width), height: Double(ds.height))
     }
 
-    // MARK: - Tile intake
+    // MARK: - Scene intake (prebuilt quads)
 
-    /// Install a fresh world tile list. `animated == true` → streaming settle lerp;
-    /// `animated == false` → snap (resize / a committed focus swap).
-    func present(tiles: [TileRect], highlightedId: String?, animated: Bool) {
-        self.highlightedId = highlightedId
+    /// Install a fresh scene's prebuilt instances. `from` and `to` are PRE-ALIGNED by
+    /// the caller (index-parallel, same node per index): the pipeline's `settleFrom` +
+    /// `quads` for a streaming settle, or a camera-end `from` + committed `to` for a
+    /// dive/ascend commit. `animated == true` → morph `from`→`to` in the vertex shader;
+    /// `animated == false` → snap to `to` (`from` ignored). No identity matching here.
+    func present(from: [GPUQuad], to: [GPUQuad], animated: Bool) {
         makeRendererIfNeeded()
         if animated {
-            beginTransition(to: tiles)
+            beginSettle(from: from, to: to)
         } else {
-            stopAnimTimer()
-            displayedTiles = tiles
-            targetTiles = tiles
-            render()
+            snap(to: to)
         }
     }
 
-    /// Update the hover highlight WITHOUT relaying out — hover must not restart the
-    /// settle lerp or move any tile.
-    func setHighlight(_ id: String?) {
-        guard id != highlightedId else { return }
-        highlightedId = id
+    /// Begin a CAMERA flight over a fixed prebuilt base (dive/ascend). No settle; the
+    /// caller animates the camera affine via `setCamera`, and drives the commit morph
+    /// itself once the flight ends.
+    ///
+    /// DELIBERATELY DOES NOT RENDER (review-2 gap 2, ascend continuity): it only uploads
+    /// the base buffer and leaves the previous pixels on screen. If it painted here it
+    /// would paint at the CURRENT camera (identity), which for ascend is the parent world
+    /// — a one-frame flash BEFORE the matching t=0 child frame. The caller renders the
+    /// explicit t=0 frame immediately after (`setCamera` in `applyCameraFrame`), so the
+    /// FIRST painted frame of every flight is exactly t=0.
+    func beginCameraFlight(base: [GPUQuad]) {
+        stopAnimTimer()
+        settleActive = false
+        makeRendererIfNeeded()
+        quadCount = base.count
+        let buf = renderer?.makeQuadBuffer(base)
+        fromBuf = buf; toBuf = buf
+    }
+
+    /// Update the camera affine (world px → screen px) and redraw. O(1)/frame — the
+    /// prebuilt base buffer is reused; only the uniform changes.
+    func setCamera(scaleX: Double, scaleY: Double, translateX: Double, translateY: Double) {
+        camScale = SIMD2(Float(scaleX), Float(scaleY))
+        camTranslate = SIMD2(Float(translateX), Float(translateY))
         render()
     }
 
-    /// Draw an ALREADY-TRANSFORMED tile list immediately (a camera frame). Never
-    /// highlights — the zoom is a transient. It DOES record the drawn geometry as
-    /// `displayedTiles` so that the committing `present(animated:true)` at the end
-    /// of the flight lerps FROM the camera's exact last frame into the freshly
-    /// squarified focus layout (TZ-3 rev-1): the camera lands the focus tile
-    /// exactly and the bounded inner-tile residual (scaled border + squarify
-    /// re-tiling to the new aspect) is closed by the existing settle-lerp instead of
-    /// a hard snap — a perceptually continuous handoff, no new animation machinery.
-    func renderCameraFrame(tiles: [TileRect]) {
+    /// Reset the camera to identity (world px == screen px). Used when a settle takes
+    /// over from a camera flight.
+    func resetCamera() {
+        camScale = SIMD2(1, 1); camTranslate = SIMD2(0, 0)
+    }
+
+    /// Set the hover-highlight instance index (or -1). A uniform update + redraw;
+    /// never relays out, never restarts the settle.
+    func setHighlightIndex(_ index: Int) {
+        let v = Int32(index)
+        guard v != highlightIndex else { return }
+        highlightIndex = v
+        render()
+    }
+
+    private func snap(to quads: [GPUQuad]) {
         stopAnimTimer()
-        makeRendererIfNeeded()
-        guard let renderer else { return }
-        let ds = metalLayer.drawableSize
-        guard ds.width > 0, ds.height > 0 else { return }
-        displayedTiles = tiles
-        renderer.render(tiles: tiles, highlightedId: nil, to: metalLayer)
+        settleActive = false
+        resetCamera()
+        quadCount = quads.count
+        let buf = renderer?.makeQuadBuffer(quads)
+        fromBuf = buf; toBuf = buf
+        render()
+    }
+
+    private func beginSettle(from: [GPUQuad], to: [GPUQuad]) {
+        // `from` and `to` are pre-aligned by the caller and expressed in identity-camera
+        // screen space (a commit's `from` already has the camera's last frame baked in),
+        // so the settle runs at identity camera and the shader lerps index-for-index.
+        resetCamera()
+        quadCount = to.count
+        fromBuf = renderer?.makeQuadBuffer(from)
+        toBuf = renderer?.makeQuadBuffer(to)
+        settleActive = true
+        transitionStart = CACurrentMediaTime()
+        startAnimTimerIfNeeded()
+        render()
     }
 
     // MARK: - Text overlays
@@ -220,16 +283,7 @@ final class CanvasView: NSView {
                                     width: w, height: Double(h))
     }
 
-    // MARK: - Streaming animation (TZ-2, preserved)
-
-    private func beginTransition(to newTiles: [TileRect]) {
-        fromTiles = Dictionary(displayedTiles.map { ($0.nodeId, $0) },
-                               uniquingKeysWith: { a, _ in a })
-        targetTiles = newTiles
-        transitionStart = CACurrentMediaTime()
-        startAnimTimerIfNeeded()
-        tickAnimation()
-    }
+    // MARK: - Streaming animation (uniform-driven; O(1) per frame)
 
     private func startAnimTimerIfNeeded() {
         guard animTimer == nil else { return }
@@ -245,43 +299,33 @@ final class CanvasView: NSView {
         animTimer = nil
     }
 
+    /// One settle frame: recompute `t` (a scalar) and redraw the SAME two buffers.
+    /// No per-tile CPU work — the vertex shader lerps.
     private func tickAnimation() {
-        let elapsed = CACurrentMediaTime() - transitionStart
-        let t = min(1.0, elapsed / Self.lerpSeconds)
-
-        displayedTiles = targetTiles.map { target in
-            guard let from = fromTiles[target.nodeId], t < 1.0 else { return target }
-            return TileRect(
-                rect: lerp(from.rect, target.rect, t),
-                dimLevel: target.dimLevel,
-                nodeId: target.nodeId,
-                kind: target.kind,
-                scanState: target.scanState,
-                hue: target.hue // hue is per-node constant — carry it, never lerp to 0
-            )
-        }
         render()
-
-        if t >= 1.0 {
-            displayedTiles = targetTiles
+        if CACurrentMediaTime() - transitionStart >= Self.lerpSeconds {
+            settleActive = false
             stopAnimTimer()
+            render() // crisp final frame at the target (t = 1)
         }
-    }
-
-    private func lerp(_ a: Rect, _ b: Rect, _ t: Double) -> Rect {
-        Rect(x: a.x + (b.x - a.x) * t,
-             y: a.y + (b.y - a.y) * t,
-             width: a.width + (b.width - a.width) * t,
-             height: a.height + (b.height - a.height) * t)
     }
 
     // MARK: - Renderer
 
     private func makeRendererIfNeeded() {
         guard renderer == nil, let device else { return }
-        guard let url = Bundle.main.url(forResource: "Shaders", withExtension: "metal"),
-              let source = try? String(contentsOf: url, encoding: .utf8) else {
-            NSLog("CanvasView: Shaders.metal missing from bundle Resources")
+        let source: String
+        if let url = Bundle.main.url(forResource: "Shaders", withExtension: "metal"),
+           let s = try? String(contentsOf: url, encoding: .utf8) {
+            source = s
+        } else if let path = ProcessInfo.processInfo.environment["TERRAZZO_SHADER_PATH"],
+                  let s = try? String(contentsOfFile: path, encoding: .utf8) {
+            // Headless threading harness (no .app bundle): read the shader from a path
+            // named in the environment. A value-read env seam (sibling of
+            // TERRAZZO_SCAN_ROOT), not I/O across the ScanFS boundary.
+            source = s
+        } else {
+            NSLog("CanvasView: Shaders.metal missing (bundle Resources and TERRAZZO_SHADER_PATH)")
             return
         }
         renderer = QuadRenderer(device: device, pixelFormat: .bgra8Unorm, shaderSource: source)
@@ -320,10 +364,17 @@ final class CanvasView: NSView {
 
     private func render() {
         makeRendererIfNeeded()
-        guard let renderer else { return }
+        guard let renderer, let fromBuf, let toBuf else { return }
         let ds = metalLayer.drawableSize
         guard ds.width > 0, ds.height > 0 else { return }
-        renderer.render(tiles: displayedTiles, highlightedId: highlightedId, to: metalLayer)
+        let t: Float = settleActive
+            ? Float(min(1.0, (CACurrentMediaTime() - transitionStart) / Self.lerpSeconds))
+            : 1.0
+        let u = QuadRenderer.Uniforms(
+            viewport: SIMD2(Float(ds.width), Float(ds.height)),
+            camScale: camScale, camTranslate: camTranslate,
+            t: t, highlightIndex: highlightIndex)
+        renderer.render(from: fromBuf, to: toBuf, count: quadCount, uniforms: u, to: metalLayer)
     }
 
     // MARK: - Input
@@ -360,7 +411,9 @@ final class CanvasView: NSView {
     override func mouseDown(with event: NSEvent) { input?.canvasDidClick(atPx: layoutPoint(event)) }
 
     override func scrollWheel(with event: NSEvent) {
-        input?.canvasDidScroll(deltaY: Double(event.scrollingDeltaY), atPx: layoutPoint(event))
+        input?.canvasDidScroll(deltaY: Double(event.scrollingDeltaY),
+                               precise: event.hasPreciseScrollingDeltas,
+                               atPx: layoutPoint(event))
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {

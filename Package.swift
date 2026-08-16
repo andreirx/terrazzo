@@ -34,6 +34,16 @@ let package = Package(
         // ScanFS is the I/O adapter (not a pure core) — a product so the App's
         // swiftc monolith and `swift test` both compile the same walker sources.
         .library(name: "ScanFS", targets: ["ScanFS"]),
+        // RenderPipeline is the background scene pipeline (TZ-3b): the serial actor
+        // that wires the two engines (ScanReducer → SizeTree → TreemapScene.layout)
+        // off the main thread. It depends on BOTH cores, so — like the App — it is
+        // not itself a pure core; it is a product so the App's swiftc monolith and
+        // `swift test` compile the same actor sources. It exists as a target (not
+        // buried in Sources/App) so `swift test` can pin the threading guarantees
+        // the ratified model demands (a slow consumer never blocks the walker; scene
+        // generations arrive in order) — a test seam unobtainable while it lives in
+        // the AppKit-only App layer that SPM cannot see.
+        .library(name: "RenderPipeline", targets: ["RenderPipeline"]),
     ],
     targets: [
         .target(name: "ScanCore", path: "Sources/ScanCore"),
@@ -49,6 +59,16 @@ let package = Package(
             name: "ScanFS",
             dependencies: ["ScanCore"],
             path: "Sources/ScanFS"
+        ),
+        // The background scene pipeline (TZ-3b). Depends on both cores; consumes the
+        // scan event stream (ScanCore) and produces positioned scenes (TreemapCore).
+        // It does NOT depend on ScanFS — the App injects the real walker's event
+        // stream, and the test injects a synthetic one, so the actor is exercised
+        // without touching the filesystem.
+        .target(
+            name: "RenderPipeline",
+            dependencies: ["ScanCore", "TreemapCore"],
+            path: "Sources/RenderPipeline"
         ),
         .testTarget(
             name: "ScanCoreTests",
@@ -66,6 +86,14 @@ let package = Package(
             name: "FixtureFS",
             dependencies: ["ScanFS", "ScanCore"],
             path: "Tests/FixtureFS"
+        ),
+        // Pins the ratified threading guarantees of the background pipeline actor
+        // (TZ-3b): scene generations arrive strictly increasing, and a slow scene
+        // consumer never blocks the walker (every fed batch is folded regardless).
+        .testTarget(
+            name: "RenderPipelineTests",
+            dependencies: ["RenderPipeline", "ScanCore", "TreemapCore"],
+            path: "Tests/RenderPipelineTests"
         ),
     ]
 )

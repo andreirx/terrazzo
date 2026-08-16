@@ -119,13 +119,15 @@ public extension SizeTree {
     }
 
     /// Depth-first lookup of a node by its `id`. O(n); TZ-3 keeps no index (files
-    /// are the system of record, no caches — CLAUDE.md constraint 4). The App's
-    /// NavigationController resolves a hit tile's `nodeId` back to its node because
-    /// TileRect carries only geometry, not the node's name/sizes. Concrete current
-    /// users (verified by `grep node(withId:` under Sources): the hover readout
-    /// (name + allocated + logical), the per-tile labels (name + allocated), and
-    /// the right-click menu title (name). The focus-path label and ascend use the
-    /// `focusStack` of ids directly — they do NOT call this.
+    /// are the system of record, no caches — CLAUDE.md constraint 4). Because it is
+    /// O(n) it must NEVER run on the main actor per the ratified threading law. Concrete
+    /// current users (verified by `grep node(withId:` under Sources): only
+    /// `ScenePipeline.buildLabels`, which calls it ONCE per scene for the FOCUS node
+    /// (then indexes that node's children by id) — on the background pipeline actor, off
+    /// main. The App's hover readout, per-tile labels, and right-click menu title read
+    /// the name/allocated/logical the layout DENORMALIZED onto each TileRect (TZ-3b),
+    /// so they no longer traverse the tree on main. The focus-path label and ascend use
+    /// the `focusStack` of ids directly — they do NOT call this.
     func node(withId id: String) -> SizeTree? {
         if self.id == id { return self }
         for child in children {

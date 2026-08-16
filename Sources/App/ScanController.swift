@@ -1,115 +1,138 @@
 //
-//  ScanController.swift — drives the live scan into the canvas + status bar.
-//  Module maturity: PROTOTYPE (slice TZ-2)
+//  ScanController.swift — the App's scan/render coordinator (main-actor side).
+//  Module maturity: PROTOTYPE (slice TZ-3b — the threading model)
 //
-//  The App-layer coordinator that closes the streaming loop: it owns the PURE
-//  `ScanReducer`, consumes the walker's `AsyncStream<[ScanEvent]>`, and folds
-//  every batch on the MAIN ACTOR — which is how the reducer stays single-threaded
-//  (ratified decision 5) even though the walker is massively parallel. The
-//  concurrency was already dissolved into an ordered event stream by ScanFS's
-//  EventBatcher; here we just apply it on one thread.
+//  REWRITTEN IN TZ-3b to enforce the ratified threading law (PLAN §"Threading
+//  model"): "nothing on the main thread may scale with node count." Before, this
+//  controller folded the walker stream AND projected the tree ON THE MAIN ACTOR,
+//  and NavigationController squarified ON THE MAIN ACTOR — at home-scan scale the
+//  main thread stalled for seconds (the field-reported beachball).
 //
-//  RELAYOUT CADENCE (ratified decision 3): a ~1 s timer snapshots the reducer
-//  into a SizeTree and hands it — via `onSnapshot` — to the App's
-//  NavigationController, which lays it out for the current focus and animates the
-//  canvas. We deliberately do NOT relayout per batch — batched, calm, never
-//  jittering. Sizes shown are always real recursive totals; the depth window
-//  prunes only retained child detail (decision 4).
+//  NOW it owns a background `ScenePipeline` actor and does only glue:
+//    - probe the volume once (a one-time syscall, not node-count work);
+//    - construct the pipeline and FEED it the real walker's event stream (the fold
+//      runs on the actor, in its own Task — never on main);
+//    - CONSUME finished `RenderScene` values on the main actor and hand them up.
+//      This is the only main-side scan work and it is O(scene): the tiles are
+//      already positioned and the labels already composed by the pipeline;
+//    - drive the batched cadence with a lightweight main Timer that only TRIGGERS
+//      the pipeline's `tick()` (the O(n) makeTree→squarify it triggers runs on the
+//      actor);
+//    - forward focus/viewport changes to the pipeline (dive/ascend/resize);
+//    - run the debug HitchMonitor so the law is measurable, not merely asserted.
 //
-//  DETAIL ON DEMAND (TZ-3, decision 4 "extended on demand when zooming"): the
-//  walker descends FULLY and the reducer retains EVERY node in memory — only the
-//  PROJECTION (`makeTree(depthWindow:)`) is windowed. So deepening detail costs a
-//  re-projection, never a re-scan. NavigationController sets `projectionDepth`
-//  (focus depth + render depth) as the focus descends; this controller re-projects
-//  at that depth. This is why the seam is `onSnapshot` + `projectionDepth`, not a
-//  direct canvas reference: the App's navigation state decides how deep to project.
+//  WHAT CROSSES THE ACTOR→MAIN BOUNDARY: exactly one type, `RenderScene` (a raw
+//  value DTO — positioned tiles carrying their own display metadata + prebuilt GPU
+//  quads + composed labels + the below-pixel cull count + the projected SizeTree for
+//  the O(1) scanned total + running flag), delivered via one `AsyncStream`.
 //
-//  This is App-layer glue (I/O/UI side), instantiated by AppDelegate (the Main
-//  assembly). Not a core abstraction — a single concrete coordinator with one
-//  caller; no protocol, no seam invented.
+//  This is App-layer glue (the Main assembly wires the two engines), instantiated
+//  by AppDelegate. Not a core abstraction — one concrete coordinator, one caller.
 //
 
 import AppKit
+// Monolith-only App layer: RenderScene / ScenePipeline / SizeTree / ScanPolicy /
+// VolumeProbe / FileSystemWalker / Rect resolve same-module (no core imports).
 
 @MainActor
 final class ScanController {
-    /// Relayout cadence — ratified decision 3 ("batched ~1 s, animated").
-    static let relayoutCadenceSeconds: TimeInterval = 1.0
-
     private let root: URL
     private let policy: ScanPolicy
-    private let onSnapshot: (SizeTree) -> Void
+    /// One value handoff up to NavigationController (positioned tiles + labels).
+    private let onScene: (RenderScene) -> Void
     private let onStatus: (ScanStatus) -> Void
 
-    /// Retained/rendered child depth of the next projection (decision 4). Starts
-    /// at the policy default (root focus); NavigationController raises it as a dive
-    /// descends so the focused subtree carries enough detail. A change re-projects
-    /// immediately so the new detail appears without waiting for the next tick.
-    private var projectionDepth: Int
-
-    private var reducer: ScanReducer
-    private var scanTask: Task<Void, Never>?
-    private var relayoutTimer: Timer?
+    private var pipeline: ScenePipeline?
     private var volume: VolumeProbe.VolumeInfo?
+    private var walkTask: Task<Void, Never>?
+    private var sceneTask: Task<Void, Never>?
+    private var cadenceTimer: Timer?
+    private let hitch = HitchMonitor()
     private var running = false
 
     init(root: URL, policy: ScanPolicy,
-         onSnapshot: @escaping (SizeTree) -> Void,
+         onScene: @escaping (RenderScene) -> Void,
          onStatus: @escaping (ScanStatus) -> Void) {
         self.root = root
         self.policy = policy
-        self.onSnapshot = onSnapshot
+        self.onScene = onScene
         self.onStatus = onStatus
-        self.projectionDepth = policy.depthDetailWindow
-        self.reducer = ScanReducer(rootId: root.path, rootName: root.lastPathComponent)
-    }
-
-    /// Raise/lower the projected detail depth (focus depth + render depth) and
-    /// re-project now. No-op if unchanged. Called by NavigationController on dive/
-    /// ascend — the "extend scan detail on demand" wiring (packet deliverable 4).
-    func setProjectionDepth(_ depth: Int) {
-        guard depth != projectionDepth else { return }
-        projectionDepth = depth
-        relayout()
     }
 
     func start() {
         volume = VolumeProbe.volumeInfo(for: root)
         running = true
+        hitch.setPhase("scanning")
+        hitch.start()
 
-        // Consume the stream on the main actor → the reducer is only ever touched
-        // from one thread. The walk itself runs off-main (the AsyncStream's
-        // internal Task), so folding here does not block the walk.
-        scanTask = Task { @MainActor [weak self] in
+        let pipe = ScenePipeline(rootId: root.path, rootName: root.lastPathComponent,
+                                 projectionDepth: policy.depthDetailWindow)
+        pipeline = pipe
+
+        // Feed the real walker's event stream into the pipeline. The fold + all the
+        // node-count-scaling projection/layout run inside the actor, off main.
+        let walker = FileSystemWalker.scan(root: root, policy: policy)
+        walkTask = Task { await pipe.ingest(walker) }
+
+        // Consume finished scenes on the MAIN actor. O(scene), not O(node count).
+        sceneTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            for await batch in FileSystemWalker.scan(root: self.root, policy: self.policy) {
-                self.reducer.apply(batch)
+            for await scene in pipe.scenes {
+                self.onScene(scene)
+                self.onStatus(ScanStatus(volume: self.volume,
+                                         scannedBytes: scene.scannedBytes,
+                                         belowPixelCount: scene.belowPixelCount,
+                                         running: scene.running))
+                if !scene.running && self.running {
+                    self.running = false
+                    self.stopCadence()
+                    self.hitch.stop(reason: "scan complete")
+                }
             }
-            self.running = false
-            self.relayout()            // final settle
-            self.relayoutTimer?.invalidate()
-            self.relayoutTimer = nil
         }
 
-        // Batched relayout cadence.
-        let timer = Timer(timeInterval: Self.relayoutCadenceSeconds, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.relayout() }
+        // Batched relayout cadence (ratified decision 3): a lightweight main Timer
+        // that only fires `tick()` at the actor — the work stays off main.
+        let timer = Timer(timeInterval: ScenePipeline.cadenceSeconds, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let pipe = self?.pipeline else { return }
+                Task { await pipe.tick() }
+            }
         }
         RunLoop.main.add(timer, forMode: .common)
-        relayoutTimer = timer
-
-        relayout() // initial frame (root tile, empty/pending)
+        cadenceTimer = timer
     }
+
+    /// New focus + projection depth (dive/ascend). Posted to the pipeline, which
+    /// emits the target scene immediately so the camera commit does not wait.
+    func setFocus(_ id: String, projectionDepth depth: Int) {
+        guard let pipe = pipeline else { return }
+        Task { await pipe.setFocus(id, projectionDepth: depth) }
+    }
+
+    /// New viewport (resize). The pipeline re-fits and emits immediately.
+    func setViewport(_ vp: Rect) {
+        guard let pipe = pipeline else { return }
+        Task { await pipe.setViewport(vp) }
+    }
+
+    /// Coarse phase label for the hitch monitor (what main is doing).
+    func setPhase(_ p: String) { hitch.setPhase(p) }
+
+    /// The worst inter-beat main-thread gap the hitch monitor has seen (ms) — the
+    /// headless threading harness reports this as the acceptance number (target
+    /// < 100 ms). 0 when the monitor is disabled (`TERRAZZO_HITCH` unset).
+    var worstMainGapMs: Double { hitch.worstGapMs }
 
     func cancel() {
-        scanTask?.cancel()
-        relayoutTimer?.invalidate()
-        relayoutTimer = nil
+        walkTask?.cancel()
+        sceneTask?.cancel()
+        stopCadence()
+        hitch.stop(reason: "cancelled")
     }
 
-    private func relayout() {
-        let tree = reducer.makeTree(depthWindow: projectionDepth)
-        onSnapshot(tree)
-        onStatus(ScanStatus(volume: volume, scannedBytes: tree.allocatedBytes, running: running))
+    private func stopCadence() {
+        cadenceTimer?.invalidate()
+        cadenceTimer = nil
     }
 }

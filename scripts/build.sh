@@ -23,7 +23,7 @@ echo "==> Clean bundle tree"
 rm -rf "$APP"
 mkdir -p "$MACOS" "$RES"
 
-echo "==> Compile Sources/App + Sources/TreemapCore + Sources/ScanCore + Sources/ScanFS -> $MACOS/Terrazzo"
+echo "==> Compile Sources/App + Sources/TreemapCore + Sources/ScanCore + Sources/ScanFS + Sources/RenderPipeline -> $MACOS/Terrazzo"
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swiftc \
 	-O \
 	-o "$MACOS/Terrazzo" \
@@ -31,6 +31,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swiftc \
 	Sources/TreemapCore/*.swift \
 	Sources/ScanCore/*.swift \
 	Sources/ScanFS/*.swift \
+	Sources/RenderPipeline/*.swift \
 	-framework AppKit \
 	-framework Metal \
 	-framework MetalKit \

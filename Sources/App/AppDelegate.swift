@@ -11,11 +11,12 @@
 //
 //  This is the Main assembly: the ONLY place concrete volatile classes (NSWindow,
 //  CanvasView, StatusBar, NavigationController, ScanController) are instantiated
-//  and wired. The wiring is a straight line: ScanController streams SizeTree
-//  snapshots (onSnapshot) → NavigationController lays out for the current focus →
-//  CanvasView renders; CanvasView input → NavigationController → dive/ascend/
-//  reveal. NavigationController holds the projection-depth knob back to
-//  ScanController for detail-on-demand.
+//  and wired. The wiring is a straight line: ScanController owns the background
+//  ScenePipeline and streams finished RenderScenes (onScene) → NavigationController
+//  presents the pre-positioned tiles for the current focus → CanvasView renders;
+//  CanvasView input → NavigationController → dive/ascend/reveal. NavigationController
+//  posts focus/viewport back to ScanController → the pipeline (detail-on-demand and
+//  off-main layout — TZ-3b threading model).
 //
 
 import AppKit
@@ -100,11 +101,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             : VolumeProbe.homeDirectory()
         controller = ScanController(
             root: root, policy: .default,
-            onSnapshot: { [weak self] tree in self?.navigation.onSnapshot(tree) },
+            onScene: { [weak self] scene in self?.navigation.onScene(scene) },
             onStatus: { [weak self] status in self?.statusBar.update(status) }
         )
         navigation.scanController = controller
         controller.start()
+        // The pipeline cannot lay out until it knows the viewport. The initial
+        // viewport-change (viewDidMoveToWindow) fired BEFORE `scanController` was
+        // wired, so post the current viewport now that the wiring exists — otherwise
+        // no scene is ever emitted and the canvas stays black.
+        navigation.pushViewport()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }

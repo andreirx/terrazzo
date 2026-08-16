@@ -1,60 +1,99 @@
 //
 //  Shaders.metal — instanced-quad treemap shaders (runtime-compiled).
-//  Module maturity: PROTOTYPE (slice TZ-1)
+//  Module maturity: PROTOTYPE (slice TZ-1; TZ-3b moved animation into uniforms)
 //
 //  Shipped as SOURCE and compiled at runtime via `device.makeLibrary(source:)`
 //  (glyph-saver heritage / PLAN.md: no build-time `metal` toolchain on this
 //  machine). Both the App and scripts/verify_host.swift compile THIS file.
 //
-//  One draw call renders every tile as an instanced unit quad (ZapZap /
-//  glyph-saver instanced-rect heritage): the vertex stage positions a corner of
-//  the per-instance rect in NDC; the fragment stage fills it with the tile's
-//  depth-dimmed color and darkens a thin 1px border band so nested tiles read as
-//  distinct rectangles. See QuadRenderer.QuadInstance for the CPU mirror — field
-//  order and sizes MUST match `QuadInstance` below.
+//  TZ-3b — THE ANIMATION MOVED INTO THE VERTEX STAGE (main-thread law).
+//  Instances are now PREBUILT off the main thread (RenderPipeline.GPUQuad) in
+//  WORLD-PIXEL space and uploaded ONCE per scene. Everything that used to be redone
+//  per-tile on the CPU every frame is now a uniform the GPU applies while it already
+//  iterates the instances:
+//    - CAMERA (dive/ascend zoom): an affine (per-axis scale + translate) uniform.
+//    - SETTLE (batched relayout morph): a linear parameter `t` between TWO instance
+//      buffers (from → to), lerped per-instance in the vertex stage.
+//    - WORLD → NDC: the viewport map, from a uniform (device-px viewport size).
+//    - HOVER HIGHLIGHT: a single highlighted instance index uniform.
+//  So the per-frame main-thread cost collapses to writing a few scalars — no per-tile
+//  work survives on the frame path (PLAN §"Threading model"; OPERATOR_NOTE gap 1).
+//
+//  See RenderPipeline/GPUQuad.swift for the CPU producer and QuadRenderer.swift for
+//  the CPU-side `Uniforms` mirror — field order + sizes MUST match the structs below.
 //
 
 #include <metal_stdlib>
 using namespace metal;
 
-// CPU mirror: QuadRenderer.QuadInstance (11 contiguous floats, 44-byte stride).
-struct QuadInstance {
-    float ox;   // origin x in NDC (top-left corner of the tile)
-    float oy;   // origin y in NDC
-    float sx;   // width in NDC (may be 0 for a degenerate tile)
-    float sy;   // height in NDC (negative = downward in NDC, y-down → y-up flip)
+// CPU mirror: RenderPipeline.GPUQuad (8 contiguous floats, 32-byte stride).
+// World-pixel geometry (top-left origin, y-down) + resolved colour + style code.
+struct GPUQuad {
+    float x;    // world-pixel rect origin x (device px)
+    float y;    // world-pixel rect origin y (device px)
+    float w;    // world-pixel width
+    float h;    // world-pixel height
     float r;
     float g;
     float b;
-    float pw;   // tile width in device pixels (for the border band)
-    float ph;   // tile height in device pixels
-    float kd;   // style code: 0 normal, 1 pending (outlined-dim), 2 denied
-    float hl;   // hover-highlight flag: 1 = lift fill + bright outline (TZ-3)
+    float style; // 0 normal, 1 pending (outlined-dim), 2 denied
+};
+
+// CPU mirror: QuadRenderer.Uniforms. Field order + sizes MUST match.
+struct Uniforms {
+    float2 viewport;     // device-px drawable size (world→NDC map)
+    float2 camScale;     // camera per-axis scale (1,1 = identity)
+    float2 camTranslate; // camera translate (device px)
+    float  t;            // settle parameter in [0,1] (0 = show `from`)
+    int    highlightIndex; // instance to highlight, or -1 for none
 };
 
 struct VOut {
     float4 position [[position]];
     float2 local;      // 0..1 within the tile
     float3 color;
-    float2 pixelSize;  // tile size in device pixels
-    float  style;      // QuadInstance.kd, flat across the tile
-    float  highlight;  // QuadInstance.hl, flat across the tile
+    float2 pixelSize;  // ON-SCREEN tile size in device pixels (post-camera)
+    float  style;      // GPUQuad.style, flat across the tile
+    float  highlight;  // 1 if this instance is the hover target, else 0
 };
 
-// Unit quad as a triangle strip: vertex ids 0..3 → (0,0)(1,0)(0,1)(1,1).
+// Unit quad as a triangle strip: vertex ids 0..3 → (0,0)(1,0)(0,1)(1,1). Positions
+// come from lerp(from,to,t) of the per-instance world rect, then the camera affine,
+// then the world→NDC map — all from uniforms, so one prebuilt buffer pair animates.
 vertex VOut quad_vertex(uint vid [[vertex_id]],
                         uint iid [[instance_id]],
-                        device const QuadInstance *insts [[buffer(0)]]) {
+                        device const GPUQuad *from [[buffer(0)]],
+                        device const GPUQuad *to   [[buffer(1)]],
+                        constant Uniforms &u       [[buffer(2)]]) {
+    GPUQuad a = from[iid];
+    GPUQuad b = to[iid];
+    float t = u.t;
+
+    // Settle-lerp the world rect (from → to). For a matched node the colour/style are
+    // identical in both buffers; for an unmatched node from==to. Colour/style follow
+    // the TARGET (`b`) — geometry morphs, colour snaps to the destination, exactly the
+    // prior CPU settle behaviour.
+    float2 origin = mix(float2(a.x, a.y), float2(b.x, b.y), t);
+    float2 size   = mix(float2(a.w, a.h), float2(b.w, b.h), t);
+
+    // Camera affine (world px → on-screen px). Identity during a settle.
+    float2 sOrigin = origin * u.camScale + u.camTranslate;
+    float2 sSize   = size * u.camScale;
+
     float2 corner = float2(float(vid & 1u), float((vid >> 1u) & 1u));
-    QuadInstance q = insts[iid];
-    float2 ndc = float2(q.ox, q.oy) + corner * float2(q.sx, q.sy);
+    float2 px = sOrigin + corner * sSize;               // device px, top-left, y-down
+
+    // world/device px → NDC (y-up).
+    float2 ndc = float2(2.0 * px.x / u.viewport.x - 1.0,
+                        1.0 - 2.0 * px.y / u.viewport.y);
+
     VOut o;
     o.position = float4(ndc, 0.0, 1.0);
     o.local = corner;
-    o.color = float3(q.r, q.g, q.b);
-    o.pixelSize = float2(q.pw, q.ph);
-    o.style = q.kd;
-    o.highlight = q.hl;
+    o.color = float3(b.r, b.g, b.b);
+    o.pixelSize = abs(sSize);
+    o.style = b.style;
+    o.highlight = (int(iid) == u.highlightIndex) ? 1.0 : 0.0;
     return o;
 }
 

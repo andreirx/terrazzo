@@ -35,6 +35,11 @@ import AppKit
 struct ScanStatus {
     let volume: VolumeProbe.VolumeInfo?
     let scannedBytes: Int64
+    /// Tiles the pipeline dropped as sub-pixel before this scene (PLAN §"Rendering
+    /// scale": "cull rects < ~2 px … no silent truncation"). Surfaced in the status
+    /// line so culled mass is REPORTED, never silently swallowed (invisible-space
+    /// principle). Comes prebuilt on the RenderScene; the App only formats it.
+    let belowPixelCount: Int
     let running: Bool
 }
 
@@ -48,11 +53,12 @@ final class StatusBar: NSView {
     /// The volume accounting line (TZ-2), now one NSTextField per field so each
     /// carries its own hover tooltip (deliverable 5d) — trailing, monospaced digits.
     private let volumeStack = NSStackView()
-    /// Reused pool of field labels (max 6: Capacity/Free/Reclaimable/Available up
-    /// to/Scanned + the scan indicator). Fixed and small → reuse, no per-update
-    /// churn (the CanvasView.setTileLabels pattern).
+    /// Reused pool of field labels (max 7: Capacity/Free/Reclaimable/Available up
+    /// to/Scanned + the optional "N tiles below pixel size" + the scan indicator).
+    /// Fixed and small → reuse, no per-update churn (the CanvasView.setTileLabels
+    /// pattern). `fields(_:)` returns a variable-length subset; extra labels hide.
     private var fieldLabels: [NSTextField] = []
-    private static let maxFields = 6
+    private static let maxFields = 7
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -153,6 +159,14 @@ final class StatusBar: NSView {
         out.append(VolumeField(
             value: "Scanned \(b(s.scannedBytes))",
             tooltip: "Total size Terrazzo has measured so far."))
+        // Sub-pixel cull count — shown only when non-zero (no "0 tiles" clutter on a
+        // small map). PLAN §"Rendering scale": culled tiles are REPORTED, never silently
+        // dropped — the invisible-space principle applied to below-pixel mass.
+        if s.belowPixelCount > 0 {
+            out.append(VolumeField(
+                value: "\(s.belowPixelCount) tiles below pixel size",
+                tooltip: "Tiles too small to draw (< ~2 px) at this zoom, so they are not shown. Zoom in to see them; nothing is silently dropped."))
+        }
         out.append(VolumeField(
             value: s.running ? "● scanning…" : "✓ scan complete",
             tooltip: s.running ? "A scan is in progress; sizes are still growing."

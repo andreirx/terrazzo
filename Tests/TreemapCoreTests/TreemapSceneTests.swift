@@ -107,6 +107,27 @@ final class TreemapSceneTests: XCTestCase {
         XCTAssertNil(tiles.first { $0.nodeId == "B" }, "siblings of the focus are not rendered")
     }
 
+    // TZ-3b (review-3 item 1): the layout DENORMALIZES each node's display metadata
+    // (name + allocated + logical bytes) onto its TileRect, so the App's hover readout
+    // and menu resolve a hit tile to its name/sizes WITHOUT a `SizeTree.node(withId:)`
+    // traversal on the main actor. Names distinct from ids here prove `name` is read
+    // from the node, not the id.
+    func testTilesCarryNodeDisplayMetadata() {
+        let child = SizeTree(id: "root/kid", name: "Kid", kind: .file,
+                             allocatedBytes: 4096, logicalBytes: 3000)
+        let root = SizeTree(id: "root", name: "Root", kind: .dir,
+                            allocatedBytes: 4096, logicalBytes: 3000, children: [child])
+        let tiles = TreemapScene.layout(tree: root, viewport: viewport)
+        let rootTile = tiles.first { $0.nodeId == "root" }!
+        XCTAssertEqual(rootTile.name, "Root")
+        XCTAssertEqual(rootTile.allocatedBytes, 4096)
+        XCTAssertEqual(rootTile.logicalBytes, 3000)
+        let kidTile = tiles.first { $0.nodeId == "root/kid" }!
+        XCTAssertEqual(kidTile.name, "Kid", "name comes from the node, not the id")
+        XCTAssertEqual(kidTile.allocatedBytes, 4096)
+        XCTAssertEqual(kidTile.logicalBytes, 3000)
+    }
+
     // The real fixture must flatten to a sane, non-degenerate scene at depth 5.
     func testFixtureRendersToTiles() throws {
         let tree = try FixtureLoader.load()

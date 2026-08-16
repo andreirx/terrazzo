@@ -53,6 +53,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swiftc \
 	-o "$HOST_BIN" \
 	scripts/verify_host.swift \
 	Sources/App/QuadRenderer.swift \
+	Sources/RenderPipeline/GPUQuad.swift \
 	Sources/TreemapCore/*.swift \
 	Sources/ScanCore/*.swift \
 	-framework Metal \
@@ -89,6 +90,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swiftc \
 	-o "$SCAN_BIN" \
 	scripts/scan_host.swift \
 	Sources/App/QuadRenderer.swift \
+	Sources/RenderPipeline/GPUQuad.swift \
 	Sources/ScanFS/*.swift \
 	Sources/TreemapCore/*.swift \
 	Sources/ScanCore/*.swift \

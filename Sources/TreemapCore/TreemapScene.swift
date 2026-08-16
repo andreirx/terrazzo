@@ -42,8 +42,13 @@ import ScanCore
 #endif
 
 /// One positioned tile the renderer draws. Flat: carries everything needed to
-/// draw without the tree — its rect, how deep it is (dim), and its identity/kind
-/// for later hit-testing and denied/pending styling.
+/// draw AND to read out WITHOUT the tree — its rect, how deep it is (dim), its
+/// identity/kind for hit-testing and denied/pending styling, and (TZ-3b) the
+/// display metadata (name + allocated/logical bytes) the hover readout and
+/// right-click menu show. Carrying that metadata on the tile is what lets the App
+/// resolve a hovered tile to its name+sizes over the VIEWPORT-BOUNDED rendered-tile
+/// list, instead of a `SizeTree.node(withId:)` traversal on the main actor — the
+/// ratified law forbids main work that scales with node count (review-3 item 1).
 public struct TileRect: Equatable, Sendable {
     public let rect: Rect
     /// 0 at the focus node, +1 per level of nesting, capped at the depth window.
@@ -64,15 +69,28 @@ public struct TileRect: Equatable, Sendable {
     /// their own hue roots. The renderer turns (hue, dimLevel) into an HSB colour;
     /// `denied`/`pending` tiles ignore hue and keep their reserved colours.
     public let hue: Double
+    /// Display name (the node's last path component) for the hover readout / menu
+    /// title. Denormalized from the SizeTree node at layout time so the App never
+    /// re-walks the tree on main to get it (TZ-3b, review-3 item 1).
+    public let name: String
+    /// Bytes on disk for this node — the hover readout's "allocated". Denormalized
+    /// here for the same reason as `name`.
+    public let allocatedBytes: Int64
+    /// Apparent size for this node — the hover readout's "logical".
+    public let logicalBytes: Int64
 
     public init(rect: Rect, dimLevel: Int, nodeId: String, kind: NodeKind,
-                scanState: ScanState = .complete, hue: Double = 0) {
+                scanState: ScanState = .complete, hue: Double = 0,
+                name: String = "", allocatedBytes: Int64 = 0, logicalBytes: Int64 = 0) {
         self.rect = rect
         self.dimLevel = dimLevel
         self.nodeId = nodeId
         self.kind = kind
         self.scanState = scanState
         self.hue = hue
+        self.name = name
+        self.allocatedBytes = allocatedBytes
+        self.logicalBytes = logicalBytes
     }
 }
 
@@ -131,7 +149,9 @@ public enum TreemapScene {
     ) {
         let tileHue = level <= 1 ? TileColor.hue(for: node.name) : inheritedHue
         tiles.append(TileRect(rect: rect, dimLevel: level, nodeId: node.id,
-                              kind: node.kind, scanState: node.scanState, hue: tileHue))
+                              kind: node.kind, scanState: node.scanState, hue: tileHue,
+                              name: node.name, allocatedBytes: node.allocatedBytes,
+                              logicalBytes: node.logicalBytes))
 
         guard level < depthWindow, !node.children.isEmpty else { return }
         let inner = rect.inset(by: borderInset)
