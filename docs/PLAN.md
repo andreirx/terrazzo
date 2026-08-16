@@ -226,7 +226,21 @@ leading-dot rule). Tests: layout with hidden set
 (sibling renormalization exactness, ancestors unchanged), hide→unhide
 round-trip restores the original layout.
 
-### TZ-6 — Scan scheduling: hierarchical spawning + anticipatory root scan
+### TZ-6 — Scan performance & scheduling (REORDERED ahead of TZ-5, 2026-08-16)
+**Measured facts (operator, 2026-08-16, this machine):** volume has
+5,078,381 used inodes; the app's implied rate was ~350 files/s ("4h
+left"); a single-threaded Python os.walk+lstat measured 42,258 files/s —
+the walker is ~120x slower than a naive baseline. Per-file suspects:
+Foundation URL/URLResourceValues per entry (ObjC bridging + multi-syscall
+attribute fetches vs one lstat), per-entry id-string/event allocations,
+worker contention on the single EventBatcher actor with small batches.
+System Settings' Storage is fast because it reads Spotlight/CacheDelete
+indexes — a ledger, not a census; fast censuses use getattrlistbulk
+(whole-directory attribute batches, the Finder path).
+**Scope:** (a) rewrite the walker hot loop on getattrlistbulk (or
+fts/readdir+lstat minimum) — no Foundation URL in the per-entry path;
+(b) aggregate per-directory before any actor hop (one batch per dir
+minimum); (c) THEN the original scheduling work:
 Human design 2026-08-16 (after reading the walker's task model). Today:
 one task per top-level folder, sequential DFS inside — finished siblings'
 pool threads idle while one giant subtree (~/Library) grinds in a single
@@ -237,8 +251,11 @@ pool then work-steals automatically ("finished threads help out" with
 zero pool-management code). (b) ANTICIPATORY ROOT SCAN: alongside the ~
 scan, one .utility-priority task walks / EXCLUDING the active scan root
 (shares promotion's scan-X-excluding-grafted-Y machinery) so zoom-out
-promotion finds siblings warm or complete. Acceptance: wall-clock home
-scan improves measurably (state before/after); threading law untouched.
+promotion finds siblings warm or complete. ACCEPTANCE (hard numbers): sustained ≥ 25,000 files/s on the home scan
+(5.7x the measured Python baseline is NOT required — parallel Swift
+should exceed 42k/s, but 25k/s is the floor); full home scan wall-clock
+≤ 3 minutes; state before/after files/s and wall-clock; threading law
+untouched (worst main gap < 100 ms during the fast scan).
 DISJOINTNESS INVARIANTS (human question 2026-08-16 — why nothing is ever
 walked twice): (1) one enumeration point (classifyChildren), called once
 by a directory's single owner; (2) ownership transfers exclusively at
