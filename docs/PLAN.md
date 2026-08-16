@@ -94,6 +94,12 @@ line shows "N tiles below pixel size").
   per-event — treemap jitter is the known failure mode of naive streaming.
 - Tiles carry scan state (pending/partial/complete/denied) → rendered
   distinctly (pending = outlined dim, denied = hatched/distinct color).
+- **Navigation is never gated on scan completion** (reaffirmed 2026-08-16
+  after a TZ-3 field regression showed a blocking spinner): hover, dive,
+  zoom-out, and Finder actions work at all times during an active scan;
+  on-demand depth-detail extension is async events into the live map —
+  a modal spinner or blocked input anywhere in the scan path is a
+  constraint violation, not a UX choice.
 
 ## Ratified decisions (human, 2026-08-12)
 
