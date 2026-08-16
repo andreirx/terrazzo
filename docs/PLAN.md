@@ -231,7 +231,16 @@ Hiding is a VISUALIZATION lens only: pure TreemapCore input (hidden path
 set), scan tree untouched, session-only (not persisted), and the status
 bar shows "N ignored · X GB excluded" while any tile is ignored (the
 invisible-space principle applies to user-hidden mass too). Depth setting
-UI (default 5) moves here from TZ-4. **"Show hidden files and folders"
+UI (default 5) moves here from TZ-4. **Scale toggle: LOGARITHMIC area by default, linear option** (human
+directive 2026-08-16 — giant tiles eclipse the tail): tile weights pass
+through a monotone log transform (log(1+bytes), named constant base)
+before Squarify, per sibling set — pure TreemapCore, tiling exactness
+and sibling ordering unchanged (tests reuse). Linear mode shows true
+proportional areas ("the HUGE rectangles"). HONESTY GUARD: the active
+scale is always visible in the status bar ("Log scale" / "Linear");
+labels and hover chips show real bytes in both modes — areas may
+compress, numbers never lie. Toggle in the control bar next to the
+depth setting. **"Show hidden files and folders"
 checkbox, ON by default** (human directive 2026-08-16; VISION amended):
 another visualization lens — the scan ALWAYS includes hidden items;
 unchecking filters dotfiles/UF_HIDDEN-flagged nodes from layout with the
