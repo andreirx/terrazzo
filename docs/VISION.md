@@ -21,9 +21,13 @@ has a visual, navigable answer.
 A disk map that silently omits what it cannot read **cannot explain a
 free-space mystery**. Terrazzo renders:
 
-- **Hidden files and folders** — always scanned, always shown (`~/Library`,
-  `/Library`, `/private`, dotfiles). No hiding; surfacing the paths "typically
-  hidden from users' view" is the product.
+- **Hidden files and folders** — always scanned, and shown by default
+  (`~/Library`, `/Library`, `/private`, dotfiles). Surfacing the paths
+  "typically hidden from users' view" is the product. (Amended 2026-08-16:
+  a display checkbox "Show hidden files and folders" exists, ON by
+  default — a visualization filter only; the scan always includes them,
+  and filtered-out mass is accounted in the status bar, never silently
+  dropped.)
 - **Denied space** — directories the scan cannot enter (other users' homes,
   TCC-protected areas) render as visibly distinct tiles sized by what the
   volume accounting implies, never dropped.

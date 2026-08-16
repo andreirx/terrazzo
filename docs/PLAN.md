@@ -171,7 +171,14 @@ Hiding is a VISUALIZATION lens only: pure TreemapCore input (hidden path
 set), scan tree untouched, session-only (not persisted), and the status
 bar shows "N hidden · X GB excluded" while any tile is hidden (the
 invisible-space principle applies to user-hidden mass too). Depth setting
-UI (default 5) moves here from TZ-4. Tests: layout with hidden set
+UI (default 5) moves here from TZ-4. **"Show hidden files and folders"
+checkbox, ON by default** (human directive 2026-08-16; VISION amended):
+another visualization lens — the scan ALWAYS includes hidden items;
+unchecking filters dotfiles/UF_HIDDEN-flagged nodes from layout with the
+same status-bar accounting ("dotfiles/hidden filtered · X GB"). Requires
+an `isHidden` flag on SizeTree nodes captured by the walker at scan time
+(additive DTO change; ScanFS sets it from the URL hidden resource key +
+leading-dot rule). Tests: layout with hidden set
 (sibling renormalization exactness, ancestors unchanged), hide→unhide
 round-trip restores the original layout.
 
