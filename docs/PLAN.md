@@ -226,6 +226,20 @@ leading-dot rule). Tests: layout with hidden set
 (sibling renormalization exactness, ancestors unchanged), hide→unhide
 round-trip restores the original layout.
 
+### TZ-6 — Scan scheduling: hierarchical spawning + anticipatory root scan
+Human design 2026-08-16 (after reading the walker's task model). Today:
+one task per top-level folder, sequential DFS inside — finished siblings'
+pool threads idle while one giant subtree (~/Library) grinds in a single
+task. (a) HIERARCHICAL SPAWNING: walkDirectory spawns child-dir subtasks
+to a bounded depth (~2-3 levels or child-count threshold; guardrail
+against task-overhead explosion), sequential below — Swift's cooperative
+pool then work-steals automatically ("finished threads help out" with
+zero pool-management code). (b) ANTICIPATORY ROOT SCAN: alongside the ~
+scan, one .utility-priority task walks / EXCLUDING the active scan root
+(shares promotion's scan-X-excluding-grafted-Y machinery) so zoom-out
+promotion finds siblings warm or complete. Acceptance: wall-clock home
+scan improves measurably (state before/after); threading law untouched.
+
 ## Slice → relay mapping
 
 Same operator loop as glyph-saver: bootstrap
