@@ -240,7 +240,12 @@ proportional areas ("the HUGE rectangles"). HONESTY GUARD: the active
 scale is always visible in the status bar ("Log scale" / "Linear");
 labels and hover chips show real bytes in both modes — areas may
 compress, numbers never lie. Toggle in the control bar next to the
-depth setting. **"Show hidden files and folders"
+depth setting. EVIDENCE ITEM: report the below-pixel-culled count on the
+SAME scene under log vs linear (quantifies the sibling-starvation
+exposure; note in the report that depth-starved tiles are exposed by
+ZOOM, not scale — no monotone transform can exceed a parent's pixel
+budget, which is why the culled counter legitimately never reaches zero
+at root scale). **"Show hidden files and folders"
 checkbox, ON by default** (human directive 2026-08-16; VISION amended):
 another visualization lens — the scan ALWAYS includes hidden items;
 unchecking filters dotfiles/UF_HIDDEN-flagged nodes from layout with the
