@@ -186,6 +186,16 @@ files/sec-derived ETA next to the bar. Known approximation, displayed
 as such: the denominator is volume-wide (includes denied/other-user
 files), so the bar may complete below 100% — clamp and snap to done on
 completion; never fake linearity.
+**ETA HONESTY FOR SUBTREE SCANS** (OPERATOR_NOTE 2026-08-16 #2 item 2,
+binding field ruling): the volume-inode denominator is the workload of a
+VOLUME-ROOT scan, not of a `~`/subtree scan (dividing a `~` scan by the
+volume total produced a nonsense "4h left"). Rule: show progress % + ETA
+ONLY when the scan root is the volume root; for a subtree scan show
+files/sec + a files-processed count, NO percentage, NO ETA. (Enforced in
+the pure `ScanProgress` — `fraction`/`etaSeconds` return nil unless
+`isVolumeRoot` — fed by ScanFS `VolumeSkipPolicy.isVolumeRoot`, the same
+judgment the FDA banner uses. Root promotion makes the volume-root case
+the common one.)
 VolumePicker (all mounted volumes); **root promotion** (refined
 2026-08-16, superseding "default /"): scans start at `~` for fast first
 paint, and zooming out AT the scan root promotes it one level
@@ -196,24 +206,30 @@ volume root; **Rescan button** in the
 toolbar/status area (human directive 2026-08-16 — the map is a snapshot of
 scan time; rescan re-runs the current volume+focus scan, streaming as
 usual); root scan with FDA guided flow (probe → explain → open System
-Settings pane → rescan); unaccounted-space tile verified against volume
-accounting; denied tiles for other users' homes. ACCEPTANCE = the founding use case: map the boot volume as each
+Settings pane → rescan); unaccounted-space STATUS-BAR FIGURE (amended
+2026-08-16 #1: NEVER a map tile — a volume quantity has no honest
+rectangle inside a subtree map) verified against volume accounting;
+denied tiles for other users' homes. ACCEPTANCE = the founding use case: map the boot volume as each
 user, see where the space disagreement lives, find what Storage Settings
 hides. (The founding mystery itself was solved during TZ-2/3 field use —
 a stale pinned TM snapshot; TZ-4 makes such answers visible by design.)
 Output: the answer to "what is going on."
 
-### TZ-5 — Explorer controls: hide/unhide, depth setting (PROTOTYPE)
-Human directive 2026-08-16. **Hide** button on every sufficiently large
-tile (same min-width rule as labels; also in the context menu for small
-ones): hiding excludes the tile from layout so its SIBLINGS renormalize
-into the freed area (LOCAL renormalization — operator decision: the rest
-of the map stays stable; ancestors keep their areas). Hidden tiles appear
-in a **side panel ledger** (name, size, hue chip, UNHIDE button each);
-the panel exists only while non-empty and disappears when depleted.
+### TZ-5 — Explorer controls: IGNORE list, depth setting (PROTOTYPE)
+Human directive 2026-08-16; RENAMED per human 2026-08-16 (was
+"hide/unhide"): the button is **IGNORE**, the ledger is the **Ignore
+list**. Ignore button on every sufficiently large tile (same min-width
+rule as labels; also in the context menu for small ones): ignoring
+excludes the tile from layout so its SIBLINGS renormalize into the freed
+area — the giant rectangle retires and the smaller ones get room (the
+founding gesture: ignore the known monster, see the long tail). Ignored
+tiles appear in a **side-panel Ignore list** (name, size, hue chip);
+**ONE CLICK on a list item restores it** as a rectangle (the whole row
+is the restore affordance — no separate button); the panel exists only
+while non-empty and disappears when depleted.
 Hiding is a VISUALIZATION lens only: pure TreemapCore input (hidden path
 set), scan tree untouched, session-only (not persisted), and the status
-bar shows "N hidden · X GB excluded" while any tile is hidden (the
+bar shows "N ignored · X GB excluded" while any tile is ignored (the
 invisible-space principle applies to user-hidden mass too). Depth setting
 UI (default 5) moves here from TZ-4. **"Show hidden files and folders"
 checkbox, ON by default** (human directive 2026-08-16; VISION amended):
