@@ -57,9 +57,13 @@ public enum FileSystemWalker {
     /// then finish the stream. Cancelling the consuming task (or terminating the
     /// stream) cancels the walk.
     ///
-    /// The node id of every node is its absolute path (stable, path-derived — the
-    /// contract `SizeTree.id` documents). Construct a `ScanReducer(rootId:
-    /// root.path, rootName: root.lastPathComponent)` to fold this stream.
+    /// The node id of every node is an absolute path rooted at the scan root: the
+    /// root's id is `root.path`, and every descendant is `parentId + "/" + name`
+    /// (see `joinId` / `classifyChildren`) — NOT the firmlink-canonicalized
+    /// `entry.path`, so the whole tree shares ONE identity prefix and the focus
+    /// path never jumps (review-2 item 1). Stable, path-derived — the contract
+    /// `SizeTree.id` documents. Construct a `ScanReducer(rootId: root.path,
+    /// rootName: root.lastPathComponent)` to fold this stream.
     public static func scan(root: URL, policy: ScanPolicy = .default) -> AsyncStream<[ScanEvent]> {
         AsyncStream { continuation in
             let work = Task {
@@ -79,6 +83,15 @@ public enum FileSystemWalker {
             }
             continuation.onTermination = { _ in work.cancel() }
         }
+    }
+
+    /// Join a parent node id and a child name into the child's node id. A plain
+    /// path join with exactly one separator — handles a root id of "/" (root scan,
+    /// TZ-4) without producing "//child". This is the ONE place descendant ids are
+    /// built, so the whole tree shares the scan root's identity prefix (review-2
+    /// item 1). Not filesystem access — pure string composition.
+    static func joinId(_ parent: String, _ name: String) -> String {
+        parent.hasSuffix("/") ? parent + name : parent + "/" + name
     }
 
     /// Measure a single filesystem entry's OWN size. NEVER follows symlinks
@@ -229,8 +242,19 @@ public enum FileSystemWalker {
 
         var out = Classified()
         for entry in entries.sorted(by: { $0.path < $1.path }) {
-            let cid = entry.path
             let name = entry.lastPathComponent
+            // Child id = parentId joined with the child name — NOT `entry.path`.
+            // `FileManager.contentsOfDirectory` canonicalizes enumerated URLs
+            // through firmlinks/symlinks (`/tmp/x` → `/private/tmp/x`,
+            // `/var/…` → `/private/var/…`), so `entry.path` would prefix children
+            // with a DIFFERENT root than the scan root's own id and the focus path
+            // would jump identity on the first dive (review-2 item 1). Deriving the
+            // id from the parent keeps every descendant under the chosen scan-root
+            // identity — still an absolute path that Finder resolves (the alias is a
+            // symlink), and identical to `entry.path` when no aliasing occurs (e.g.
+            // the `/Users/apple` home scan). The real (canonical) `entry` URL is
+            // still used for all FS access below — only the id string is derived.
+            let cid = Self.joinId(parentId, name)
             let vals = try? entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
             let isSymlink = vals?.isSymbolicLink ?? false
             let isDir = vals?.isDirectory ?? false

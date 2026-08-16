@@ -66,7 +66,10 @@ public enum ScanState: String, Codable, Sendable {
 /// `id` string; equality of whole subtrees (for tests) is via `Equatable`.
 public struct SizeTree: Codable, Equatable, Sendable, Identifiable {
     /// Stable identity of this node. In TZ-1 an arbitrary fixture string; in
-    /// TZ-2 the scanner assigns it (path-derived).
+    /// TZ-2+ the scanner assigns it path-derived: the root's id is the scan root's
+    /// path and each descendant is `parentId + "/" + name`, so the whole tree
+    /// shares one absolute-path identity prefix (FileSystemWalker contract). Doubles
+    /// as the Finder-reveal path and the focus-path readout under the live scan.
     public let id: String
     /// Display name (the last path component, or a synthetic label for
     /// denied/unaccounted placeholders).
@@ -113,5 +116,21 @@ public extension SizeTree {
     /// Depth of the subtree rooted here: a leaf is depth 1.
     var depth: Int {
         1 + (children.map(\.depth).max() ?? 0)
+    }
+
+    /// Depth-first lookup of a node by its `id`. O(n); TZ-3 keeps no index (files
+    /// are the system of record, no caches — CLAUDE.md constraint 4). The App's
+    /// NavigationController resolves a hit tile's `nodeId` back to its node because
+    /// TileRect carries only geometry, not the node's name/sizes. Concrete current
+    /// users (verified by `grep node(withId:` under Sources): the hover readout
+    /// (name + allocated + logical), the per-tile labels (name + allocated), and
+    /// the right-click menu title (name). The focus-path label and ascend use the
+    /// `focusStack` of ids directly — they do NOT call this.
+    func node(withId id: String) -> SizeTree? {
+        if self.id == id { return self }
+        for child in children {
+            if let found = child.node(withId: id) { return found }
+        }
+        return nil
     }
 }

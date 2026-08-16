@@ -70,9 +70,18 @@ echo "==> Assert the signature carries a stable TeamIdentifier"
 # An ad-hoc or unsigned bundle reports 'TeamIdentifier=not set'. Require a real
 # team id so an identity-less build (which would defeat TCC persistence) fails
 # LOUDLY here rather than silently re-prompting the operator at runtime.
-if ! codesign -dv "$APP" 2>&1 | grep -Eq '^TeamIdentifier=[A-Z0-9]+$'; then
+#
+# CAPTURE-THEN-MATCH (TZ-3 rev-1): do NOT pipe `codesign -dv` into `grep -q`.
+# Under `set -o pipefail`, `grep -q` exits at the first match and closes the
+# pipe; `codesign` then dies with SIGPIPE (141) on its next write, and pipefail
+# propagates that 141 as the pipeline's status — a false "no TeamIdentifier"
+# failure that fires intermittently on a perfectly-signed bundle (observed once,
+# then vanished on rerun — a timing race, not a code fault). Capturing the
+# output first removes the pipe entirely; the assertion is otherwise identical.
+SIG_DESC="$(codesign -dv "$APP" 2>&1)"
+if ! grep -Eq '^TeamIdentifier=[A-Z0-9]+$' <<<"$SIG_DESC"; then
 	echo "BUILD FAILED: $APP has no stable TeamIdentifier after codesign" >&2
-	codesign -dv "$APP" 2>&1 || true
+	echo "$SIG_DESC" >&2
 	exit 1
 fi
 

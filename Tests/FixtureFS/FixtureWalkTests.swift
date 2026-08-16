@@ -193,7 +193,7 @@ final class FixtureWalkTests: XCTestCase {
 
     func testGoldenTreeMatchesIndependentRecompute() async throws {
         let actual = await walkToTree()
-        let expected = expectedTree(root, name: root.lastPathComponent, depth: 0)
+        let expected = expectedTree(root, id: root.path, name: root.lastPathComponent, depth: 0)
         assertTreesEqual(actual, expected, path: root.lastPathComponent)
     }
 
@@ -201,9 +201,37 @@ final class FixtureWalkTests: XCTestCase {
     /// kept from the prior gate; the full-tree test above subsumes it).
     func testRootAllocatedMatchesIndependentRecompute() async throws {
         let tree = await walkToTree()
-        let expected = expectedTree(root, name: root.lastPathComponent, depth: 0)
+        let expected = expectedTree(root, id: root.path, name: root.lastPathComponent, depth: 0)
         XCTAssertEqual(tree.allocatedBytes, expected.allocatedBytes)
         XCTAssertGreaterThan(tree.allocatedBytes, 0)
+    }
+
+    // MARK: - Focus-path identity continuity (review-2 item 1)
+    //
+    // The fixture root lives under `NSTemporaryDirectory()` — on macOS a firmlink
+    // path (`/var/folders/…`) that `FileManager` enumeration canonicalizes to
+    // `/private/var/folders/…`. Before the fix the root id stayed `/var/…` while
+    // child ids came out `/private/var/…`, so the focus path JUMPED identity on the
+    // first dive (root shows `/var/…`, child shows `/private/var/…/Alpha`). This
+    // pins the contract: every descendant id is the root id + "/" + names, so the
+    // focus path grows FROM the scan root and never changes prefix.
+
+    func testAllNodeIdsShareScanRootIdentityPrefix() async throws {
+        let tree = await walkToTree()
+        XCTAssertEqual(tree.id, root.path, "root id is the scan root's own path")
+
+        func check(_ node: SizeTree, parentId: String) {
+            for child in node.children {
+                XCTAssertEqual(child.id, joinId(parentId, child.name),
+                    "child id must be parentId + name (no firmlink prefix jump): \(child.id)")
+                XCTAssertTrue(child.id.hasPrefix(tree.id + "/"),
+                    "every descendant id lives under the scan-root identity: \(child.id)")
+                XCTAssertFalse(child.id.hasPrefix("/private/var/") && !tree.id.hasPrefix("/private/"),
+                    "child id must not adopt the firmlink-canonical prefix the root lacks: \(child.id)")
+                check(child, parentId: child.id)
+            }
+        }
+        check(tree, parentId: tree.id)
     }
 
     // MARK: - Streaming contract (partial data is usable mid-scan)
@@ -287,9 +315,17 @@ final class FixtureWalkTests: XCTestCase {
     // scanState is `.complete` (files/bundles via hasSize, dirs via subtreeCompleted,
     // denied via the denial flag), so the golden fixes `.complete` throughout.
 
-    private func expectedTree(_ url: URL, name: String, depth: Int) -> SizeTree {
+    /// Independent path-join oracle for node ids: parent id + "/" + child name,
+    /// mirroring the walker's `joinId` contract (review-2 item 1) but recomputed
+    /// here so a walker id-derivation regression fails the golden too. NOT
+    /// `url.path` — that would be the firmlink-canonicalized form the walker no
+    /// longer uses for descendants.
+    private func joinId(_ parent: String, _ name: String) -> String {
+        parent.hasSuffix("/") ? parent + name : parent + "/" + name
+    }
+
+    private func expectedTree(_ url: URL, id: String, name: String, depth: Int) -> SizeTree {
         let policy = ScanPolicy.default
-        let id = url.path
 
         // Symlink → un-followed leaf, sized by the link (never the target).
         var st = stat()
@@ -318,7 +354,10 @@ final class FixtureWalkTests: XCTestCase {
             return leaf(id: id, name: name, kind: .denied, a: ownA, l: ownL)
         }
 
-        var kids = entries.map { expectedTree($0, name: $0.lastPathComponent, depth: depth + 1) }
+        var kids = entries.map {
+            expectedTree($0, id: joinId(id, $0.lastPathComponent),
+                         name: $0.lastPathComponent, depth: depth + 1)
+        }
         kids.sort { $0.name == $1.name ? $0.id < $1.id : $0.name < $1.name }
 
         let totalA = kids.reduce(ownA) { $0 + $1.allocatedBytes }

@@ -56,14 +56,23 @@ public struct TileRect: Equatable, Sendable {
     /// scanned", and the renderer styles a not-yet-`.complete` tile outlined-dim
     /// WITHOUT conflating kind and state. Concrete current user: QuadRenderer.
     public let scanState: ScanState
+    /// Subtree hue in [0,1) (TZ-3, PLAN §"Visual language"): the hue of this
+    /// tile's TOP-LEVEL ancestor under the current focus, derived from that
+    /// ancestor's NAME (`TileColor.hue`) and INHERITED by every descendant, so a
+    /// whole subtree shares one hue and the dim ladder becomes brightness within
+    /// it. The focus tile (dimLevel 0) and each top-level tile (dimLevel 1) are
+    /// their own hue roots. The renderer turns (hue, dimLevel) into an HSB colour;
+    /// `denied`/`pending` tiles ignore hue and keep their reserved colours.
+    public let hue: Double
 
     public init(rect: Rect, dimLevel: Int, nodeId: String, kind: NodeKind,
-                scanState: ScanState = .complete) {
+                scanState: ScanState = .complete, hue: Double = 0) {
         self.rect = rect
         self.dimLevel = dimLevel
         self.nodeId = nodeId
         self.kind = kind
         self.scanState = scanState
+        self.hue = hue
     }
 }
 
@@ -103,19 +112,26 @@ public enum TreemapScene {
             focus = tree
         }
         var tiles: [TileRect] = []
-        place(node: focus, rect: viewport, level: 0,
+        place(node: focus, rect: viewport, level: 0, inheritedHue: 0,
               depthWindow: depthWindow, borderInset: borderInset, into: &tiles)
         return tiles
     }
 
     /// Pre-order recursive placement. Emits `node`, then (if within the depth
     /// window and there is room) tiles its children in the inset rect.
+    ///
+    /// Hue assignment (PLAN §"Visual language"): the focus (level 0) and each
+    /// top-level tile (level 1) are HUE ROOTS — they derive their hue from their
+    /// own name; deeper tiles INHERIT the hue passed down. `inheritedHue` is thus
+    /// only consulted at level ≥ 2. Threading it down the recursion keeps the
+    /// assignment a pure property of the layout, not a second tree walk.
     private static func place(
-        node: SizeTree, rect: Rect, level: Int,
+        node: SizeTree, rect: Rect, level: Int, inheritedHue: Double,
         depthWindow: Int, borderInset: Double, into tiles: inout [TileRect]
     ) {
+        let tileHue = level <= 1 ? TileColor.hue(for: node.name) : inheritedHue
         tiles.append(TileRect(rect: rect, dimLevel: level, nodeId: node.id,
-                              kind: node.kind, scanState: node.scanState))
+                              kind: node.kind, scanState: node.scanState, hue: tileHue))
 
         guard level < depthWindow, !node.children.isEmpty else { return }
         let inner = rect.inset(by: borderInset)
@@ -124,7 +140,7 @@ public enum TreemapScene {
         let weights = node.children.map { Double($0.allocatedBytes) }
         let childRects = Squarify.layout(weights: weights, in: inner)
         for (child, childRect) in zip(node.children, childRects) {
-            place(node: child, rect: childRect, level: level + 1,
+            place(node: child, rect: childRect, level: level + 1, inheritedHue: tileHue,
                   depthWindow: depthWindow, borderInset: borderInset, into: &tiles)
         }
     }

@@ -53,4 +53,30 @@ public struct Rect: Equatable, Sendable {
         let iy = max(0, min(y + height, other.y + other.height) - max(y, other.y))
         return ix * iy
     }
+
+    /// HALF-OPEN containment: `[x, x+width) × [y, y+height)`. Added in TZ-3 for
+    /// hit-testing. Half-open is deliberate and load-bearing: adjacent tiles share
+    /// an edge, and half-open makes a point on that seam belong to EXACTLY ONE
+    /// tile — the property `HitTest` relies on to return a single unambiguous
+    /// root→leaf chain rather than a fork. The trade-off: a point exactly on the
+    /// viewport's far (right/bottom) outer edge is NOT contained; the App clamps
+    /// cursor coordinates strictly inside the drawable before hit-testing, so that
+    /// boundary is never queried in practice. Concrete users: HitTest (this slice).
+    public func contains(_ p: Point) -> Bool {
+        p.x >= x && p.x < x + width && p.y >= y && p.y < y + height
+    }
+}
+
+/// A point in the SAME space as `Rect` (top-left origin, y-down; pixels in the
+/// App, any units in tests). A tiny value type — earned by two concrete current
+/// users, `HitTest` (cursor → tile) and `FocusCamera` (transforming a probe
+/// point); the rejected alternative, a bare `(Double, Double)` tuple, loses the
+/// `.x/.y` naming both callers read and invites axis-swap bugs across them.
+public struct Point: Equatable, Sendable {
+    public var x: Double
+    public var y: Double
+    public init(x: Double, y: Double) {
+        self.x = x
+        self.y = y
+    }
 }

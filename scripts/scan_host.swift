@@ -120,7 +120,7 @@ struct ScanHost {
     static let window = 10
 
     static func assertGolden(_ tree: SizeTree, root: URL) {
-        let expected = expectedTree(root, name: root.lastPathComponent, depth: 0)
+        let expected = expectedTree(root, id: root.path, name: root.lastPathComponent, depth: 0)
         compareTrees(tree, expected, path: root.lastPathComponent)
         if tree.allocatedBytes <= 0 { die("scanned allocated total is not positive") }
         // Spot-check the two invisible-space edges by name, for a legible failure.
@@ -157,9 +157,14 @@ struct ScanHost {
     /// syscalls, same ScanPolicy rules, same (name, id) ordering. Mirrors the
     /// XCTest golden in Tests/FixtureFS. Every node is `.complete` after a finished
     /// walk (files/bundles via size, dirs via completion, denied via the flag).
-    static func expectedTree(_ url: URL, name: String, depth: Int) -> SizeTree {
+    /// Node id = parent id + "/" + name, mirroring the walker's `joinId` contract
+    /// (review-2 item 1) — NOT `url.path`, which the firmlink canonicalizes.
+    static func joinId(_ parent: String, _ name: String) -> String {
+        parent.hasSuffix("/") ? parent + name : parent + "/" + name
+    }
+
+    static func expectedTree(_ url: URL, id: String, name: String, depth: Int) -> SizeTree {
         let policy = ScanPolicy.default
-        let id = url.path
 
         var st = stat()
         if lstat(url.path, &st) == 0, (st.st_mode & S_IFMT) == S_IFLNK {
@@ -180,7 +185,10 @@ struct ScanHost {
             at: url, includingPropertiesForKeys: nil, options: []) else {
             return leaf(id, name, .denied, ownA, ownL)
         }
-        var kids = entries.map { expectedTree($0, name: $0.lastPathComponent, depth: depth + 1) }
+        var kids = entries.map {
+            expectedTree($0, id: joinId(id, $0.lastPathComponent),
+                         name: $0.lastPathComponent, depth: depth + 1)
+        }
         kids.sort { $0.name == $1.name ? $0.id < $1.id : $0.name < $1.name }
         let totalA = kids.reduce(ownA) { $0 + $1.allocatedBytes }
         let totalL = kids.reduce(ownL) { $0 + $1.logicalBytes }

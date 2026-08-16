@@ -10,10 +10,19 @@
 //  EventBatcher; here we just apply it on one thread.
 //
 //  RELAYOUT CADENCE (ratified decision 3): a ~1 s timer snapshots the reducer
-//  into a SizeTree and hands it to the canvas, which animates the ~300 ms rect
-//  lerp. We deliberately do NOT relayout per batch — batched, calm, never
+//  into a SizeTree and hands it — via `onSnapshot` — to the App's
+//  NavigationController, which lays it out for the current focus and animates the
+//  canvas. We deliberately do NOT relayout per batch — batched, calm, never
 //  jittering. Sizes shown are always real recursive totals; the depth window
-//  (policy) prunes only retained child detail (decision 4).
+//  prunes only retained child detail (decision 4).
+//
+//  DETAIL ON DEMAND (TZ-3, decision 4 "extended on demand when zooming"): the
+//  walker descends FULLY and the reducer retains EVERY node in memory — only the
+//  PROJECTION (`makeTree(depthWindow:)`) is windowed. So deepening detail costs a
+//  re-projection, never a re-scan. NavigationController sets `projectionDepth`
+//  (focus depth + render depth) as the focus descends; this controller re-projects
+//  at that depth. This is why the seam is `onSnapshot` + `projectionDepth`, not a
+//  direct canvas reference: the App's navigation state decides how deep to project.
 //
 //  This is App-layer glue (I/O/UI side), instantiated by AppDelegate (the Main
 //  assembly). Not a core abstraction — a single concrete coordinator with one
@@ -29,8 +38,14 @@ final class ScanController {
 
     private let root: URL
     private let policy: ScanPolicy
-    private weak var canvas: CanvasView?
+    private let onSnapshot: (SizeTree) -> Void
     private let onStatus: (ScanStatus) -> Void
+
+    /// Retained/rendered child depth of the next projection (decision 4). Starts
+    /// at the policy default (root focus); NavigationController raises it as a dive
+    /// descends so the focused subtree carries enough detail. A change re-projects
+    /// immediately so the new detail appears without waiting for the next tick.
+    private var projectionDepth: Int
 
     private var reducer: ScanReducer
     private var scanTask: Task<Void, Never>?
@@ -38,13 +53,24 @@ final class ScanController {
     private var volume: VolumeProbe.VolumeInfo?
     private var running = false
 
-    init(root: URL, policy: ScanPolicy, canvas: CanvasView,
+    init(root: URL, policy: ScanPolicy,
+         onSnapshot: @escaping (SizeTree) -> Void,
          onStatus: @escaping (ScanStatus) -> Void) {
         self.root = root
         self.policy = policy
-        self.canvas = canvas
+        self.onSnapshot = onSnapshot
         self.onStatus = onStatus
+        self.projectionDepth = policy.depthDetailWindow
         self.reducer = ScanReducer(rootId: root.path, rootName: root.lastPathComponent)
+    }
+
+    /// Raise/lower the projected detail depth (focus depth + render depth) and
+    /// re-project now. No-op if unchanged. Called by NavigationController on dive/
+    /// ascend — the "extend scan detail on demand" wiring (packet deliverable 4).
+    func setProjectionDepth(_ depth: Int) {
+        guard depth != projectionDepth else { return }
+        projectionDepth = depth
+        relayout()
     }
 
     func start() {
@@ -82,8 +108,8 @@ final class ScanController {
     }
 
     private func relayout() {
-        let tree = reducer.makeTree(depthWindow: policy.depthDetailWindow)
-        canvas?.updateTree(tree)
+        let tree = reducer.makeTree(depthWindow: projectionDepth)
+        onSnapshot(tree)
         onStatus(ScanStatus(volume: volume, scannedBytes: tree.allocatedBytes, running: running))
     }
 }

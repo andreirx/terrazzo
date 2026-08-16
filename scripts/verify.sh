@@ -36,11 +36,13 @@ SHADER="Sources/App/Shaders.metal"
 FIXTURE="Tests/Fixtures/fixture-tree.json"
 OUT1="build/verify-1.png"
 OUT2="build/verify-2.png"
+FOCUS_ROOT="build/verify-focus-root.png"
+FOCUS_CHILD="build/verify-focus-child.png"
 SCAN_OUT1="build/verify-scan-1.png"
 SCAN_OUT2="build/verify-scan-2.png"
 
 mkdir -p build
-rm -f "$OUT1" "$OUT2" "$SCAN_OUT1" "$SCAN_OUT2"
+rm -f "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD" "$SCAN_OUT1" "$SCAN_OUT2"
 
 echo "==> (2a) Build the app bundle (also needed for structure assertions)"
 scripts/build.sh
@@ -58,18 +60,26 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swiftc \
 	-framework ImageIO \
 	-target arm64-apple-macos14
 
-echo "==> (1b) Render two fixture frames at different viewport sizes"
-"$HOST_BIN" "$SHADER" "$FIXTURE" "$OUT1" "$OUT2"
+echo "==> (1b) Render two viewport frames + two focus frames (root vs first child)"
+"$HOST_BIN" "$SHADER" "$FIXTURE" "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD"
 
-echo "==> (1c) Assert both frames were written and are non-empty"
-if [[ ! -s "$OUT1" || ! -s "$OUT2" ]]; then
-	echo "VERIFY FAILED: a frame is missing/empty ($OUT1, $OUT2)" >&2
+echo "==> (1c) Assert all four frames were written and are non-empty"
+for f in "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD"; do
+	if [[ ! -s "$f" ]]; then
+		echo "VERIFY FAILED: a frame is missing/empty ($f)" >&2
+		exit 1
+	fi
+done
+
+echo "==> (1d) Assert the two viewport frames differ (layout responded to viewport)"
+if cmp -s "$OUT1" "$OUT2"; then
+	echo "VERIFY FAILED: $OUT1 and $OUT2 are byte-identical — layout did not respond to size" >&2
 	exit 1
 fi
 
-echo "==> (1d) Assert the two frames differ (layout responded to viewport)"
-if cmp -s "$OUT1" "$OUT2"; then
-	echo "VERIFY FAILED: $OUT1 and $OUT2 are byte-identical — layout did not respond to size" >&2
+echo "==> (1e) Assert focus=root and focus=child differ (navigation changes the map)"
+if cmp -s "$FOCUS_ROOT" "$FOCUS_CHILD"; then
+	echo "VERIFY FAILED: $FOCUS_ROOT and $FOCUS_CHILD are byte-identical — focus did not change what is drawn" >&2
 	exit 1
 fi
 
@@ -112,6 +122,6 @@ for f in \
 	fi
 done
 
-echo "==> VERIFY OK: fixture frames ($OUT1,$OUT2) and scan frames ($SCAN_OUT1,$SCAN_OUT2) written and differ; $APP structure complete."
+echo "==> VERIFY OK: fixture frames ($OUT1,$OUT2), focus frames ($FOCUS_ROOT,$FOCUS_CHILD), and scan frames ($SCAN_OUT1,$SCAN_OUT2) written and differ; $APP structure complete."
 echo "    Scan gate: real walker+reducer produced the golden tree and rendered it."
 echo "    Operator judges the PNGs + the live window (scripts/run.sh)."

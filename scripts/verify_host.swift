@@ -15,7 +15,16 @@
 //  verify.sh then asserts both files are non-empty AND byte-differ (different
 //  viewport ⇒ different squarified layout ⇒ different pixels).
 //
+//  TZ-3 ADDS the NAVIGATION gate (packet deliverable 8): at a FIXED viewport it
+//  renders the scene at focus=root and at focus=<root's first child> (the
+//  committed, post-animation focus states — the deterministic gate renders the
+//  COMMITTED state, not the transient camera frames, keeping it byte-stable). The
+//  two frames go through the same real QuadRenderer; verify.sh asserts they differ
+//  (a different focus ⇒ a different subtree fills the canvas ⇒ different pixels),
+//  proving focus navigation actually changes what is drawn.
+//
 //  Usage: verify_host <shaders.metal> <fixture.json> <out1.png> <out2.png>
+//                     <focus-root.png> <focus-child.png>
 //
 
 import Foundation
@@ -33,11 +42,12 @@ private let viewportB = (w: 1300, h: 520)
 struct VerifyHost {
     static func main() {
         let args = CommandLine.arguments
-        guard args.count == 5 else {
-            FileHandle.standardError.write(Data("usage: \(args.first ?? "verify_host") <shaders.metal> <fixture.json> <out1.png> <out2.png>\n".utf8))
+        guard args.count == 7 else {
+            FileHandle.standardError.write(Data("usage: \(args.first ?? "verify_host") <shaders.metal> <fixture.json> <out1.png> <out2.png> <focus-root.png> <focus-child.png>\n".utf8))
             exit(2)
         }
         let shaderPath = args[1], fixturePath = args[2], out1 = args[3], out2 = args[4]
+        let focusRootOut = args[5], focusChildOut = args[6]
 
         guard let device = MTLCreateSystemDefaultDevice() else { die("no Metal device") }
 
@@ -70,16 +80,28 @@ struct VerifyHost {
         renderFrame(device: device, renderer: renderer, tree: tree,
                     px: viewportB.w, py: viewportB.h, out: out2)
 
-        print("VERIFY_HOST OK: wrote \(out1) (\(viewportA.w)x\(viewportA.h)) and \(out2) (\(viewportB.w)x\(viewportB.h))")
+        // Navigation gate (TZ-3): committed focus=root vs focus=<first child> at a
+        // fixed viewport. A valid focus child must exist in the fixture.
+        guard let focusChild = tree.children.first else {
+            die("fixture root has no children — cannot render a focus-child frame")
+        }
+        renderFrame(device: device, renderer: renderer, tree: tree, focusId: nil,
+                    px: viewportA.w, py: viewportA.h, out: focusRootOut)
+        renderFrame(device: device, renderer: renderer, tree: tree, focusId: focusChild.id,
+                    px: viewportA.w, py: viewportA.h, out: focusChildOut)
+
+        print("VERIFY_HOST OK: wrote \(out1) (\(viewportA.w)x\(viewportA.h)) and \(out2) (\(viewportB.w)x\(viewportB.h)); "
+              + "focus frames \(focusRootOut) (root) and \(focusChildOut) (child \(focusChild.id))")
     }
 
-    /// Build the scene at the given pixel viewport, render through the real
-    /// QuadRenderer into an offscreen texture, assert non-blank, write PNG.
+    /// Build the scene at the given pixel viewport (optionally focused on
+    /// `focusId`), render through the real QuadRenderer into an offscreen texture,
+    /// assert non-blank, write PNG.
     static func renderFrame(device: MTLDevice, renderer: QuadRenderer, tree: SizeTree,
-                            px: Int, py: Int, out: String) {
+                            focusId: String? = nil, px: Int, py: Int, out: String) {
         let viewport = Rect(x: 0, y: 0, width: Double(px), height: Double(py))
-        let tiles = TreemapScene.layout(tree: tree, viewport: viewport)
-        guard !tiles.isEmpty else { die("scene produced no tiles at \(px)x\(py)") }
+        let tiles = TreemapScene.layout(tree: tree, focusId: focusId, viewport: viewport)
+        guard !tiles.isEmpty else { die("scene produced no tiles at \(px)x\(py) (focus \(focusId ?? "root"))") }
 
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm, width: px, height: py, mipmapped: false)
