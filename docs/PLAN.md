@@ -250,6 +250,21 @@ the scan root's is a boundary stub, never entered (kills the
 mounts); (5) a concurrent anticipatory scan excludes the active scan
 root by emitting a graft reference at its enumeration point.
 
+### TZ-7 — The living map: staleness detection and live updates
+Human field report 2026-08-16 (deleted a folder; its tile persisted).
+Tier 1 (near-free): store each directory's mtime in SizeTree at scan
+time; revalidate the FOCUS directory with ONE stat on focus change, app
+activation, and a lazy idle timer — mtime unchanged ⇒ listing current;
+changed ⇒ re-enumerate that one directory and diff. Tier 2 (the real
+mechanism): an FSEvents recursive subscription on the scan root —
+kernel-coalesced change notifications per directory; each event
+re-enumerates the touched directory and emits diff events. New additive
+ScanCore vocabulary: childRemoved (+ subtree prune; sizes ripple up).
+The reducer/pipeline consume diffs exactly like scan events — the map
+updates live without rescan. Manual Rescan (TZ-4) remains the
+full-truth fallback. ALL revalidation is async events — never blocks
+navigation (the law).
+
 ## Slice → relay mapping
 
 Same operator loop as glyph-saver: bootstrap
