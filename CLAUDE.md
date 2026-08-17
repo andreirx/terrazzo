@@ -30,6 +30,18 @@
 4. **Files are the system of record.** No hidden state; no caches in v1.
 5. **Name honesty.** Names must match verified behavior; ported patterns
    cite their source (glyph-saver / ZapZap heritage where applicable).
+6. **THE MEMORY LAW** (ratified 2026-08-17, TZ-9, sibling to the threading
+   law — after a 33 GB RSS field report on a tens-of-millions-inode
+   machine): Retained memory per scanned node ≤ ~100 B amortized; a rescan
+   returns footprint to baseline. Anything that scales worse is a defect.
+   STATUS (honest, 2026-08-17): the law is the TARGET, not yet the
+   achieved state. Phase A shipped and measured: 534 B/node (was 624);
+   rescan leak gate green. Phase B (derive Node.id from parent-chain
+   names — the ~200 B/node whale) is OPEN: three builder cycles failed
+   to land it (strain recorded for the human). Until it lands, the
+   giant-volume consent screen is the field protection. Claiming the
+   law as achieved would be the appearance of a guarantee without the
+   guarantee — prohibited.
 
 ## Build & gates (imported lessons — do not relearn)
 

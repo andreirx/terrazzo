@@ -2,6 +2,26 @@
 //  ScanEvents.swift — the streaming scan event model + the pure reducer.
 //  Module maturity: PROTOTYPE (slice TZ-2 — contracts still moving)
 //
+//  TZ-9 (THE MEMORY LAW) — LEAN NODE STORE, Phase A. The field report named three ways the
+//  pre-TZ-9 `[String: Node]` retained every node's absolute path — as the dict KEY, inside its
+//  parent's CHILD SET, and as each child's `parentId` — i.e. the same path stored THREE times
+//  (~264 B of path strings/node, the bulk of the pre-TZ-9 ~624 B/node measured on the home scan,
+//  growing O(depth)). This
+//  slice removes TWO of those three copies with an index-addressed store:
+//    • `store: [Node]`   — one contiguous slot per node; each node retains its OPAQUE id string
+//                          exactly ONCE (`Node.id`).
+//    • `index: [PathKey: Int32]` — id → slot, keyed by a 128-bit HASH of the id (16 bytes), NOT
+//                          the id string — so the map holds NO path copy (kills copy #1).
+//    • parent / children are SLOT INDICES (`Int32`), not strings — so no parent or child holds
+//                          another node's path (kills copies #2 and #3).
+//  The public API is UNCHANGED: events carry path-string ids; makeTree/graft/prune/diff produce
+//  byte-identical trees (the 211 tests are the ratchet). Ids stay OPAQUE — echoed back verbatim
+//  from `Node.id`, never reconstructed — so a caller whose ids are NOT `parent + "/" + name`
+//  (the shared verify/TreemapCore fixture uses synthetic ids like "n028:System") is unaffected.
+//  See `PathKey` for the collision argument, and the build report for why the LAST id copy is
+//  kept here (dropping it to reach ≤100 B/node — Phase B — needs the `id == parent+"/"+name`
+//  contract, which the walker honors but that fixture does not).
+//
 //  This is the concurrency boundary (ratified decision 5). The walker in ScanFS
 //  runs ONE worker per top-level folder; every worker emits SUBTREE-TAGGED
 //  `ScanEvent` batches into this SINGLE, PURE, SINGLE-THREADED reducer. No locks,
@@ -149,6 +169,60 @@ public struct RevalidationDiff: Equatable, Sendable {
     }
 }
 
+/// A 128-bit hash of a node's opaque id — the lean store's map KEY (TZ-9, THE MEMORY LAW).
+///
+/// WHY A HASH, NOT THE PATH: the pre-TZ-9 `[String: Node]` retained the full path string as the
+/// dict key; at ~40–80 bytes each (plus String/heap overhead) that was one of the three retained
+/// path copies the field report named. Keying by a fixed 16-byte hash retains no path in the map at
+/// all — the id→slot map costs the same whether ids are 8 or 200 chars long. (The node still keeps
+/// its own id once, in `Node.id`, so ids stay opaque and are echoed back verbatim — see the file
+/// header for why that LAST copy is retained rather than derived.)
+///
+/// COLLISION RESOLUTION IS EXACT (review-0 change 1) — the hash is a fast FIRST-LEVEL discriminator,
+/// NOT the correctness argument. The map (`index`) holds one slot per key; a second DISTINCT id that
+/// hashes to the same key goes into the `collisions` side table; and EVERY lookup (`slot(of:)` /
+/// `ensureSlot`) confirms `store[slot].id == id` against the ONE opaque id the node already retains
+/// (`Node.id`). So two distinct ids can never resolve to the same node — correctness rests on the
+/// retained-id compare, exactly as the pre-TZ-9 `[String: Node]` store's key compare did, NOT on the
+/// hash being collision-free. The packet's suggested "parent-chain verification" was rejected as
+/// UNSOUND here — verified from the code, not the name:
+///   1. LATE NAMING — a node may be created by a `sizeUpdated` BEFORE its `childrenDiscovered` stub
+///      (the size-before-stub test), so its `name` is transiently `""`.
+///   2. OPAQUE / DISPLAY-NAME IDS — a node's id need not be `parent + "/" + name` (the scan root's
+///      `name` is a display name; the verify fixture's ids are synthetic), so a name-based path
+///      reconstruction cannot even produce the id to verify against.
+/// The retained-id compare has neither problem: it is the id itself, present from `ensureSlot`.
+///
+/// WHY 128 BITS ANYWAY: keeping the hash wide (two independent 64-bit passes) is what keeps the
+/// `collisions` side table EMPTY in practice — across even a 60M-node forest the expected number of
+/// colliding pairs is ≈ n²/2·2⁻¹²⁸ ≈ 1e-23 — so the exact-resolution machinery pays ~zero memory and
+/// the verify compare almost always succeeds on the first slot. That is a MEMORY/throughput argument,
+/// not a correctness one: even if a collision did occur, the side table + id compare keep the two
+/// nodes distinct. Keys are compared on the FULL 128 bits (Swift synthesizes `==` over both halves).
+///
+/// ABSTRACTION LEDGER — PathKey: a value type wrapping the map key. Concrete users: `ScanReducer.index`
+/// + `collisions`. Axis: memory (drop the map's retained path copy — THE MEMORY LAW). Rejected simpler
+/// alternative: key by the `String` id (the pre-TZ-9 design — one of the three path copies this slice
+/// removes); and, separately, name-based parent-chain verification (unsound, see above).
+fileprivate struct PathKey: Hashable {
+    let a: UInt64
+    let b: UInt64
+    init(a: UInt64, b: UInt64) { self.a = a; self.b = b }
+    /// The production hasher: two independent hashes over the UTF-8 bytes (different bases + primes)
+    /// → 128 bits combined. Kept a plain, inlinable `init` (not routed through the reducer's stored
+    /// hasher) so the hot fold path pays a direct call, not an indirect one (the scan-rate law).
+    init(_ s: String) {
+        var a: UInt64 = 0xcbf2_9ce4_8422_2325            // FNV-1a offset basis
+        var b: UInt64 = 0x9e37_79b9_7f4a_7c15            // golden-ratio basis (independent seed)
+        for byte in s.utf8 {
+            a = (a ^ UInt64(byte)) &* 0x0000_0100_0000_01B3   // FNV-1a prime
+            b = (b ^ UInt64(byte)) &* 0x8803_55f2_1e6d_1965   // a different odd prime
+        }
+        self.a = a
+        self.b = b
+    }
+}
+
 /// Pure, single-threaded fold of `ScanEvent` batches into a `SizeTree`.
 ///
 /// Value type: `apply` mutates in place, `makeTree` snapshots. Constructed with
@@ -167,60 +241,136 @@ public struct ScanReducer {
     /// own tests, the full non-area-bounded path) this identity-on-non-negative default applies.
     public static let linearWeight: (Int64) -> Double = { Double(max(0, $0)) }
 
-    /// A node under construction. Fields are filled as facts arrive, in any
-    /// order. `kind`/`scanState` are DERIVED (see `outputKind`/`outputState`),
-    /// never stored, so they cannot depend on write order.
-    private struct Node {
-        var name: String
-        /// The kind reported by the parent's `childrenDiscovered` stub. `nil`
-        /// until the stub arrives (a node can be referenced by a size event
-        /// before its stub under interleaving). `denied` overrides this at
-        /// projection time.
-        var stubKind: NodeKind?
-        var ownAllocated: Int64 = 0
-        var ownLogical: Int64 = 0
-        /// Child ids as a set — arrival order is discarded; `makeTree` sorts.
-        var childIds: Set<String> = []
-        /// This node's id in its parent's `childIds` — set EXACTLY ONCE, when the
-        /// incoming edge is added (the parent's `childrenDiscovered`, or `reRoot`'s
-        /// graft). `nil` for the current scan root (no parent) and for a node whose
-        /// parent edge has not arrived yet. Used only to propagate retained-total
-        /// deltas upward (`bumpSubtree`); a node has exactly one parent by
-        /// filesystem structure (ids are absolute paths).
-        var parentId: String?
-        /// RETAINED EXACT subtree totals = own + Σ (linked children's retained
-        /// totals), maintained INCREMENTALLY by `bumpSubtree` on every own-size
-        /// write and every edge addition. Order-independent because the only
-        /// mutations are additive deltas pushed up the parent chain, and addition
-        /// commutes — so the invariant `subtree == own + Σ children.subtree` holds
-        /// after ANY interleaving, at EVERY snapshot (partial totals included).
-        /// This is what lets `build` read a beyond-window total in O(1) instead of
-        /// traversing every hidden descendant (the focus-rooted-projection bound the
-        /// operator ratified: work is O(focus subtree ∩ window), not O(retained)).
-        var subtreeAllocated: Int64 = 0
-        var subtreeLogical: Int64 = 0
-        var hasSize = false
-        var discoveredChildren = false
-        var denied = false
-        var completed = false
-        /// Walker's hidden judgment (leading-dot OR UF_HIDDEN), written ONCE from the
-        /// child's stub — a write-once field like `name`/`stubKind`, so it is
-        /// order-independent (the reducer's defining property). The visualization
-        /// "Show hidden" filter reads it during projection; `false` until the stub arrives.
-        var isHidden = false
-        /// Directory mtime (nanoseconds) — the TZ-7 staleness key. `nil` until learned, then set
-        /// by the parent's stub (scan-time capture) OR by a `directoryMtime` event (revalidation /
-        /// scan-root seed). NOT order-sensitive in a way that corrupts state: whichever write lands
-        /// last wins, and revalidation always re-stats to establish truth, so a transient stale
-        /// value only ever causes one extra (idempotent) re-enumeration, never a wrong tree.
-        var mtime: Int64?
+    // MARK: - Lean node store (TZ-9 — THE MEMORY LAW)
+
+    /// Sentinels. `noIndex` (`-1`) is not a valid `store` slot, so it marks "no parent" (the
+    /// current root, or a not-yet-linked node). `unknownMtime` (`Int64.min`) cannot be a real
+    /// nanosecond mtime (they are ≥ 0), so it marks "mtime not yet learned" — a sentinel instead
+    /// of `Int64?` to spare the optional's 8-byte alignment tax under the memory law.
+    private static let noIndex: Int32 = -1
+    private static let unknownMtime: Int64 = .min
+
+    /// Packed monotonic/flag bits. Every one is either write-once or an OR-set flag (see the file
+    /// header's order-independence argument), so packing them changes NOTHING about folding — it
+    /// only replaces five `Bool`s (which alignment would round up to 8 bytes/node) with one byte.
+    ///
+    /// ABSTRACTION LEDGER — Flags: a bitset over Node's boolean state. Concrete user: `Node`. Axis:
+    /// memory (THE MEMORY LAW — 8 bytes/node saved). Rejected simpler alternative: five `Bool` fields.
+    private struct Flags: OptionSet {
+        let rawValue: UInt8
+        static let hasSize            = Flags(rawValue: 1 << 0)
+        static let discoveredChildren = Flags(rawValue: 1 << 1)
+        static let denied             = Flags(rawValue: 1 << 2)
+        static let completed          = Flags(rawValue: 1 << 3)
+        static let isHidden           = Flags(rawValue: 1 << 4)
     }
 
-    private var nodes: [String: Node]
-    /// The scan root's id. MUTABLE since TZ-4b: root promotion re-roots the reducer
-    /// in place (`reRoot`) — the whole node map is preserved and a new parent is
-    /// grafted above the old root. Everywhere else this is written once at init.
+    /// A node under construction in the LEAN STORE (TZ-9). The DERIVED semantics are unchanged from
+    /// the pre-TZ-9 record — `kind`/`scanState` are computed (`outputKind`/`outputState`), never
+    /// stored, so they cannot depend on write order — the change is ADDRESSING: a node is a SLOT in
+    /// `store`, referenced by `Int32` index, never by a retained path String except its OWN id.
+    ///   • `id` is this node's opaque id, retained EXACTLY ONCE (echoed back verbatim in `SizeTree`,
+    ///     so ids stay opaque — a caller's synthetic ids survive a round trip). The pre-TZ-9 store
+    ///     held this same string THREE times (map key + parent's child-set + `parentId`); the other
+    ///     two are gone (hash key + `Int32` links).
+    ///   • `name` is the display name (usually ≤ 15 UTF-8 bytes → inline via Swift's small-string
+    ///     optimization, no heap).
+    ///   • `childIndices` are child SLOTS, not path strings — empty for leaves (Swift's shared
+    ///     empty-array singleton, so a file node pays ZERO heap here, the common case).
+    ///   • `parent` is the parent SLOT (`noIndex` for the root / a not-yet-linked node); it carries
+    ///     exactly the write-once single-parent role the old `parentId` string did.
+    private struct Node {
+        var id: String = ""
+        var name: String
+        var ownAllocated: Int64 = 0
+        var ownLogical: Int64 = 0
+        /// RETAINED EXACT subtree totals = own + Σ (linked children's retained totals), maintained
+        /// INCREMENTALLY by `bumpSubtree` on every own-size write and every edge addition. Order-
+        /// independent because the only mutations are additive deltas pushed up the parent chain,
+        /// and addition commutes — so `subtree == own + Σ children.subtree` holds after ANY
+        /// interleaving, at EVERY snapshot. This is what lets `build` read a beyond-window total in
+        /// O(1) instead of traversing hidden descendants (the ratified focus-rooted bound).
+        var subtreeAllocated: Int64 = 0
+        var subtreeLogical: Int64 = 0
+        /// Directory mtime (ns) — the TZ-7 staleness key — or `unknownMtime` until learned (parent
+        /// stub at scan time, or a `directoryMtime` event). Whichever write lands last wins;
+        /// revalidation always re-stats to establish truth, so a transient stale value costs at most
+        /// one extra (idempotent) re-enumeration, never a wrong tree.
+        var mtimeRaw: Int64 = ScanReducer.unknownMtime
+        /// Child SLOTS — arrival order is discarded; `makeTree` sorts by (name, id).
+        var childIndices: [Int32] = []
+        /// Parent SLOT (`noIndex` == none). Set EXACTLY ONCE when the incoming edge is added (the
+        /// parent's `childrenDiscovered`, or `reRoot`'s graft); a node has one parent by filesystem
+        /// structure. Used to propagate retained-total deltas upward (`bumpSubtree`).
+        var parent: Int32 = ScanReducer.noIndex
+        /// The kind reported by the parent's `childrenDiscovered` stub. `nil` until the stub arrives
+        /// (a node can be referenced by a size event before its stub); `denied` overrides at
+        /// projection time.
+        var stubKind: NodeKind?
+        var flags: Flags = []
+
+        // Derived boolean views (so `outputKind`/`outputState`/`build` read unchanged).
+        var hasSize: Bool { flags.contains(.hasSize) }
+        var discoveredChildren: Bool { flags.contains(.discoveredChildren) }
+        var denied: Bool { flags.contains(.denied) }
+        var completed: Bool { flags.contains(.completed) }
+        var isHidden: Bool { flags.contains(.isHidden) }
+        /// Projection view of the mtime sentinel: `nil` when unknown.
+        var projectedMtime: Int64? { mtimeRaw == ScanReducer.unknownMtime ? nil : mtimeRaw }
+    }
+
+    /// The node records, addressed by slot. Freed slots (from pruned subtrees) are recycled via
+    /// `freeList`, so the array does not grow unboundedly under live churn — the prune/rescan half
+    /// of THE MEMORY LAW.
+    private var store: [Node]
+    /// id → slot, keyed by a 128-bit path HASH (`PathKey`), NOT the path string. The memory win is
+    /// that the MAP KEY retains no path copy (16 fixed bytes regardless of id length) — the reducer
+    /// still keeps ONE opaque id per node, in `Node.id`, so ids round-trip verbatim (see the header).
+    /// This map holds exactly ONE slot per key: the FIRST id that claimed it. A second DISTINCT id
+    /// that hashes to the same key (a 128-bit collision — see `PathKey`) does not overwrite it; it is
+    /// recorded in `collisions` instead, and every lookup VERIFIES `store[slot].id == id`, so two
+    /// distinct ids can never resolve to one node. Exact resolution, not probabilistic.
+    private var index: [PathKey: Int32]
+    /// Collision side table: for a `PathKey` shared by two or more retained ids, the EXTRA slots
+    /// beyond the one in `index`. Absent (and the enclosing dictionary empty) in the overwhelming
+    /// normal case — a real FNV-128 collision is not an operational event (see `PathKey`) — so it
+    /// costs ZERO retained bytes per node under THE MEMORY LAW; it exists only so that IF two distinct
+    /// ids ever share a key, they are still kept apart EXACTLY (validated against the retained
+    /// `Node.id`), never merged. Cleared as slots are freed (`removeSubtree`) so it cannot leak.
+    ///
+    /// ABSTRACTION LEDGER — collisions: a side table of same-key slots. Concrete users: `slot(of:)` +
+    /// `ensureSlot` (readers/writer) and `removeSubtree` (cleanup). Axis: exact hash-collision
+    /// resolution (the frozen public API guarantees distinct ids stay distinct; a 128-bit hash alone
+    /// cannot). Rejected simpler alternative: none — a bare `[PathKey: Int32]` silently merges two
+    /// distinct filesystem nodes on any collision (the review-0 finding); parent-chain (name-based)
+    /// verification is unsound here (late naming + opaque ids, see `PathKey`).
+    private var collisions: [PathKey: [Int32]] = [:]
+    /// Recycled slot indices from pruned subtrees, reused by the next `ensureSlot` before growing
+    /// `store` (bounds live-churn memory; the initial scan never prunes, so it stays empty then).
+    ///
+    /// ABSTRACTION LEDGER — freeList: a slot recycler. Concrete users: `removeSubtree` (producer),
+    /// `ensureSlot` (consumer). Axis: live-churn memory (prune must return footprint). Rejected
+    /// simpler alternative: never reclaim slots — leaks one dead slot per pruned node over a long
+    /// living-map session, which the memory law forbids.
+    private var freeList: [Int32] = []
+    /// The current scan root's slot — the default `makeTree` focus and the `reRoot` anchor.
+    private var rootIndex: Int32
+    /// The scan root's id. MUTABLE since TZ-4b: root promotion re-roots the reducer in place
+    /// (`reRoot`) — the whole store is preserved and a new parent is grafted above the old root.
     private var rootId: String
+
+    /// TEST SEAM (TZ-9 review-0 change 2) — an OPTIONAL override of the 128-bit path hash, `nil` in
+    /// every production build (the public `init` leaves it nil). A real FNV-128 collision is not
+    /// constructible in a test, so proving that two DISTINCT ids sharing one key stay distinct through
+    /// `apply`/`makeTree`/lookup/prune requires FORCING the collision — the `internal` test init
+    /// installs a hasher that maps chosen ids to one key. On the hot fold path this is a single
+    /// optional-nil check that short-circuits to the inlinable `PathKey(id)` (see `key(_:)`), so the
+    /// seam adds no measurable scan-rate cost and touches no per-node memory (one optional reference on
+    /// the single reducer instance). Reviewer pre-ratified this narrowly scoped internal seam.
+    private let testHasher: ((String) -> PathKey)?
+    /// The path→key hash: the production `PathKey(id)` (inlinable direct call) unless a test installed
+    /// `testHasher`. THE single place the reducer turns an id into a map key.
+    private func key(_ id: String) -> PathKey { testHasher?(id) ?? PathKey(id) }
 
     /// TZ-7 (OPERATOR_NOTE 2026-08-17 #2) — TOMBSTONES: the subtree ROOTS a live `childRemoved` pruned.
     /// The reducer is "the single-threaded ordering authority"; it is where the deleted-while-subscanning
@@ -284,8 +434,86 @@ public struct ScanReducer {
     ///     events tagged with ids derived from the same root, so they match.
     ///   - rootName: display name for the root tile.
     public init(rootId: String, rootName: String) {
+        self.init(rootId: rootId, rootName: rootName, testHasher: nil)
+    }
+
+    /// TEST-ONLY designated init (TZ-9 review-0 change 2): the same construction as the public init,
+    /// plus an optional `testHasher` that forces chosen ids onto one 128-bit key so a test can drive a
+    /// hash collision the FNV-128 hash would otherwise never produce. `internal` — reachable only via
+    /// `@testable import ScanCore`; production always calls the public init (`testHasher == nil`).
+    /// `rawHash` is a plain `(String) -> (UInt64, UInt64)` so the seam never exposes the fileprivate
+    /// `PathKey` type across the module boundary.
+    internal init(rootId: String, rootName: String, rawHashForTesting rawHash: @escaping (String) -> (UInt64, UInt64)) {
+        self.init(rootId: rootId, rootName: rootName,
+                  testHasher: { let (a, b) = rawHash($0); return PathKey(a: a, b: b) })
+    }
+
+    private init(rootId: String, rootName: String, testHasher: ((String) -> PathKey)?) {
+        self.testHasher = testHasher
         self.rootId = rootId
-        self.nodes = [rootId: Node(name: rootName, stubKind: .dir)]
+        var root = Node(name: rootName, stubKind: .dir)
+        root.id = rootId
+        self.store = [root]
+        // Seed the root's key through the SAME hash the fold will use (test or production), else a
+        // forced-collision test would key the root differently from every folded id.
+        self.index = [testHasher?(rootId) ?? PathKey(rootId): 0]
+        self.rootIndex = 0
+    }
+
+    // MARK: - Lean-store primitives (TZ-9)
+
+    /// The slot for `id`, or `nil` if the reducer has never recorded it. EXACT (review-0 change 1):
+    /// the 128-bit hash picks a candidate, then the retained `Node.id` is compared so a hash collision
+    /// resolves to the RIGHT node (or `nil`), never to a distinct id's node. The id compare is the same
+    /// work the pre-TZ-9 `[String: Node]` did on every lookup, so the hot path is unchanged in cost.
+    private func slot(of id: String) -> Int32? {
+        let k = key(id)
+        guard let first = index[k] else { return nil }
+        if store[Int(first)].id == id { return first }
+        // Hash collision (astronomically rare — see `PathKey`): scan the side-table slots for this key.
+        if let bucket = collisions[k] {
+            for s in bucket where store[Int(s)].id == id { return s }
+        }
+        return nil
+    }
+
+    /// The slot for `id`, creating it from `make()` (recycling a freed slot if one is available,
+    /// else appending) when absent. The single allocation point — every `apply` arm that folds a
+    /// fact about a node routes through here, exactly as the old `nodes[id] ?? Node(…)` did. The
+    /// created node's `id` is stamped here (so every slot echoes its opaque id verbatim), the one
+    /// place it is retained. Collision-EXACT: an existing slot is returned only when its retained
+    /// `Node.id` matches; a genuine 128-bit collision with a DIFFERENT id allocates a fresh slot and
+    /// records it in the `collisions` side table so both ids stay distinct.
+    private mutating func ensureSlot(_ id: String, _ make: () -> Node) -> Int32 {
+        let k = key(id)
+        if let first = index[k] {
+            if store[Int(first)].id == id { return first }
+            if let bucket = collisions[k] {
+                for s in bucket where store[Int(s)].id == id { return s }
+            }
+            // Distinct id sharing this key: new slot, recorded in the side table (never overwrites
+            // `index[k]`, so the first id keeps its slot). Verified by `Node.id` on every lookup.
+            let i = allocateSlot(id, make)
+            collisions[k, default: []].append(i)
+            return i
+        }
+        let i = allocateSlot(id, make)
+        index[k] = i
+        return i
+    }
+
+    /// Stamp a fresh `Node` for `id` into a recycled or newly-appended slot and return its index. The
+    /// slot's key registration (`index` vs `collisions`) is the caller's (`ensureSlot`) decision.
+    private mutating func allocateSlot(_ id: String, _ make: () -> Node) -> Int32 {
+        var node = make()
+        node.id = id
+        if let reused = freeList.popLast() {
+            store[Int(reused)] = node
+            return reused
+        }
+        let i = Int32(store.count)
+        store.append(node)
+        return i
     }
 
     // MARK: - Root promotion (TZ-4b — "root promotion", ratified)
@@ -311,26 +539,25 @@ public struct ScanReducer {
     /// prior state under that id is lost.
     public mutating func reRoot(to newRootId: String, newRootName: String) {
         guard newRootId != rootId else { return } // already there — nothing to promote
-        let oldRootId = rootId
-        var newRoot = nodes[newRootId] ?? Node(name: newRootName, stubKind: .dir)
-        newRoot.name = newRootName
-        newRoot.stubKind = .dir
-        let grafted = newRoot.childIds.insert(oldRootId).inserted // graft the old root as a child
-        nodes[newRootId] = newRoot
-        // Graft is an edge addition, so it uses the SAME retained-total propagation as any
-        // other edge (see `bumpSubtree`): the old root's full retained subtree total folds
-        // into the new root exactly once. Guarded by `.inserted` so a repeated promotion to
-        // an already-grafted parent (idempotent) cannot double-count. `parentId` is set on the
-        // old root here — it had none (it was the root) — completing the upward chain the new
-        // siblings' size events will later climb.
-        if grafted {
-            nodes[oldRootId]?.parentId = newRootId
-            let old = nodes[oldRootId]
-            bumpSubtree(from: newRootId,
-                        allocated: old?.subtreeAllocated ?? 0,
-                        logical: old?.subtreeLogical ?? 0)
+        let oldIdx = rootIndex
+        let newIdx = ensureSlot(newRootId) { Node(name: newRootName, stubKind: .dir) }
+        store[Int(newIdx)].name = newRootName
+        store[Int(newIdx)].stubKind = .dir
+        // Graft the old root as a child of the new root, IFF that edge is new. The guard
+        // `parent != newIdx` mirrors the old `Set.insert().inserted`: the old root normally has
+        // no parent (`noIndex`) so it links; if `newRootId` had ALREADY discovered the old root as
+        // a child during scanning (its parent is already `newIdx`), we skip so the retained-total
+        // fold cannot double-count. Setting the old root's `parent` here completes the upward chain
+        // the new siblings' size events will later climb (`bumpSubtree`).
+        if store[Int(oldIdx)].parent != newIdx {
+            store[Int(newIdx)].childIndices.append(oldIdx)
+            store[Int(oldIdx)].parent = newIdx
+            bumpSubtree(fromSlot: newIdx,
+                        allocated: store[Int(oldIdx)].subtreeAllocated,
+                        logical: store[Int(oldIdx)].subtreeLogical)
         }
         rootId = newRootId
+        rootIndex = newIdx
     }
 
     // MARK: - Fold
@@ -350,39 +577,45 @@ public struct ScanReducer {
             // parent last. name/kind come ONLY from the stub → a single write; a
             // size event that created a bare record first just gets its identity
             // filled here. Creation order is irrelevant (write-once fields).
+            var childSlots: [Int32] = []
+            childSlots.reserveCapacity(children.count)
             for stub in children {
                 // A RETAINED parent re-linking this child is a legitimate re-appearance (delete+recreate):
                 // clear any tombstone so the child's fresh sub-scan folds normally. Idempotent for a child
                 // that was never tombstoned (the common case).
                 prunedRoots.remove(stub.id)
-                var child = nodes[stub.id] ?? Node(name: stub.name)
-                child.name = stub.name
-                child.stubKind = stub.kind
-                child.isHidden = stub.isHidden // write-once from the stub (order-independent)
-                if let m = stub.mtime { child.mtime = m } // scan-time dir mtime (TZ-7); nil for leaves
-                nodes[stub.id] = child
+                let ci = ensureSlot(stub.id) { Node(name: stub.name) }
+                store[Int(ci)].name = stub.name
+                store[Int(ci)].stubKind = stub.kind
+                // write-once from the stub (order-independent)
+                if stub.isHidden { store[Int(ci)].flags.insert(.isHidden) }
+                else { store[Int(ci)].flags.remove(.isHidden) }
+                if let m = stub.mtime { store[Int(ci)].mtimeRaw = m } // scan-time dir mtime (TZ-7); leaves keep unknown
+                childSlots.append(ci)
             }
-            var parent = nodes[parentId] ?? Node(name: "")
-            parent.discoveredChildren = true
-            // Track which edges are GENUINELY NEW (Set.insert reports it): only a new edge
-            // may fold a child's retained subtree total into the parent, so a re-stated stub
-            // (the idempotent graft reference the sibling walk emits, or any duplicate batch)
-            // cannot double-count.
-            var newlyLinked: [String] = []
-            for stub in children where parent.childIds.insert(stub.id).inserted {
-                newlyLinked.append(stub.id)
+            let pi = ensureSlot(parentId) { Node(name: "") }
+            store[Int(pi)].flags.insert(.discoveredChildren)
+            // Track which edges are GENUINELY NEW: only a new edge may fold a child's retained
+            // subtree total into the parent, so a re-stated stub (the idempotent graft reference the
+            // sibling walk emits, or any duplicate batch) cannot double-count. A child's `parent`
+            // already equal to `pi` means the edge exists (one parent by filesystem structure), so
+            // `parent != pi` is the exact test the old `Set.insert().inserted` gave. The child slots
+            // are the ones just returned by `ensureSlot` (collision-exact), not a re-lookup.
+            var newlyLinked: [Int32] = []
+            for ci in childSlots {
+                if store[Int(ci)].parent != pi {
+                    store[Int(pi)].childIndices.append(ci)
+                    store[Int(ci)].parent = pi
+                    newlyLinked.append(ci)
+                }
             }
-            nodes[parentId] = parent
-            // Set the parent pointer on each newly-linked child and push its CURRENT retained
-            // total up through the parent's ancestor chain. If the child's own/descendant sizes
-            // arrive LATER, their deltas climb this same chain (the child's `parentId` now
-            // points here) — so the order of "edge vs sizes" never changes the final totals.
-            for cid in newlyLinked {
-                nodes[cid]?.parentId = parentId
-                let child = nodes[cid]
-                bumpSubtree(from: parentId,
-                            allocated: child?.subtreeAllocated ?? 0,
-                            logical: child?.subtreeLogical ?? 0)
+            // Push each newly-linked child's CURRENT retained total up the parent's ancestor chain.
+            // If the child's own/descendant sizes arrive LATER, their deltas climb this same chain
+            // (the child's `parent` now points here) — so "edge vs sizes" order never changes totals.
+            for ci in newlyLinked {
+                bumpSubtree(fromSlot: pi,
+                            allocated: store[Int(ci)].subtreeAllocated,
+                            logical: store[Int(ci)].subtreeLogical)
             }
 
         case let .sizeUpdated(nodeId, allocated, logical):
@@ -390,13 +623,13 @@ public struct ScanReducer {
             // pruned subtree. Dropping it here is THE fix for the flat-accumulator inflation — this is the
             // one arm that would otherwise bump `rootAllocatedBytes`/`processedCount` for an orphan.
             if isTombstoned(nodeId) { droppedOrphanEvents += 1; return }
-            var node = nodes[nodeId] ?? Node(name: "")
+            let n = Int(ensureSlot(nodeId) { Node(name: "") })
             // Count this entry as "processed" exactly once (the first own-size write), and
             // accumulate its own size into the scan-root total on the SAME transition. The
             // walker emits one size event per stat'd node, but count/accumulate from the
             // false→true transition so both stay robust to a duplicate/replayed batch and a
             // pure function of the accumulated state.
-            if !node.hasSize { processedCount += 1 }
+            if !store[n].hasSize { processedCount += 1 }
             // The retained-total delta is the CHANGE in own size (first write: 0→size, so the
             // delta equals the full size; a live re-size: old→new; a replayed same-size batch:
             // a no-op 0). Push it up the ancestor chain AND into the scan-root accumulator —
@@ -404,26 +637,23 @@ public struct ScanReducer {
             // live re-sizes updated subtree totals while `scannedBytes`/status drifted from
             // the truth. Delta-accumulation keeps root == Σ own sizes under first writes,
             // live changes, replays, and prunes (prune subtracts own sizes symmetrically).
-            let dAllocated = allocated - node.ownAllocated
-            let dLogical = logical - node.ownLogical
+            let dAllocated = allocated - store[n].ownAllocated
+            let dLogical = logical - store[n].ownLogical
             rootAllocatedBytes += dAllocated
-            node.ownAllocated = allocated
-            node.ownLogical = logical
-            node.hasSize = true
-            nodes[nodeId] = node
-            bumpSubtree(from: nodeId, allocated: dAllocated, logical: dLogical)
+            store[n].ownAllocated = allocated
+            store[n].ownLogical = logical
+            store[n].flags.insert(.hasSize)
+            bumpSubtree(fromSlot: Int32(n), allocated: dAllocated, logical: dLogical)
 
         case let .accessDenied(nodeId):
             if isTombstoned(nodeId) { droppedOrphanEvents += 1; return } // late event under a pruned root
-            var node = nodes[nodeId] ?? Node(name: "")
-            node.denied = true
-            nodes[nodeId] = node
+            let i = ensureSlot(nodeId) { Node(name: "") }
+            store[Int(i)].flags.insert(.denied)
 
         case let .subtreeCompleted(nodeId):
             if isTombstoned(nodeId) { droppedOrphanEvents += 1; return } // late event under a pruned root
-            var node = nodes[nodeId] ?? Node(name: "")
-            node.completed = true
-            nodes[nodeId] = node
+            let i = ensureSlot(nodeId) { Node(name: "") }
+            store[Int(i)].flags.insert(.completed)
 
         case let .childRemoved(parentId, childId):
             prune(parentId: parentId, childId: childId)
@@ -431,11 +661,10 @@ public struct ScanReducer {
         case let .directoryMtime(nodeId, mtime):
             // TZ-7 drop (OPERATOR_NOTE #2 / review-1 change 1): a delayed `directoryMtime` for a
             // tombstoned node (e.g. an ancestor prune removed it while its own read was in flight) would
-            // otherwise re-materialize an unlinked orphan via `nodes[id] ?? Node()`. Drop + count.
+            // otherwise re-materialize an unlinked orphan via `ensureSlot`. Drop + count.
             if isTombstoned(nodeId) { droppedOrphanEvents += 1; return }
-            var node = nodes[nodeId] ?? Node(name: "")
-            node.mtime = mtime
-            nodes[nodeId] = node
+            let i = ensureSlot(nodeId) { Node(name: "") }
+            store[Int(i)].mtimeRaw = mtime
         }
     }
 
@@ -466,13 +695,14 @@ public struct ScanReducer {
     /// Idempotent / honest: only prunes when the edge is actually present. A `childRemoved` for a
     /// child not currently linked under `parentId` (a duplicate, or a race with an ancestor prune
     /// that already took the whole subtree) removes NO edge and returns — it can neither double-
-    /// subtract nor delete an unrelated node. No cycles: a `childIds` set is a tree by filesystem
-    /// structure (ids are absolute paths), so the DFS deletion terminates.
+    /// subtract nor delete an unrelated node. No cycles: `childIndices` is a tree by filesystem
+    /// structure, so the DFS deletion terminates.
     private mutating func prune(parentId: String, childId: String) {
-        guard var parent = nodes[parentId], parent.childIds.remove(childId) != nil else {
-            return // edge not present — nothing to remove (idempotent)
+        guard let pi = slot(of: parentId), let ci = slot(of: childId),
+              let pos = store[Int(pi)].childIndices.firstIndex(of: ci) else {
+            return // edge not present under this parent — nothing to remove (idempotent)
         }
-        nodes[parentId] = parent
+        store[Int(pi)].childIndices.remove(at: pos)
         // TOMBSTONE the removed subtree root (OPERATOR_NOTE #2): late events from an in-flight sub-scan of
         // this now-deleted child (or its descendants) are DROPPED by `apply` until a retained parent
         // legitimately re-links it. Only the root is recorded — `isTombstoned` catches descendants by
@@ -481,27 +711,45 @@ public struct ScanReducer {
         // Ripple the pruned child's WHOLE retained total out of the parent and every ancestor —
         // one negative delta up the chain, the exact reverse of the edge-addition bump. (The child's
         // own subtree total already includes its descendants, so a single delta suffices.)
-        let child = nodes[childId]
-        bumpSubtree(from: parentId,
-                    allocated: -(child?.subtreeAllocated ?? 0),
-                    logical: -(child?.subtreeLogical ?? 0))
+        bumpSubtree(fromSlot: pi,
+                    allocated: -store[Int(ci)].subtreeAllocated,
+                    logical: -store[Int(ci)].subtreeLogical)
         // Delete the subtree node-by-node, backing out each node's own contribution to the
         // scan-root accumulators (so "Scanned" and the processed count track the LIVE tree, the
         // documented invariant of both — they are Σ/count over *retained* nodes).
-        removeSubtree(childId)
+        removeSubtree(ci)
     }
 
-    /// DFS-delete the subtree rooted at `id` from the node map, decrementing `rootAllocatedBytes`
-    /// and `processedCount` by each removed node's own contribution (only where it was counted — a
-    /// node whose size never arrived contributed to neither). Reads children before deleting.
-    private mutating func removeSubtree(_ id: String) {
-        guard let node = nodes[id] else { return }
+    /// DFS-delete the subtree rooted at slot `s` from the store, decrementing `rootAllocatedBytes`/
+    /// `processedCount` by each removed node's own contribution (only where it was counted). Drops
+    /// each node's map key (by its retained `id`) and recycles its slot onto `freeList` so the store
+    /// does not leak dead slots under live churn (THE MEMORY LAW).
+    private mutating func removeSubtree(_ s: Int32) {
+        let node = store[Int(s)]
         if node.hasSize {
             processedCount -= 1
             rootAllocatedBytes -= node.ownAllocated
         }
-        let children = node.childIds
-        nodes[id] = nil
+        let children = node.childIndices
+        // Free this slot: drop its map key and reset the record (releasing id + child array) so the
+        // recycled slot carries no stale state; then make it available for reuse. Collision-aware:
+        // if `s` was this key's PRIMARY (`index`), promote a side-table entry into its place (so the
+        // remaining colliding id stays reachable), else drop the primary key; if `s` was a side-table
+        // entry, just remove it from the bucket. Empty buckets are dropped so `collisions` cannot leak.
+        let k = key(node.id)
+        if index[k] == s {
+            if var bucket = collisions[k], !bucket.isEmpty {
+                index[k] = bucket.removeLast()
+                if bucket.isEmpty { collisions.removeValue(forKey: k) } else { collisions[k] = bucket }
+            } else {
+                index.removeValue(forKey: k)
+            }
+        } else if var bucket = collisions[k] {
+            bucket.removeAll { $0 == s }
+            if bucket.isEmpty { collisions.removeValue(forKey: k) } else { collisions[k] = bucket }
+        }
+        store[Int(s)] = Node(name: "")
+        freeList.append(s)
         for c in children { removeSubtree(c) }
     }
 
@@ -557,7 +805,8 @@ public struct ScanReducer {
                          weight: (Int64) -> Double = ScanReducer.linearWeight) -> SizeTree {
         var pruned = 0
         var hidden: Int64 = 0
-        return build(id: focusId ?? rootId, depth: 0, depthWindow: depthWindow,
+        let fid = focusId ?? rootId
+        return build(id: fid, slot: slot(of: fid), depth: 0, depthWindow: depthWindow,
                      area: 0, minRenderArea: 0, excluding: excluding,
                      includeHidden: includeHidden, weight: weight,
                      prunedBelowArea: &pruned, hiddenFilteredBytes: &hidden)
@@ -598,24 +847,33 @@ public struct ScanReducer {
         -> (tree: SizeTree, prunedBelowArea: Int, hiddenFilteredBytes: Int64) {
         var pruned = 0
         var hidden: Int64 = 0
-        let t = build(id: focusId, depth: 0, depthWindow: depthWindow,
+        let t = build(id: focusId, slot: slot(of: focusId), depth: 0, depthWindow: depthWindow,
                       area: viewportArea, minRenderArea: minRenderArea, excluding: excluding,
                       includeHidden: includeHidden, weight: weight,
                       prunedBelowArea: &pruned, hiddenFilteredBytes: &hidden)
         return (t, pruned, hidden)
     }
 
-    private func build(id: String, depth: Int, depthWindow: Int,
+    private func build(id: String, slot: Int32?, depth: Int, depthWindow: Int,
                        area: Double, minRenderArea: Double,
                        excluding: Set<String>, includeHidden: Bool, weight: (Int64) -> Double,
                        prunedBelowArea: inout Int, hiddenFilteredBytes: inout Int64) -> SizeTree {
-        let node = nodes[id] ?? Node(name: id)
+        // Absent focus (an id the scan never recorded): the pre-TZ-9 fallback was
+        // `nodes[id] ?? Node(name: id)` — a lone pending placeholder tile named by its id. The
+        // `contains` gate normally prevents this; reproduced here so behavior is unchanged.
+        guard let s = slot else {
+            return SizeTree(id: id, name: id, kind: .pending, allocatedBytes: 0, logicalBytes: 0,
+                            children: [], scanState: .pending, isHidden: false, mtime: nil)
+        }
+        let node = store[Int(s)]
         let kind = outputKind(node)
 
-        // Children are MATERIALIZED only inside the window; below it the array is empty.
-        // Either way the node's totals come from its RETAINED subtree total — read in O(1),
-        // never recomputed — so `build` visits only nodes strictly inside the window. This
-        // is the focus-rooted bound the operator ratified (review-3 correction).
+        // Children are MATERIALIZED only inside the window; below it the array is empty. Either way
+        // the node's totals come from its RETAINED subtree total — read in O(1), never recomputed —
+        // so `build` visits only nodes strictly inside the window (the ratified focus-rooted bound).
+        // Each child slot is already in hand (no id→node dict lookup as the old path did), and its
+        // opaque id is read straight from `store[c].id` — so ids round-trip verbatim (the scan-rate
+        // law is respected: index reads, not hashing, on the hot projection path).
         let retained: [SizeTree]
         if depth < depthWindow {
             if minRenderArea > 0 && area > 0 {
@@ -645,34 +903,33 @@ public struct ScanReducer {
                 // the injected `weight` transform so a sqrt/linear projection prunes exactly what
                 // the same-weighted Squarify will render (the composition layer passes both).
                 var totalW = 0.0
-                for cid in node.childIds {
-                    if excluding.contains(cid) { continue }
-                    if !includeHidden, nodes[cid]?.isHidden == true {
-                        hiddenFilteredBytes += nodes[cid]?.subtreeAllocated ?? 0
+                for c in node.childIndices {
+                    if excluding.contains(store[Int(c)].id) { continue }
+                    if !includeHidden, store[Int(c)].isHidden {
+                        hiddenFilteredBytes += store[Int(c)].subtreeAllocated
                         continue
                     }
-                    totalW += weight(nodes[cid]?.subtreeAllocated ?? 0)
+                    totalW += weight(store[Int(c)].subtreeAllocated)
                 }
-                var kept: [(id: String, area: Double)] = []
-                for cid in node.childIds {
-                    if excluding.contains(cid) { continue }                       // ignored
-                    if !includeHidden, nodes[cid]?.isHidden == true { continue }   // counted above
-                    let child = nodes[cid]
-                    let w = weight(child?.subtreeAllocated ?? 0)
+                var kept: [(slot: Int32, id: String, area: Double)] = []
+                for c in node.childIndices {
+                    if excluding.contains(store[Int(c)].id) { continue }           // ignored
+                    if !includeHidden, store[Int(c)].isHidden { continue }         // counted above
+                    let w = weight(store[Int(c)].subtreeAllocated)
                     let childArea = totalW > 0 ? area * w / totalW : 0
-                    if !(child?.denied ?? false) && childArea < minRenderArea {
+                    if !store[Int(c)].denied && childArea < minRenderArea {
                         prunedBelowArea += 1 // count the dropped subtree (a floor — see makeRenderTree)
                     } else {
-                        kept.append((cid, childArea))
+                        kept.append((c, store[Int(c)].id, childArea))
                     }
                 }
                 kept.sort { a, b in
-                    let na = nodes[a.id]?.name ?? a.id
-                    let nb = nodes[b.id]?.name ?? b.id
+                    let na = store[Int(a.slot)].name
+                    let nb = store[Int(b.slot)].name
                     return na == nb ? a.id < b.id : na < nb
                 }
                 retained = kept.map {
-                    build(id: $0.id, depth: depth + 1, depthWindow: depthWindow,
+                    build(id: $0.id, slot: $0.slot, depth: depth + 1, depthWindow: depthWindow,
                           area: $0.area, minRenderArea: minRenderArea, excluding: excluding,
                           includeHidden: includeHidden, weight: weight,
                           prunedBelowArea: &prunedBelowArea, hiddenFilteredBytes: &hiddenFilteredBytes)
@@ -681,22 +938,22 @@ public struct ScanReducer {
                 // Full projection: sort children canonically so enumeration order never leaks in.
                 // The same TZ-5 lenses apply (ignored + hidden filtered), so a full-projection
                 // consumer (e.g. a non-area-bounded view) sees the identical excluded set.
-                var kids: [String] = []
-                for cid in node.childIds {
-                    if excluding.contains(cid) { continue }
-                    if !includeHidden, nodes[cid]?.isHidden == true {
-                        hiddenFilteredBytes += nodes[cid]?.subtreeAllocated ?? 0
+                var kids: [Int32] = []
+                for c in node.childIndices {
+                    if excluding.contains(store[Int(c)].id) { continue }
+                    if !includeHidden, store[Int(c)].isHidden {
+                        hiddenFilteredBytes += store[Int(c)].subtreeAllocated
                         continue
                     }
-                    kids.append(cid)
+                    kids.append(c)
                 }
-                let sortedChildIds = kids.sorted { a, b in
-                    let na = nodes[a]?.name ?? a
-                    let nb = nodes[b]?.name ?? b
-                    return na == nb ? a < b : na < nb
+                kids.sort { a, b in
+                    let na = store[Int(a)].name
+                    let nb = store[Int(b)].name
+                    return na == nb ? store[Int(a)].id < store[Int(b)].id : na < nb
                 }
-                retained = sortedChildIds.map {
-                    build(id: $0, depth: depth + 1, depthWindow: depthWindow,
+                retained = kids.map {
+                    build(id: store[Int($0)].id, slot: $0, depth: depth + 1, depthWindow: depthWindow,
                           area: 0, minRenderArea: 0, excluding: excluding,
                           includeHidden: includeHidden, weight: weight,
                           prunedBelowArea: &prunedBelowArea, hiddenFilteredBytes: &hiddenFilteredBytes)
@@ -715,27 +972,26 @@ public struct ScanReducer {
             children: retained,
             scanState: outputState(node, kind: kind),
             isHidden: node.isHidden,
-            mtime: node.mtime // TZ-7 staleness key; nil for leaves/until-known (root before first revalidation)
+            mtime: node.projectedMtime // TZ-7 staleness key; nil for leaves/until-known (root before first revalidation)
         )
     }
 
-    /// Add `allocated`/`logical` to the RETAINED subtree total of `id` and of every ANCESTOR
-    /// currently linked above it (inclusive of `id` itself). Walks the `parentId` chain — O(the
+    /// Add `allocated`/`logical` to the RETAINED subtree total of slot `s` and of every ANCESTOR
+    /// currently linked above it (inclusive of `s` itself). Walks the `parent` slot chain — O(the
     /// node's current depth), a small bounded constant in a filesystem — and is the ONLY place
     /// retained totals change. Two callers push deltas here: a node's own-size write (delta =
     /// change in own size) and an edge addition (delta = the newly-linked child's whole retained
     /// total). Because every mutation is an additive delta and addition commutes, the invariant
     /// `subtree == own + Σ linked children.subtree` holds after any interleaving — the reducer's
-    /// order-independence, preserved. No cycles: a `parentId` chain is strictly shallower each
-    /// step (a child id is deeper than its parent), and each edge is added at most once.
-    private mutating func bumpSubtree(from id: String, allocated: Int64, logical: Int64) {
+    /// order-independence, preserved. No cycles: a `parent` chain is strictly shallower each step
+    /// (a child slot is deeper than its parent), and each edge is added at most once.
+    private mutating func bumpSubtree(fromSlot s: Int32, allocated: Int64, logical: Int64) {
         if allocated == 0 && logical == 0 { return } // no-op delta (e.g. a re-stated same size)
-        var cursor: String? = id
-        while let cid = cursor, var n = nodes[cid] {
-            n.subtreeAllocated += allocated
-            n.subtreeLogical += logical
-            nodes[cid] = n
-            cursor = n.parentId
+        var cursor = s
+        while cursor != ScanReducer.noIndex {
+            store[Int(cursor)].subtreeAllocated += allocated
+            store[Int(cursor)].subtreeLogical += logical
+            cursor = store[Int(cursor)].parent
         }
     }
 
@@ -744,15 +1000,15 @@ public struct ScanReducer {
     /// produced would fabricate a lone placeholder tile; the old root-rooted-then-navigate
     /// path returned an empty layout there and the pipeline kept the last good scene. This
     /// preserves that streaming behavior (never flash a bare fill for an unknown focus).
-    public func contains(_ id: String) -> Bool { nodes[id] != nil }
+    public func contains(_ id: String) -> Bool { slot(of: id) != nil }
 
     /// The retained KIND of `id` (denial-aware, derived exactly as the projection does — order-
     /// independent), or `nil` if the scan has never recorded `id`. TZ-7 (review-1 change 3): the
     /// composition layer reads this to decide whether a flagged path is a DIRECTORY to re-enumerate
     /// or an opaque BUNDLE LEAF to re-size — a bundle's descendants must never be exposed.
     public func kind(of id: String) -> NodeKind? {
-        guard let n = nodes[id] else { return nil }
-        return outputKind(n)
+        guard let s = slot(of: id) else { return nil }
+        return outputKind(store[Int(s)])
     }
 
     /// The directory mtime the reducer currently holds for `id` (the staleness key), or `nil` if not
@@ -761,15 +1017,18 @@ public struct ScanReducer {
     /// directory's later state — and is dropped whole, so a slow read can never un-do a newer one
     /// (e.g. a stale `childRemoved` retiring a just-recreated child). A directory's mtime rises
     /// monotonically with every structural change to it, which is what makes the comparison sound.
-    public func mtime(of id: String) -> Int64? { nodes[id]?.mtime }
+    public func mtime(of id: String) -> Int64? {
+        guard let s = slot(of: id) else { return nil }
+        return store[Int(s)].projectedMtime
+    }
 
     /// The retained OWN (intrinsic) size of `id`, or `nil` if unknown. TZ-7 (review-1 change 3): the
     /// bundle re-size path compares a freshly-measured recursive total against this to stay CALM —
     /// emit no `sizeUpdated` when the opaque total is unchanged — mirroring `revalidationDiff`'s
     /// own-size discipline for directories.
     public func ownSize(of id: String) -> (allocated: Int64, logical: Int64)? {
-        guard let n = nodes[id] else { return nil }
-        return (n.ownAllocated, n.ownLogical)
+        guard let s = slot(of: id) else { return nil }
+        return (store[Int(s)].ownAllocated, store[Int(s)].ownLogical)
     }
 
     /// EVERY retained DIRECTORY-like node id (`.dir`/`.bundleLeaf`) in the subtree rooted at `id`,
@@ -784,14 +1043,14 @@ public struct ScanReducer {
     /// strings only (no I/O); the I/O — the actual re-validation — is what the caller bounds per drain.
     /// Pre-order; empty if `id` is not retained.
     public func retainedDirIds(under id: String) -> [String] {
-        guard nodes[id] != nil else { return [] }
+        guard let root = slot(of: id) else { return [] }
         var out: [String] = []
-        var stack = [id]
+        var stack: [Int32] = [root]
         while let cur = stack.popLast() {
-            guard let n = nodes[cur] else { continue }
+            let n = store[Int(cur)]
             let k = outputKind(n)
-            if k == .dir || k == .bundleLeaf { out.append(cur) }
-            stack.append(contentsOf: n.childIds)
+            if k == .dir || k == .bundleLeaf { out.append(n.id) }
+            stack.append(contentsOf: n.childIndices)
         }
         return out
     }
@@ -837,7 +1096,8 @@ public struct ScanReducer {
         var newStubs: [ChildStub] = []
         var changed = false
 
-        let node = nodes[dirId]
+        let dirSlot = slot(of: dirId)
+        let node = dirSlot.map { store[Int($0)] }
         // Own-entry size refresh (review-0 change 5): emit only on a real change to the directory's
         // own allocation, so a stale own-size does not keep a changed directory's total short, while
         // an unchanged directory (same `st_blocks * 512`) stays calm — no event, no re-emit.
@@ -846,7 +1106,8 @@ public struct ScanReducer {
             changed = true
         }
 
-        let known = node?.childIds ?? []
+        // The retained children's opaque ids, read straight from each child slot (echoed verbatim).
+        let known: Set<String> = Set((node?.childIndices ?? []).map { store[Int($0)].id })
         let freshIds = Set(fresh.map(\.id))
 
         // Removals (only on a COMPLETE read — see `complete` doc).
@@ -871,8 +1132,8 @@ public struct ScanReducer {
                     events.append(.sizeUpdated(nodeId: f.id, allocated: f.allocated, logical: f.logical))
                 }
             } else if f.kind == .file {
-                let node = nodes[f.id]
-                if node?.ownAllocated != f.allocated || node?.ownLogical != f.logical {
+                let fileNode = slot(of: f.id).map { store[Int($0)] }
+                if fileNode?.ownAllocated != f.allocated || fileNode?.ownLogical != f.logical {
                     events.append(.sizeUpdated(nodeId: f.id, allocated: f.allocated, logical: f.logical))
                     changed = true
                 }
@@ -892,11 +1153,11 @@ public struct ScanReducer {
     /// otherwise; `nil` only if not even the volume root survives (the scan root was deleted — the App
     /// then has nothing to show and keeps its last scene). Used by the pipeline on the emit path.
     public func nearestRetainedAncestor(of id: String) -> String? {
-        if nodes[id] != nil { return id }
+        if slot(of: id) != nil { return id }
         var cur = id
         while let slash = cur.lastIndex(of: "/") {
             let parent = slash == cur.startIndex ? "/" : String(cur[cur.startIndex..<slash])
-            if nodes[parent] != nil { return parent }
+            if slot(of: parent) != nil { return parent }
             if parent == "/" { return nil }
             cur = parent
         }
@@ -924,19 +1185,30 @@ public struct ScanReducer {
     /// Pure over the accumulated state; the pipeline calls it on its actor once per emit —
     /// O(ignored × ancestor-chain-depth), never node-count. A tuple, not a new type: one caller.
     public func ignoreAccounting(_ ids: Set<String>) -> (total: Int64, currentById: [String: Int64]) {
+        // Resolve the ignored ids to slots once; the ancestor test then walks `parent` slots and
+        // checks membership in this set (the lean store has no parent-id STRING to compare).
+        var slotOf = [String: Int32](minimumCapacity: ids.count)
+        var ignoredSlots = Set<Int32>()
+        for id in ids where slot(of: id) != nil {
+            let s = slot(of: id)!
+            slotOf[id] = s
+            ignoredSlots.insert(s)
+        }
         var currentById = [String: Int64](minimumCapacity: ids.count)
         var total: Int64 = 0
         for id in ids {
-            currentById[id] = nodes[id]?.subtreeAllocated ?? 0
+            let s = slotOf[id]
+            let subtree = s.map { store[Int($0)].subtreeAllocated } ?? 0
+            currentById[id] = subtree
             // Walk the retained parent chain; if any ancestor is ALSO ignored, this node's mass is
             // already subsumed by that ancestor's subtree total — do not add it again (union dedup).
             var subsumed = false
-            var pid = nodes[id]?.parentId
-            while let p = pid {
-                if ids.contains(p) { subsumed = true; break }
-                pid = nodes[p]?.parentId
+            var pid: Int32 = s.map { store[Int($0)].parent } ?? ScanReducer.noIndex
+            while pid != ScanReducer.noIndex {
+                if ignoredSlots.contains(pid) { subsumed = true; break }
+                pid = store[Int(pid)].parent
             }
-            if !subsumed { total += nodes[id]?.subtreeAllocated ?? 0 }
+            if !subsumed { total += subtree }
         }
         return (total, currentById)
     }

@@ -5,7 +5,8 @@
 A native macOS application that shows **where your disk space actually is** —
 as a live, zoomable, nested **treemap** (Shneiderman; squarified per Bruls et
 al.): a black canvas where every folder is a rectangle sized by its disk
-footprint — logarithmically compressed by default so giants cannot
+footprint — sqrt-compressed by default (power-law scale-invariance;
+ratified 2026-08-17, superseding log — see PLAN §TZ-5) so giants cannot
 eclipse the long tail, with a linear true-proportion mode one toggle away
 (amended 2026-08-16; the active scale is always labeled and the NUMBERS
 on tiles are always real bytes) — children tiling their parent, each

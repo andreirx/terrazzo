@@ -30,10 +30,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusBar: StatusBar!
     private var controlBar: ControlBar!
     private var banner: FDABanner!
+    private var consentBanner: ConsentBanner!
     private var ignorePanel: IgnorePanel!
     private var container: ChromeContainer!
     private var navigation: NavigationController!
     private var controller: ScanController!
+
+    /// Giant-volume consent, REMEMBERED FOR THE SESSION (TZ-9 deliverable 4: "Non-modal, remembered
+    /// for the session"). A volume path here has been acknowledged once — re-selecting it does not
+    /// re-prompt. Session-only (no persistence — CLAUDE.md constraint 4, files are the record).
+    private var acknowledgedGiantVolumes: Set<String> = []
+    /// The volume awaiting a consent decision while the ConsentBanner is up (nil otherwise).
+    private var pendingConsentVolume: VolumeDescriptor?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let frame = NSRect(x: 0, y: 0, width: 1100, height: 720)
@@ -63,11 +71,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // cannot express (see ChromeContainer).
         controlBar = ControlBar(frame: NSRect(x: 0, y: 0, width: frame.width, height: ControlBar.height))
         banner = FDABanner(frame: NSRect(x: 0, y: 0, width: frame.width, height: FDABanner.height))
+        consentBanner = ConsentBanner(frame: NSRect(x: 0, y: 0, width: frame.width, height: ConsentBanner.height))
         statusBar = StatusBar(frame: NSRect(x: 0, y: 0, width: frame.width, height: StatusBar.height))
         canvas = CanvasView(frame: NSRect(x: 0, y: 0, width: frame.width, height: frame.height))
         ignorePanel = IgnorePanel()
-        container = ChromeContainer(controlBar: controlBar, banner: banner, canvas: canvas,
-                                    statusBar: statusBar, ignorePanel: ignorePanel)
+        container = ChromeContainer(controlBar: controlBar, banner: banner, consentBanner: consentBanner,
+                                    canvas: canvas, statusBar: statusBar, ignorePanel: ignorePanel)
         container.frame = frame
         container.autoresizingMask = [.width, .height]
         window.contentView = container
@@ -85,7 +94,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // volume selection both funnel to the scan helpers below.
         controlBar.onRescan = { [weak self] in self?.rescanCurrentVolume() }
         banner.onRescan = { [weak self] in self?.rescanCurrentVolume() }
-        controlBar.volumePicker.onSelect = { [weak self] descriptor in self?.scanVolume(descriptor.url) }
+        controlBar.volumePicker.onSelect = { [weak self] descriptor in self?.selectVolume(descriptor) }
+        // TZ-9 giant-volume consent (deliverable 4): non-modal, remembered for the session.
+        consentBanner.onProceed = { [weak self] in self?.proceedWithPendingVolume() }
+        consentBanner.onCancel = { [weak self] in self?.cancelPendingVolume() }
         // TZ-5 lens controls → ScanController → the background pipeline (off main).
         controlBar.onScaleChange = { [weak self] scale in self?.controller.setScale(scale) }
         controlBar.onHiddenChange = { [weak self] include in self?.controller.setIncludeHidden(include) }
@@ -151,6 +163,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - TZ-4 scan actions (VolumePicker / Rescan)
+
+    /// The VolumePicker selection funnel (TZ-9): gate a giant volume behind non-modal consent
+    /// before scanning. Below the threshold, already acknowledged this session, or an unknown inode
+    /// count ⇒ scan straight through (`GiantVolumeConsent.evaluate` returns nil). Otherwise show the
+    /// consent banner and hold the selection until the user proceeds or cancels.
+    private func selectVolume(_ descriptor: VolumeDescriptor) {
+        let path = descriptor.url.path
+        if !acknowledgedGiantVolumes.contains(path),
+           let prompt = GiantVolumeConsent.evaluate(usedInodes: descriptor.usedInodes,
+                                                     isTimeMachineBackup: descriptor.isTimeMachineBackup) {
+            pendingConsentVolume = descriptor
+            consentBanner.setMessage(prompt.message)
+            container.showsConsentBanner = true
+            return
+        }
+        scanVolume(descriptor.url)
+    }
+
+    /// "Scan anyway" — record the session acknowledgement, dismiss the banner, and scan.
+    private func proceedWithPendingVolume() {
+        guard let descriptor = pendingConsentVolume else { return }
+        pendingConsentVolume = nil
+        acknowledgedGiantVolumes.insert(descriptor.url.path)
+        container.showsConsentBanner = false
+        scanVolume(descriptor.url)
+    }
+
+    /// "Cancel" — dismiss the banner and REVERT the picker to the volume actually being scanned, so
+    /// the visible selection never lies about what is on the map.
+    private func cancelPendingVolume() {
+        pendingConsentVolume = nil
+        container.showsConsentBanner = false
+        controlBar.volumePicker.selectVolume(path: controller.root.path)
+    }
 
     /// Scan a chosen volume's root (VolumePicker, D2). Resets the map + progress sampling
     /// so the new volume starts clean, then streams as always.
@@ -251,6 +297,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 final class ChromeContainer: NSView {
     private let controlBar: ControlBar
     private let banner: FDABanner
+    /// The giant-volume consent strip (TZ-9 deliverable 4) — a SECOND dynamic top banner, below the
+    /// FDA banner, shown only while a consent decision is pending. Same re-flow mechanism as `banner`.
+    private let consentBanner: ConsentBanner
     private let canvas: CanvasView
     private let statusBar: StatusBar
     /// The Ignore list (TZ-5 deliverable 1) — FLOATS at the top-right of the canvas region, over
@@ -267,6 +316,16 @@ final class ChromeContainer: NSView {
         }
     }
 
+    /// Whether the giant-volume consent banner is shown (TZ-9). Toggling re-flows the canvas, like
+    /// the FDA banner.
+    var showsConsentBanner = false {
+        didSet {
+            guard showsConsentBanner != oldValue else { return }
+            consentBanner.isHidden = !showsConsentBanner
+            relayout()
+        }
+    }
+
     /// Whether the Ignore panel is shown (TZ-5) — set by AppDelegate from the panel's non-empty
     /// state. It FLOATS over the canvas, so toggling repositions it without re-flowing the map.
     var showsIgnorePanel = false {
@@ -277,19 +336,22 @@ final class ChromeContainer: NSView {
         }
     }
 
-    init(controlBar: ControlBar, banner: FDABanner, canvas: CanvasView, statusBar: StatusBar,
-         ignorePanel: IgnorePanel) {
+    init(controlBar: ControlBar, banner: FDABanner, consentBanner: ConsentBanner,
+         canvas: CanvasView, statusBar: StatusBar, ignorePanel: IgnorePanel) {
         self.controlBar = controlBar
         self.banner = banner
+        self.consentBanner = consentBanner
         self.canvas = canvas
         self.statusBar = statusBar
         self.ignorePanel = ignorePanel
         super.init(frame: .zero)
         wantsLayer = true
         banner.isHidden = true
+        consentBanner.isHidden = true
         ignorePanel.isHidden = true
         addSubview(controlBar)
         addSubview(banner)
+        addSubview(consentBanner)
         addSubview(canvas)
         addSubview(statusBar)
         addSubview(ignorePanel) // on top of the canvas
@@ -318,6 +380,10 @@ final class ChromeContainer: NSView {
         if showsBanner {
             banner.frame = NSRect(x: 0, y: top, width: w, height: bannerH)
             top += bannerH
+        }
+        if showsConsentBanner {
+            consentBanner.frame = NSRect(x: 0, y: top, width: w, height: ConsentBanner.height)
+            top += ConsentBanner.height
         }
         let canvasHeight = max(0, h - top - statusH)
         canvas.frame = NSRect(x: 0, y: top, width: w, height: canvasHeight)

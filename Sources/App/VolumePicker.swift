@@ -48,7 +48,12 @@ final class VolumePicker: NSPopUpButton {
         for v in volumes {
             // "Macintosh HD — /"  ·  a network volume is marked so the user knows.
             let suffix = v.isRootVolume ? " — /" : (v.isLocal ? "" : " (network)")
-            addItem(withTitle: "\(v.name)\(suffix)")
+            // TZ-9 deliverable 4: surface each volume's used-inode ENTRY COUNT (statfs, free) so the
+            // scale of what you are about to scan is visible BEFORE selecting — the giant-volume
+            // consent's number, shown up front. Omitted when unknown (0) rather than shown as a lie.
+            let entries = v.usedInodes > 0 ? " · \(Self.entryCount(v.usedInodes)) entries" : ""
+            let tm = v.isTimeMachineBackup ? " · Time Machine" : ""
+            addItem(withTitle: "\(v.name)\(suffix)\(entries)\(tm)")
         }
         if let idx = volumes.firstIndex(where: { $0.url.path == selectedPath }) {
             selectItem(at: idx)
@@ -63,6 +68,21 @@ final class VolumePicker: NSPopUpButton {
         // still fires `picked`, so choosing the already-shown boot volume starts the
         // root scan.
         isEnabled = !volumes.isEmpty
+    }
+
+    /// Re-select the volume at `path` WITHOUT firing `onSelect` — used to REVERT the popup after the
+    /// user cancels a giant-volume consent prompt (TZ-9), so the visible selection matches the volume
+    /// actually being scanned. A no-op if `path` is not in the model.
+    func selectVolume(path: String) {
+        if let idx = descriptors.firstIndex(where: { $0.url.path == path }) { selectItem(at: idx) }
+    }
+
+    /// Compact entry-count label ("5.1M", "62.4M", "980K") for the menu title. Coarse on purpose —
+    /// it conveys scale, not a precise inode audit.
+    private static func entryCount(_ n: Int64) -> String {
+        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
+        if n >= 1_000 { return String(format: "%.0fK", Double(n) / 1_000) }
+        return "\(n)"
     }
 
     @objc private func picked() {

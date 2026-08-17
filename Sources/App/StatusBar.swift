@@ -298,6 +298,13 @@ final class StatusBar: NSView {
 
     private static func b(_ v: Int64) -> String { bytes.string(fromByteCount: v) }
 
+    /// Grouped integer ("2,834,102") for the retained-node footprint tooltip (TZ-9 deliverable 5).
+    private static let counter: NumberFormatter = {
+        let f = NumberFormatter(); f.numberStyle = .decimal; f.maximumFractionDigits = 0
+        return f
+    }()
+    private static func count(_ n: Int) -> String { counter.string(from: NSNumber(value: n)) ?? "\(n)" }
+
     /// How hard a field fights to STAY VISIBLE when the strip is too narrow for all of them
     /// (review-1 change 4). The strip carries up to 11 fields; at 700 px they cannot all fit, so
     /// the low-value volume figures must yield while the required TZ-5 fields stay readable. The
@@ -434,10 +441,21 @@ final class StatusBar: NSView {
                 tooltip: "Tile areas are true-proportional to bytes — the huge folders look huge. Switch to Sqrt scale in the toolbar to expose the long tail.",
                 importance: .essential))
         }
+        // TZ-9 deliverable 5 (footprint made visible — the memory law's honesty principle). The
+        // scan indicator's TOOLTIP states the current RETAINED-NODE count (`filesProcessed` == the
+        // reducer's `processedCount`, its stat'd-and-retained entries) and an ESTIMATED footprint.
+        // NAME HONESTY (TZ-9 item 3): this is NOT a live measurement of the process — it is a
+        // PROJECTION, retained-entries × the constant `GiantVolumeConsent.estimatedBytesPerNode`
+        // (itself the last footprint-tool measurement of the shipping build). The wording says so
+        // plainly ("est. … at N B/node"), so no one mistakes the projection for a measured number
+        // (the earlier "about X of memory" read as measured — measurement theater).
+        let retained = max(0, s.filesProcessed)
+        let footprint = Int64(retained) * GiantVolumeConsent.estimatedBytesPerNode
+        let footprintNote = " Retained \(count(retained)) entries · est. ~\(b(footprint)) of memory (projected at the constant \(GiantVolumeConsent.estimatedBytesPerNode) B/node, not a live measurement)."
         out.append(VolumeField(
             value: s.running ? "● scanning…" : "✓ scan complete",
-            tooltip: s.running ? "A scan is in progress; sizes are still growing."
-                               : "The scan has finished; sizes are final for this run.",
+            tooltip: (s.running ? "A scan is in progress; sizes are still growing."
+                                : "The scan has finished; sizes are final for this run.") + footprintNote,
             importance: .essential)) // the running/complete state must never be clipped off
         // LIVE indicator (TZ-7 deliverable 5) — a subtle marker that the FSEvents change stream is
         // active, so deletions/additions retire or add tiles WITHOUT a rescan. If the stream could not
