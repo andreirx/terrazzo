@@ -797,6 +797,84 @@ final class NavigationController: CanvasInputDelegate {
         if rowSizeChanged { ignorePanel.setEntries(ignored) }
     }
 
+    // MARK: - Focus fallback (TZ-7 — the map never points at a ghost)
+
+    /// The focused subtree was pruned by a live update (a `childRemoved` for the focus or one of its
+    /// ancestors). The pipeline already re-rooted its focus at `ancestorId` (the nearest surviving
+    /// ancestor) and force-emitted that scene; here we re-seed navigation to match AND ANIMATE THE
+    /// ASCENT so the map zooms out of the deleted region rather than snapping — the map never points at
+    /// a ghost (PLAN §TZ-7 deliverable 1: "camera animates the ascent").
+    ///
+    /// THE ANIMATION is the DIVE REVERSED, exactly as `ascend()`/root-promotion run it (the same
+    /// swift-tested `QuadGeometry.embedChild` + `FocusCamera` primitives, no new camera math). We fly
+    /// the camera from the (now-deleted) branch's slot filling the viewport out to the ancestor's
+    /// identity, over the ancestor's CACHED pre-deletion world (which still shows that branch), with the
+    /// ghost scene currently on screen embedded into the slot so t=0 opens exactly on what the user
+    /// sees. On commit we settle onto the fresh ancestor scene — in which the deleted branch is gone and
+    /// its siblings have renormalized, so the tile visibly shrinks away. When the cached geometry is
+    /// unavailable (drift, or the ancestor IS the current focus), we fall back to a plain re-seed +
+    /// settle (`settleFocusFallback`) — the "never a ghost" guarantee holds either way.
+    func focusFellBack(to ancestorId: String) {
+        cameraTimer?.invalidate(); cameraTimer = nil
+        isAnimatingCamera = false
+        pendingPromotion = nil
+        awaitingFocusScene = false
+
+        // Need: the ancestor on the current focus path, its cached world, and the slot of the branch we
+        // are ascending out of (the level directly under the ancestor). Absent any of these → settle.
+        guard let idx = focusStack.firstIndex(of: ancestorId),
+              idx + 1 < focusStack.count, idx < sceneStack.count else {
+            settleFocusFallback(to: ancestorId)
+            return
+        }
+        let branchId = focusStack[idx + 1]        // the branch beneath the ancestor (its slot is the t=0 frame)
+        let ancestorWorld = sceneStack[idx]       // ancestor's map, captured before the deletion
+        guard let branchRect = ancestorWorld.tiles.first(where: { $0.nodeId == branchId })?.rect else {
+            settleFocusFallback(to: ancestorId)
+            return
+        }
+        let ghost = displayed // the deleted focus scene currently on screen — embedded for a seamless t=0
+
+        // Re-seed navigation to the surviving ancestor.
+        focusStack = Array(focusStack.prefix(idx + 1))
+        sceneStack = Array(sceneStack.prefix(idx))
+        displayed = ancestorWorld
+        bottomBar.setFocusPath(ancestorId)
+        trace("focus-fallback (animated ascent) -> \(ancestorId)")
+        // Re-post the surviving focus so the pipeline force-emits a fresh ancestor scene for the commit
+        // (robust to the order the fallback signal and the pipeline's own emit arrive in).
+        scanController?.setFocus(ancestorId)
+
+        // Embed the ghost scene into the branch slot so the flight opens exactly on the current view,
+        // then fly the camera from that slot out to identity (dive reversed).
+        let (baseQuads, baseNodeIds) = QuadGeometry.embedChild(
+            childQuads: ghost.quads, childNodeIds: ghost.nodeIds, into: branchRect,
+            parentQuads: ancestorWorld.quads, parentNodeIds: ancestorWorld.nodeIds, childId: branchId)
+        animateCamera(fromFrame: branchRect, toFrame: viewport,
+                      baseQuads: baseQuads, baseNodeIds: baseNodeIds) { [weak self] in
+            guard let self else { return }
+            if !self.commitToLatestScene() { self.presentSnapshot(ancestorWorld) }
+            self.scanController?.setPhase("scanning")
+        }
+    }
+
+    /// Re-seed navigation to the surviving ancestor and SETTLE onto its scene (no camera flight) — the
+    /// fallback path when there is no cached geometry to animate the ascent over. Guarantees "never a
+    /// ghost": truncating the stacks + re-posting the focus force-emits the ancestor scene, which
+    /// `onScene` then presents.
+    private func settleFocusFallback(to ancestorId: String) {
+        if let idx = focusStack.firstIndex(of: ancestorId) {
+            focusStack = Array(focusStack.prefix(idx + 1))
+            sceneStack = Array(sceneStack.prefix(idx)) // parallel-above-root: one shorter than focusStack
+        } else {
+            focusStack = [ancestorId]
+            sceneStack = []
+        }
+        trace("focus-fallback -> \(ancestorId)")
+        bottomBar.setFocusPath(ancestorId)
+        scanController?.setFocus(ancestorId)
+    }
+
     // MARK: - New-scan reset (rescan / volume switch, TZ-4)
 
     /// Reset all navigation state for a fresh scan (Rescan button / VolumePicker). The

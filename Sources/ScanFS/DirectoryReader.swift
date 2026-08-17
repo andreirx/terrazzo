@@ -83,6 +83,12 @@ enum DirectoryReader {
         /// UF_HIDDEN regular file are both covered (review-0 change 1 closed the earlier
         /// file-fast-path gap by adding the common FLAGS attribute to the bulk parse).
         let isHidden: Bool
+        /// Directory MTIME in nanoseconds since the epoch (TZ-7 staleness key), read from the SAME
+        /// per-dir `lstat` that already gives a directory its size + device — zero extra syscall.
+        /// 0 for files/symlinks (never re-listed, so no revalidation mtime is meaningful); the walker
+        /// carries it only on `.dir`/`.bundleLeaf` stubs. `st_mtimespec` (sec·1e9 + nsec) so a
+        /// create-then-delete within the same wall-clock second is still detected on APFS.
+        let mtime: Int64
     }
 
     /// The outcome of enumerating one directory — a SUM TYPE because the three cases are
@@ -156,6 +162,12 @@ enum DirectoryReader {
         if name.hasPrefix(".") { return true }
         if let flags, (flags & hiddenFlag) != 0 { return true }
         return false
+    }
+
+    /// A stat's mtime as nanoseconds since the epoch (TZ-7 staleness key). Full `st_mtimespec`
+    /// resolution so a create-then-delete inside one wall-clock second is still a detectable change.
+    static func mtimeNanos(_ st: stat) -> Int64 {
+        Int64(st.st_mtimespec.tv_sec) &* 1_000_000_000 &+ Int64(st.st_mtimespec.tv_nsec)
     }
 
     /// `lstat` with optional timing (see `ReaderProfile`). Zero overhead when `profile`
@@ -290,10 +302,10 @@ enum DirectoryReader {
                         if timedLstat(dirPath + "/" + name, &st, profile) == 0 {
                             child = Child(name: name, kind: .dir, device: st.st_dev,
                                           allocated: Int64(st.st_blocks) * 512, logical: Int64(st.st_size),
-                                          isHidden: isHidden)
+                                          isHidden: isHidden, mtime: mtimeNanos(st))
                         } else {
                             child = Child(name: name, kind: .dir, device: 0, allocated: 0, logical: 0,
-                                          isHidden: isHidden)
+                                          isHidden: isHidden, mtime: 0)
                         }
                     case VLNK:
                         // A symlink is sized by the LINK, target never resolved (measure uses
@@ -302,10 +314,10 @@ enum DirectoryReader {
                         if timedLstat(dirPath + "/" + name, &st, profile) == 0 {
                             child = Child(name: name, kind: .symlink, device: 0,
                                           allocated: Int64(st.st_blocks) * 512, logical: Int64(st.st_size),
-                                          isHidden: isHidden)
+                                          isHidden: isHidden, mtime: 0)
                         } else {
                             child = Child(name: name, kind: .symlink, device: 0, allocated: 0, logical: 0,
-                                          isHidden: isHidden)
+                                          isHidden: isHidden, mtime: 0)
                         }
                     default:
                         // Regular file (VREG) or a rare special node: a leaf. A regular file's
@@ -316,13 +328,13 @@ enum DirectoryReader {
                         if hasFileSize {
                             child = Child(name: name, kind: .file, device: 0,
                                           allocated: allocSize, logical: dataLength,
-                                          isHidden: isHidden)
+                                          isHidden: isHidden, mtime: 0)
                         } else {
                             var st = stat()
                             _ = timedLstat(dirPath + "/" + name, &st, profile)
                             child = Child(name: name, kind: .file, device: 0,
                                           allocated: Int64(st.st_blocks) * 512, logical: Int64(st.st_size),
-                                          isHidden: isHidden)
+                                          isHidden: isHidden, mtime: 0)
                         }
                     }
                     out.append(child)

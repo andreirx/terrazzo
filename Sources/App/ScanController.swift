@@ -72,6 +72,122 @@ final class ScanController {
     private let hitch = HitchMonitor()
     private var running = false
 
+    // MARK: - TZ-7 live-map state (the living map: revalidation + FSEvents)
+    //
+    /// The directory the user is focused on — the Tier-1 revalidation target. Tracked from
+    /// `setFocus`; a change re-arms `pendingFocusRevalidation` so the new focus gets a fresh look
+    /// once its scene (carrying its retained mtime) arrives.
+    private var currentFocusId: String?
+    /// The focus directory's mtime as the retained tree knows it (read off each focus scene's
+    /// projection root — O(1) on main). The Tier-1 fast path: a fresh `stat` equal to this means the
+    /// listing is current and revalidation stops after one syscall. `nil` ⇒ unknown (re-enumerate).
+    private var knownFocusMtime: Int64?
+    /// Set when the focus changed; consumed when the new focus's scene arrives to trigger one
+    /// mtime-compared revalidation of it (catches deletions since scan without re-enumerating on
+    /// every idle tick).
+    private var pendingFocusRevalidation = false
+    /// The Tier-2 kernel change stream on the scan root. `nil` when creation failed (degraded to
+    /// Tier-1 — SAID SO in the status tooltip, never silent). Rebuilt on rescan/volume-switch/promote.
+    private var fsWatcher: FSEventsWatcher?
+    /// LIVE-UPDATE DELIVERY THROUGH THE EXISTING EventBatcher (OPERATOR_NOTE 2026-08-17 #1). ALL live
+    /// updates — Tier-1 focus pokes, Tier-2 FSEvents drains, and loss recovery — flow through ONE
+    /// `EventBatcher` (`liveBatcher`), the SAME batched-delivery funnel scan data uses. Each revalidation
+    /// COMPUTES its diff atomically against retained state (`ScenePipeline.computeLiveDiff`, the reviewer's
+    /// "keep atomic reconcile" guards), then routes the resulting `ScanEvent`s through the batcher, which
+    /// deposits coalesced FIFO batches into `liveDelivery`; the serial `liveWorkTask` drains and folds
+    /// them via `ScenePipeline.applyLiveBatch`. There is NO parallel delivery path: the FSEvents watcher no
+    /// longer folds anything itself. Serial correctness (review-1 change 1) holds because a single work
+    /// loop serializes compute→deliver→fold per revalidation group (a directory's fold lands before its
+    /// next compute — the delete/recreate ordering), and the reducer drops orphan events from a pruned
+    /// subtree (OPERATOR_NOTE #2). The flagged-directory I/O storm bound (dedup + per-drain cap + carry)
+    /// stays in `FSEventsWatcher`'s coalescer as the INPUT stage feeding this loop, and one `liveEmit` per
+    /// group coalesces the emit — so a mass change still yields a few scenes.
+    ///
+    /// Whether the live capability is DEGRADED — the FSEvents stream dropped events wholesale
+    /// (`MustScanSubDirs` / kernel queue overflow) and a recovery subtree-rescan is in flight
+    /// (review-1 change 4). Shown honestly in the status ("Live · recovering") for the duration, then
+    /// cleared — never a silent claim of full "Live" after a completeness loss.
+    private var fsDegraded = false
+    /// Consumes the pipeline's `focusFallbacks` stream: a live prune of the focused subtree re-roots the
+    /// pipeline focus at the surviving ancestor and yields it here → the App re-seeds navigation (the map
+    /// never points at a ghost). Cancelled on teardown.
+    private var liveFallbackTask: Task<Void, Never>?
+    /// Whether the FSEvents stream is live (drives the status "live" indicator, deliverable 5).
+    private var fsLive = false
+    /// The lazy idle-revalidation timer (~10 s) — a cheap periodic focus mtime check while the user
+    /// sits still, so a background deletion in the focused directory retires its tile without a poke.
+    private var idleTimer: Timer?
+    private static let idleRevalidationSeconds: TimeInterval = 10
+    /// The last scene, cached so a `live`/`degraded` capability change (which arrives WITHOUT a new
+    /// scene) can re-push the status honestly (`refreshStatus`).
+    private var lastScene: RenderScene?
+    /// PER-DRAIN batch cap for FSEvents-loss recovery (review-1 change 4; semantics corrected review-2
+    /// change 2). This is NO LONGER a cap on the TOTAL directories recovered — that truncation silently
+    /// left retained directories un-revalidated while the status resumed claiming full "Live". It now
+    /// bounds only how many directories one recovery DRAIN re-validates before yielding; the remainder
+    /// carries to the next drain, and the capability stays `.degraded` until every retained directory
+    /// under the flagged subtree is processed (see `recoverSubtrees`). So a huge-subtree loss recovers
+    /// COMPLETELY, a bounded batch at a time — never a silent claim of completeness.
+    private static let maxRecoveryDirs = 512
+    /// Pending FSEvents-loss recovery work (review-2 change 2): the retained directories still to be
+    /// re-validated after a `MustScanSubDirs`/dropped-queue loss. REUSES `FSEventCoalescer` (the same
+    /// dedup-set + capped-drain + carry policy the Tier-2 storm coalescer uses — now a two-user
+    /// abstraction), drained by `recoverSubtrees` in `maxRecoveryDirs`-sized batches. New work from a
+    /// later loss folds into the SAME set (dedup), so overlapping recoveries never double-process.
+    private var recovery = FSEventCoalescer()
+    /// Whether the single recovery drain loop is running. `recoverSubtrees` runs inside the SERIAL live
+    /// loop, so only one drains at a time; a loss arriving mid-recovery is a fresh queued work item. `fsDegraded`
+    /// tracks this — the loop clears both only when the recovery set is genuinely empty.
+    private var recoveryDraining = false
+    /// Called (on main) when a prune removed the focus subtree, with the surviving ancestor to fall
+    /// back to — the App re-seeds navigation so the map never points at a ghost (deliverable 1).
+    var onFocusFallback: ((String) -> Void)?
+
+    // MARK: - TZ-7 live delivery through the EventBatcher (OPERATOR_NOTE #1)
+    //
+    /// The single live-update delivery funnel (OPERATOR_NOTE #1): computed diff `ScanEvent`s are `add`ed
+    /// here; it coalesces them into ≤`maxEventsPerBatch` FIFO batches and deposits each into
+    /// `liveDelivery` (its sink), exactly as the walker's batcher delivers scan data. `nil` between scans.
+    private var liveBatcher: EventBatcher?
+    /// The batcher's sink target: a serial hand-off the `liveWorkTask` drains after each flush and folds
+    /// via `ScenePipeline.applyLiveBatch`. A tiny `@unchecked Sendable` box (lock-guarded) because the
+    /// `EventBatcher` sink is `@Sendable` and runs on the batcher's executor; the App drains it on main.
+    /// PER-SCAN (created with its batcher in `startLiveUpdates`, dropped in `stopLiveUpdates`) and THREADED
+    /// through the live methods bound to its batcher — so a rescan mid-fold can never let one scan's drain
+    /// consume another scan's batches (the two are always a consistent pair for one revalidation group).
+    private var liveDelivery: LiveDelivery?
+    /// The SINGLE serial consumer of `liveWork`: it processes one revalidation group at a time
+    /// (compute→deliver→fold, then one `liveEmit`), which is what serializes fold-before-next-compute and
+    /// preserves the review-1 delete/recreate ordering. Cancelled on teardown.
+    private var liveWorkTask: Task<Void, Never>?
+    /// Enqueues live work (focus pokes, Tier-2 drains, recovery) for the serial `liveWorkTask`. Buffered
+    /// (not newest-1) so a rare burst of triggers is not coalesced away before it is processed.
+    private var liveWorkCont: AsyncStream<LiveWork>.Continuation?
+    /// Last `droppedOrphanEvents` value traced, so the TZTRACE line fires only on a change (honesty
+    /// without spam) — OPERATOR_NOTE #2 ("expose the drop counter in TZTRACE").
+    private var lastTracedDrops = 0
+    private static let traceEnabled = ProcessInfo.processInfo.environment["TERRAZZO_TRACE"] != nil
+
+    /// One unit of live work for the serial loop. A sum type: the three trigger shapes fold to distinct
+    /// processing (one dir with a known mtime; a coalesced Tier-2 drain; a loss recovery).
+    private enum LiveWork {
+        /// Tier-1: revalidate ONE directory (the focus, or the pending-focus check), comparing `known`.
+        case dir(id: String, known: Int64?)
+        /// Tier-2: a coalesced drain of flagged directories (each revalidated, no known mtime).
+        case dirs([String])
+        /// FSEvents loss: recover the retained subtrees under these ids (bounded, degraded meanwhile).
+        case recover([String])
+    }
+
+    /// Serial hand-off from the `EventBatcher`'s sink (batcher executor) to the main-actor drain. The
+    /// batcher deposits coalesced FIFO batches; the live loop drains them in order and folds each.
+    private final class LiveDelivery: @unchecked Sendable {
+        private let lock = NSLock()
+        private var batches: [[ScanEvent]] = []
+        func deposit(_ b: [ScanEvent]) { lock.lock(); batches.append(b); lock.unlock() }
+        func drain() -> [[ScanEvent]] { lock.lock(); defer { batches.removeAll(); lock.unlock() }; return batches }
+    }
+
     // MARK: - TZ-5 lens state (persists across a rescan; re-applied to each new pipeline)
     //
     // The scale/hidden/depth lens choices are the App's source of truth (updated by the
@@ -127,6 +243,13 @@ final class ScanController {
         totalInodes = VolumeProbe.usedInodes(for: root) ?? 0
         isVolumeRoot = Self.rootIsVolumeRoot(root)
 
+        // TZ-7: the initial focus IS the scan root (NavigationController seeds it from the first
+        // scene), so track it here — the idle timer + FSEvents revalidate the root focus from t=0.
+        // A just-scanned root needs no immediate focus poke (pendingFocusRevalidation stays false).
+        currentFocusId = root.path
+        knownFocusMtime = nil
+        pendingFocusRevalidation = false
+
         let pipe = ScenePipeline(rootId: root.path, rootName: root.lastPathComponent)
         pipeline = pipe
         // TZ-5: re-apply the current lens choices so a rescan/volume-switch keeps the user's
@@ -163,15 +286,19 @@ final class ScanController {
             guard let self else { return }
             for await scene in pipe.scenes {
                 self.onScene(scene)
-                self.onStatus(ScanStatus(volume: self.volume,
-                                         scannedBytes: scene.scannedBytes,
-                                         belowPixelCount: scene.belowPixelCount,
-                                         running: scene.running,
-                                         filesProcessed: scene.filesProcessed,
-                                         totalInodes: self.totalInodes,
-                                         isVolumeRoot: self.isVolumeRoot,
-                                         scaleMode: scene.scaleMode,
-                                         hiddenFilteredBytes: scene.hiddenFilteredBytes))
+                self.lastScene = scene
+                self.onStatus(self.makeStatus(scene))
+                // TZ-7 Tier-1: cache the FOCUS directory's retained mtime off the focus-rooted
+                // projection root (O(1) on main) and, on a fresh focus, trigger one mtime-compared
+                // revalidation once its scene has arrived — a fresh look that catches any deletion
+                // since scan time without re-enumerating on every idle tick.
+                if scene.focusId == self.currentFocusId {
+                    self.knownFocusMtime = scene.tree.mtime
+                    if self.pendingFocusRevalidation {
+                        self.pendingFocusRevalidation = false
+                        self.revalidateDir(scene.focusId, comparingMtime: scene.tree.mtime)
+                    }
+                }
                 if !scene.running && self.running {
                     self.running = false
                     self.stopCadence()
@@ -180,7 +307,21 @@ final class ScanController {
             }
         }
 
+        // Consume focus fallbacks (a live prune of the focused subtree) → re-seed navigation. The
+        // stream finishes when the pipeline is released (its deinit); the task is also cancelled on
+        // teardown. Reading `pipe.focusFallbacks` (a nonisolated let) here keeps the actor un-retained.
+        let fallbacks = pipe.focusFallbacks
+        liveFallbackTask = Task { @MainActor [weak self] in
+            for await ancestorId in fallbacks {
+                guard let self else { return }
+                self.currentFocusId = ancestorId
+                self.knownFocusMtime = nil
+                self.onFocusFallback?(ancestorId)
+            }
+        }
+
         startCadence()
+        startLiveUpdates(root: root)
     }
 
     /// Start the batched relayout cadence (ratified decision 3): a lightweight main Timer
@@ -239,6 +380,13 @@ final class ScanController {
         let newRootId = newRoot.path
         let oldRootId = oldRoot.path
 
+        // TZ-7: the scan root moved up — re-point the living map (FSEvents watches the new, larger
+        // root; the focus lands on it). The grafted subtree keeps its retained mtimes.
+        currentFocusId = newRootId
+        knownFocusMtime = nil
+        pendingFocusRevalidation = false
+        startLiveUpdates(root: newRoot)
+
         guard let pipe = pipeline else { return newRootId }
         startCadence() // resume batched relayout if the primary scan had finished
 
@@ -271,12 +419,312 @@ final class ScanController {
     /// full-volume dive latency (the O(retained-nodes)-from-root cost) is gone.
     func setFocus(_ id: String) {
         guard let pipe = pipeline else { return }
+        // TZ-7 Tier-1: a focus CHANGE arms one mtime-compared revalidation of the new focus, fired
+        // when its scene arrives (so we have its retained mtime to compare). The previous focus's
+        // mtime is meaningless for the new one, so forget it until the new scene lands.
+        if id != currentFocusId {
+            currentFocusId = id
+            knownFocusMtime = nil
+            pendingFocusRevalidation = true
+        }
         Task {
             let t0 = DispatchTime.now().uptimeNanoseconds
             await pipe.setFocus(id)
             let ms = Double(DispatchTime.now().uptimeNanoseconds &- t0) / 1e6
             worstFocusEmitMs = max(worstFocusEmitMs, ms)
             focusEmitSamples += 1
+        }
+    }
+
+    // MARK: - TZ-7 live updates (revalidation + FSEvents) — all background, main-thread law untouched
+
+    /// Start the living map for `root`: the FSEvents Tier-2 stream (its callback revalidates each
+    /// flagged directory) and the lazy Tier-1 idle timer (a periodic focus mtime check). The stream
+    /// watches the PRIMARY scan root only (the anticipatory tree is deliberately unwatched in v1,
+    /// PLAN §TZ-7 out-of-scope). `fsLive` reflects whether the stream came up; a failure degrades to
+    /// Tier-1 and the status tooltip SAYS so (never silent — deliverable 5).
+    private func startLiveUpdates(root: URL) {
+        stopLiveUpdates()
+        let rootPath = root.path
+
+        // The single live delivery funnel (OPERATOR_NOTE #1). The batcher's sink deposits coalesced FIFO
+        // batches into a FRESH per-scan `liveDelivery`; the serial `liveWorkTask` drains and folds them.
+        // Constructed BEFORE the work loop and the watcher so the very first flagged directory has a
+        // funnel to flow through. Batcher and delivery are a matched pair, threaded together below.
+        let delivery = LiveDelivery()
+        liveDelivery = delivery
+        liveBatcher = EventBatcher { batch in delivery.deposit(batch) }
+
+        // The SINGLE serial consumer: one revalidation group at a time (compute→deliver→fold, one emit).
+        let (workStream, workCont) = AsyncStream<LiveWork>.makeStream(bufferingPolicy: .unbounded)
+        liveWorkCont = workCont
+        liveWorkTask = Task { @MainActor [weak self] in
+            for await work in workStream {
+                guard let self else { return }
+                await self.processLiveWork(work)
+            }
+        }
+
+        fsWatcher = FSEventsWatcher(rootPath: rootPath, onDirs: { [weak self] flaggedDirIds in
+            // Runs on the watcher's background queue. Enqueue the coalesced drain for the serial loop; the
+            // blocking enumeration + the batcher-routed fold happen there, off the watcher queue.
+            Task { @MainActor [weak self] in self?.liveWorkCont?.yield(.dirs(flaggedDirIds)) }
+        }, onRescan: { [weak self] rescanIds in
+            // review-1 change 4: the kernel lost events for these subtrees — enqueue a recovery.
+            Task { @MainActor [weak self] in self?.liveWorkCont?.yield(.recover(rescanIds)) }
+        })
+        fsLive = (fsWatcher != nil)
+        refreshStatus() // reflect the live/degraded capability the moment it is known (deliverable 5)
+
+        let timer = Timer(timeInterval: Self.idleRevalidationSeconds, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.revalidateFocus() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        idleTimer = timer
+    }
+
+    private func stopLiveUpdates() {
+        fsWatcher?.stop(); fsWatcher = nil
+        fsLive = false
+        fsDegraded = false
+        // Tear down the live delivery funnel + serial loop. Finishing the continuation ends the loop's
+        // `for await`; any in-flight iteration bails at its next `self.pipeline === pipe` guard (the
+        // pipeline is being replaced). Draining `liveDelivery` prevents stale batches leaking across scans.
+        liveWorkCont?.finish(); liveWorkCont = nil
+        liveWorkTask?.cancel(); liveWorkTask = nil
+        liveBatcher = nil
+        liveDelivery = nil // dropped whole — a fresh per-scan delivery is made in startLiveUpdates
+        // Drop any in-flight recovery work — a new scan/promotion starts with a clean slate.
+        recovery = FSEventCoalescer()
+        recoveryDraining = false
+        idleTimer?.invalidate(); idleTimer = nil
+    }
+
+    // MARK: - Live status (the live/degraded indicator — deliverable 5, review-1 change 4)
+
+    /// The current live-monitoring capability, honestly: `.off` when the FSEvents stream is unavailable
+    /// (Tier-1 only), `.degraded` while recovering from a dropped-events burst, else `.live`.
+    private var liveStatus: LiveStatus {
+        guard fsLive else { return .off }
+        return fsDegraded ? .degraded : .live
+    }
+
+    /// Build the status DTO for a scene, carrying the current live capability.
+    private func makeStatus(_ scene: RenderScene) -> ScanStatus {
+        ScanStatus(volume: volume, scannedBytes: scene.scannedBytes,
+                   belowPixelCount: scene.belowPixelCount, running: scene.running,
+                   filesProcessed: scene.filesProcessed, totalInodes: totalInodes,
+                   isVolumeRoot: isVolumeRoot, scaleMode: scene.scaleMode,
+                   hiddenFilteredBytes: scene.hiddenFilteredBytes, live: liveStatus)
+    }
+
+    /// Re-push the status with the current live capability when it changes WITHOUT a new scene (stream
+    /// came up / degraded / recovered). No-op before the first scene arrives.
+    private func refreshStatus() {
+        if let scene = lastScene { onStatus(makeStatus(scene)) }
+    }
+
+    /// Tier-1 trigger for app activation (NSApplication.didBecomeActive) and the idle timer:
+    /// revalidate the CURRENT focus, comparing against its cached mtime (one syscall if unchanged).
+    /// Enqueued on the serial live loop (OPERATOR_NOTE #1) so it is delivered through the same batcher.
+    func revalidateFocus() {
+        guard let id = currentFocusId else { return }
+        liveWorkCont?.yield(.dir(id: id, known: knownFocusMtime))
+    }
+
+    /// Revalidate ONE directory (Tier-1 focus poke, or the pending-focus check when a fresh focus's
+    /// scene arrives). Enqueued on the serial live loop; the read + batcher-routed fold happen there.
+    func revalidateDir(_ dirId: String, comparingMtime known: Int64?) {
+        liveWorkCont?.yield(.dir(id: dirId, known: known))
+    }
+
+    // MARK: - The serial live loop (OPERATOR_NOTE #1 — one delivery path through the EventBatcher)
+
+    /// Process one live-work group serially: revalidate its directories (compute→deliver→fold through the
+    /// batcher), then emit ONCE for the group so a mass change coalesces into a scene. Because the loop
+    /// awaits each group to completion before the next, a directory's fold lands before its next compute —
+    /// the delete/recreate ordering review-1 change 1 requires, now preserved WITHOUT an atomic fold.
+    private func processLiveWork(_ work: LiveWork) async {
+        // Capture the scan's (pipeline, batcher, delivery) as a consistent trio for this group.
+        guard let pipe = pipeline, let batcher = liveBatcher, let delivery = liveDelivery else { return }
+        switch work {
+        case let .dir(id, known):
+            await revalidateOne(id, comparingMtime: known, pipe: pipe, batcher: batcher, delivery: delivery)
+            guard self.pipeline === pipe else { return }
+            await pipe.liveEmit()
+            await traceDrops(pipe)
+        case let .dirs(ids):
+            for dirId in ids {
+                await revalidateOne(dirId, comparingMtime: nil, pipe: pipe, batcher: batcher, delivery: delivery)
+                guard self.pipeline === pipe else { return }
+            }
+            await pipe.liveEmit() // one scene per coalesced drain (storm-safe emit)
+            await traceDrops(pipe)
+        case let .recover(ids):
+            await recoverSubtrees(ids, pipe: pipe, batcher: batcher, delivery: delivery)
+        }
+    }
+
+    /// The shared revalidation core (Tier-1 focus poke + Tier-2 FSEvents dir + recovery). It (1) asks
+    /// the actor what a flagged path IS — an ordinary directory, an opaque bundle leaf, or a skip
+    /// (review-1 change 3); (2) does the matching BLOCKING read OFF the main actor (a detached task, so
+    /// the syscalls never touch the suspended main actor — the threading law); (3) COMPUTES the diff
+    /// atomically against retained state (`computeLiveDiff`/`computeBundleDiff` — the review-1 stale/
+    /// contains guards) and routes the events THROUGH the batcher to `applyLiveBatch` (`deliverAndFold`).
+    /// Only the sub-scan launch and the emit return to the caller. Does NOT emit — the caller emits once
+    /// per logical group (`liveEmit`) so a storm coalesces.
+    ///
+    /// A `.unreadable` directory/bundle (deleted) re-targets the nearest surviving ancestor of its
+    /// PARENT, whose fresh listing `childRemoved`s the vanished subtree and triggers the focus fallback
+    /// (review-0 change 2 — a deleted focus never leaves a ghost). Self-correcting for a merely-DENIED
+    /// (still-present) directory: the parent's listing still contains it, so no removal is emitted.
+    private func revalidateOne(_ dirId: String, comparingMtime known: Int64?,
+                               pipe: ScenePipeline, batcher: EventBatcher, delivery: LiveDelivery) async {
+        let policy = self.policy
+        let target = await pipe.revalidationTarget(for: dirId)
+        guard self.pipeline === pipe else { return }
+        switch target {
+        case .skip:
+            return
+        case .directory(let id):
+            // OFF MAIN: stat + (if changed) enumerate.
+            let read = await Task.detached(priority: .utility) {
+                FileSystemWalker.revalidationRead(dirId: id, ifUnchangedFrom: known, policy: policy)
+            }.value
+            guard self.pipeline === pipe else { return } // a rescan replaced the pipeline during the await
+            switch read {
+            case .unchanged:
+                return
+            case .unreadable:
+                await revalidateSurvivingParent(of: id, pipe: pipe, batcher: batcher, delivery: delivery)
+            case let .changed(mtime, ownAllocated, ownLogical, fresh, complete):
+                // Compute the diff atomically (guards), then DELIVER it through the batcher (fold happens
+                // in `deliverAndFold` via `applyLiveBatch`) — one delivery path, OPERATOR_NOTE #1.
+                let (events, newChildIds) = await pipe.computeLiveDiff(
+                    dirId: id, readMtime: mtime, ownAllocated: ownAllocated, ownLogical: ownLogical,
+                    fresh: fresh, complete: complete)
+                guard self.pipeline === pipe else { return }
+                await deliverAndFold(events, pipe: pipe, batcher: batcher, delivery: delivery)
+                guard self.pipeline === pipe else { return }
+                self.launchSubScans(newChildIds, rootPath: self.root.path, pipe: pipe)
+            }
+        case .bundle(let id):
+            // OFF MAIN: opaque re-measure of the bundle's recursive total (never exposes descendants).
+            let read = await Task.detached(priority: .utility) {
+                FileSystemWalker.revalidationBundleRead(bundleId: id)
+            }.value
+            guard self.pipeline === pipe else { return }
+            switch read {
+            case .incomplete:
+                return // present but not fully readable — leave the retained total (never a false shrink)
+            case .unreadable:
+                await revalidateSurvivingParent(of: id, pipe: pipe, batcher: batcher, delivery: delivery)
+            case let .sized(mtime, allocated, logical):
+                let events = await pipe.computeBundleDiff(bundleId: id, readMtime: mtime,
+                                                          allocated: allocated, logical: logical)
+                guard self.pipeline === pipe else { return }
+                await deliverAndFold(events, pipe: pipe, batcher: batcher, delivery: delivery)
+            }
+        }
+    }
+
+    /// Route the computed live events THROUGH the `EventBatcher` (the single live delivery funnel,
+    /// OPERATOR_NOTE #1), then fold the coalesced FIFO batches. `add` chunks a huge single-directory diff
+    /// (a mass delete's thousands of `childRemoved`) into ≤`maxEventsPerBatch` batches; `flush` drains the
+    /// remainder; each deposited batch is folded via `applyLiveBatch` IN ORDER. Awaiting the fold here —
+    /// inside the serial loop — is what makes fold land before the next compute (the delete/recreate
+    /// ordering). Empty diff (unchanged / guarded-stale) is a no-op.
+    private func deliverAndFold(_ events: [ScanEvent], pipe: ScenePipeline,
+                                batcher: EventBatcher, delivery: LiveDelivery) async {
+        guard !events.isEmpty else { return }
+        await batcher.add(events)
+        await batcher.flush()
+        for batch in delivery.drain() {
+            guard self.pipeline === pipe else { return }
+            await pipe.applyLiveBatch(batch)
+        }
+    }
+
+    /// Emit a TZTRACE line when the reducer's orphan-drop counter changes (OPERATOR_NOTE #2 — "expose the
+    /// drop counter in TZTRACE, honesty over silence"). Fires only on a change so a quiet map is quiet.
+    private func traceDrops(_ pipe: ScenePipeline) async {
+        guard Self.traceEnabled else { return }
+        let n = await pipe.droppedOrphanEvents
+        guard n != lastTracedDrops else { return }
+        lastTracedDrops = n
+        print("TZTRACE live droppedOrphanEvents=\(n) (late sub-scan events under a pruned subtree, dropped by the reducer)")
+        fflush(stdout)
+    }
+
+    /// A deleted directory/bundle re-targets the nearest surviving ancestor of its PARENT, whose fresh
+    /// listing `childRemoved`s the vanished subtree (review-0 change 2). Bounded: `parentPath` never
+    /// climbs past "/", and each hop strictly shortens the path, so the recursion terminates.
+    private func revalidateSurvivingParent(of id: String, pipe: ScenePipeline,
+                                           batcher: EventBatcher, delivery: LiveDelivery) async {
+        let parent = Self.parentPath(of: id)
+        guard parent != id, let anc = await pipe.nearestRetainedAncestor(of: parent) else { return }
+        guard self.pipeline === pipe else { return }
+        await revalidateOne(anc, comparingMtime: nil, pipe: pipe, batcher: batcher, delivery: delivery)
+    }
+
+    /// Recover from an FSEvents event LOSS (`MustScanSubDirs` / dropped kernel queue — review-1
+    /// change 4). The kernel could not tell us WHAT changed under each flagged subtree, so a one-level
+    /// re-list is insufficient: re-validate every RETAINED directory under it (each diffed against
+    /// disk — catching adds, removes, and in-place size changes at every level; newly-appeared subtrees
+    /// arrive via their retained parent's `childrenDiscovered` + sub-scan). All folds route through the
+    /// batcher like every other live update (OPERATOR_NOTE #1).
+    ///
+    /// COMPLETENESS + HONEST STATUS (review-2 change 2). The flagged subtree's EVERY retained directory
+    /// is enqueued (`retainedDirIds(under:)` is uncapped) and drained in `maxRecoveryDirs`-sized batches
+    /// that CARRY across drains; the live capability is stated `.degraded` from the first loss until the
+    /// recovery set is genuinely EMPTY. Runs inside the serial live loop (one recovery at a time), so a
+    /// loss arriving mid-recovery is processed as a fresh recovery afterwards — still complete.
+    private func recoverSubtrees(_ ids: [String], pipe: ScenePipeline,
+                                 batcher: EventBatcher, delivery: LiveDelivery) async {
+        guard !ids.isEmpty else { return }
+        // Enqueue EVERY retained directory under each flagged subtree (complete — dedup folds overlaps).
+        for id in ids {
+            recovery.add(await pipe.retainedDirIds(under: id))
+            guard self.pipeline === pipe else { return }
+        }
+        recoveryDraining = true
+        fsDegraded = true
+        refreshStatus()
+        while !recovery.isEmpty {
+            for d in recovery.drain(max: Self.maxRecoveryDirs) {
+                await revalidateOne(d, comparingMtime: nil, pipe: pipe, batcher: batcher, delivery: delivery)
+                guard self.pipeline === pipe else { recoveryDraining = false; return }
+            }
+            await pipe.liveEmit() // one scene per bounded drain (storm-safe emit)
+            await traceDrops(pipe)
+            guard self.pipeline === pipe else { recoveryDraining = false; return }
+            await Task.yield()    // let other main work interleave between bounded drains
+        }
+        recoveryDraining = false
+        fsDegraded = false
+        refreshStatus()
+    }
+
+    /// The parent directory id (absolute path) of `id`. Returns "/" for a top-level id and "/" for the
+    /// volume root itself, so the deleted-focus fallback can never climb past the volume root.
+    private static func parentPath(of id: String) -> String {
+        guard let slash = id.lastIndex(of: "/") else { return id }
+        if slash == id.startIndex { return "/" } // e.g. "/Users" -> "/", and "/" -> "/"
+        return String(id[id.startIndex..<slash])
+    }
+
+    /// Launch a streamed sub-scan for each new child a revalidation surfaced, folded into the SAME
+    /// pipeline. Flips `running`/cadence on so intermediate frames of a large new subtree stream in;
+    /// the scene consumer turns them off again when every walk drains.
+    private func launchSubScans(_ ids: [String], rootPath: String, pipe: ScenePipeline) {
+        guard !ids.isEmpty else { return }
+        running = true
+        startCadence()
+        let policy = self.policy
+        for childId in ids {
+            let stream = FileSystemWalker.scanNewChild(url: URL(fileURLWithPath: childId), id: childId,
+                                                       scanRootPath: rootPath, policy: policy)
+            walkTasks.append(Task { await pipe.ingest(stream) })
         }
     }
 
@@ -356,7 +804,10 @@ final class ScanController {
         for t in walkTasks { t.cancel() }; walkTasks = []
         anticipateTask?.cancel(); anticipateTask = nil
         sceneTask?.cancel(); sceneTask = nil
+        liveFallbackTask?.cancel(); liveFallbackTask = nil
         stopCadence()
+        stopLiveUpdates() // TZ-7: tear down the FSEvents stream + idle timer before the pipeline goes
+        lastScene = nil
         pipeline = nil
         if running { hitch.stop(reason: "cancelled") }
         running = false

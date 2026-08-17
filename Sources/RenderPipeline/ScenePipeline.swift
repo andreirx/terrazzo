@@ -162,6 +162,15 @@ public actor ScenePipeline {
     public nonisolated let scenes: AsyncStream<RenderScene>
     private let continuation: AsyncStream<RenderScene>.Continuation
 
+    /// TZ-7: focus-fallback signals — the surviving ancestor a live prune re-rooted the focus onto
+    /// (see `reconcile`). Delivered as its OWN stream (parallel to `scenes`) because a fallback is a
+    /// NAVIGATION event the App must act on (re-seed its focus stack + animate the ascent), not a
+    /// render frame: a scene already carries `focusId`, but the App otherwise DROPS a scene whose
+    /// focus it did not navigate to (a stale-focus guard), so the ancestor must be signalled
+    /// explicitly. Buffered (not newest-1) so a rare burst of fallbacks is not coalesced away.
+    public nonisolated let focusFallbacks: AsyncStream<String>
+    private let fallbackContinuation: AsyncStream<String>.Continuation
+
     /// Formatter for label sizes. Instance-owned (actor-isolated) — `ByteCountFormatter`
     /// is not Sendable, so it must not be shared across concurrency domains.
     private let sizeFormatter: ByteCountFormatter
@@ -177,6 +186,16 @@ public actor ScenePipeline {
         let (stream, cont) = AsyncStream<RenderScene>.makeStream(bufferingPolicy: .bufferingNewest(1))
         self.scenes = stream
         self.continuation = cont
+        let (fbStream, fbCont) = AsyncStream<String>.makeStream(bufferingPolicy: .bufferingNewest(16))
+        self.focusFallbacks = fbStream
+        self.fallbackContinuation = fbCont
+    }
+
+    /// Finish both streams when the pipeline is released (rescan/volume-switch/teardown), so a
+    /// consumer's `for await` loop ends deterministically instead of relying on continuation dealloc.
+    deinit {
+        continuation.finish()
+        fallbackContinuation.finish()
     }
 
     // MARK: - Ingest (folds walker batches; never blocked by main)
@@ -280,6 +299,176 @@ public actor ScenePipeline {
         activeWalks -= 1
         if activeWalks == 0 { running = false } // last walk to drain marks the scan done
         emit(force: true) // final settle at the promoted root
+    }
+
+    // MARK: - Revalidation (TZ-7 — the living map)
+    //
+    // DELIVERY THROUGH THE EXISTING EventBatcher (OPERATOR_NOTE 2026-08-17 #1). Live updates are NOT a
+    // bypass: the App computes each directory's diff here (`computeLiveDiff`/`computeBundleDiff`, an
+    // ATOMIC read of retained state with the two staleness guards below), then routes the resulting
+    // `ScanEvent`s through the SAME `EventBatcher` scan data uses — one live delivery funnel, no parallel
+    // path — which delivers coalesced FIFO batches back to `applyLiveBatch` for the fold. The reducer is
+    // the single-threaded ordering authority (OPERATOR_NOTE #2): a late sub-scan event addressed to a
+    // pruned/unknown subtree is DROPPED and COUNTED inside `reducer.apply`, so the batched (rather than
+    // instantly-folded) delivery cannot re-materialize an orphan.
+    //
+    // SERIAL CORRECTNESS (review-1 change 1) is preserved by TWO guards in the compute step reading a
+    // CONSISTENT snapshot, PLUS the App serializing compute→deliver→fold per revalidation group (so a
+    // directory's fold lands before its next compute — the delete/recreate ordering):
+    //   • CONTAINS — a directory an ancestor prune already removed yields no events (no orphan).
+    //   • STALE-MTIME — a read whose freshly-stat'd mtime is OLDER than the one already folded is a stale
+    //     snapshot and yields no events, so a slow read cannot un-do a newer one (a stale `childRemoved`
+    //     retiring a just-recreated child). A directory's mtime rises monotonically with each change.
+    // Emission is DEFERRED to `liveEmit` (called ONCE per logical group — a Tier-1 poke or a whole Tier-2
+    // drain) so a mass change coalesces into ONE scene. A focus fallback is the sole immediate emit — it
+    // is a navigation event the App must act on now.
+    //
+    // The `reconcile`/`reconcileBundle` compact forms (compute + `applyLiveBatch` in one call) are the
+    // in-process primitive the RenderPipeline tests drive — that target cannot import the ScanFS
+    // `EventBatcher`, so it exercises the identical guards+fold+fallback without the transport.
+
+    /// What the living map should do with a flagged path, decided from RETAINED reducer state
+    /// (review-1 changes 1+3). Returned to the App so the matching I/O (directory enumerate vs opaque
+    /// bundle re-measure) runs OFF the actor before the atomic fold.
+    public enum RevalidationTarget: Sendable, Equatable {
+        /// Re-enumerate this directory and diff it (`reconcile`).
+        case directory(String)
+        /// Re-measure this opaque bundle leaf's recursive total, WITHOUT exposing descendants
+        /// (`reconcileBundle`). The id is the retained bundle leaf — a flagged path INSIDE a bundle
+        /// resolves here to the leaf, since the leaf's descendants are not retained.
+        case bundle(String)
+        /// Not retained and not inside a bundle — its own parent's revalidation will link it; never
+        /// fabricate a lone node.
+        case skip
+    }
+
+    /// Classify a flagged path (review-1 changes 1+3). A retained bundle leaf — or any path INSIDE one,
+    /// whose nearest retained ancestor IS the leaf (a bundle's descendants are opaque, hence not
+    /// retained) — re-sizes opaquely; a retained directory re-enumerates; anything else is skipped.
+    public func revalidationTarget(for dirId: String) -> RevalidationTarget {
+        if let k = reducer.kind(of: dirId) {
+            return k == .bundleLeaf ? .bundle(dirId) : .directory(dirId)
+        }
+        if let anc = reducer.nearestRetainedAncestor(of: dirId), reducer.kind(of: anc) == .bundleLeaf {
+            return .bundle(anc)
+        }
+        return .skip
+    }
+
+    /// COMPUTE the diff for `dirId` against CURRENT retained state, WITHOUT folding it (TZ-7
+    /// OPERATOR_NOTE 2026-08-17 #1 — the batcher-delivered live path). The App routes the returned
+    /// `events` through the live `EventBatcher` (its single delivery funnel), which delivers them back to
+    /// `applyLiveBatch` for the actual fold — so live updates flow through the SAME batched delivery scan
+    /// data uses, not a bypass. The compute is ATOMIC over reducer state (the reviewer's "keep atomic
+    /// reconcile" — the two staleness guards read a CONSISTENT snapshot here), and the App serializes
+    /// compute→deliver→fold per revalidation group so a directory's fold lands before its next compute
+    /// (the delete/recreate ordering review-1 change 1 pins). `newChildIds` are the new sub-directories
+    /// the App must launch streamed sub-scans for.
+    ///   • CONTAINS — a directory an ancestor prune already removed yields no events (no orphan).
+    ///   • STALE-MTIME — a read older than the folded mtime is a stale snapshot; yields no events.
+    public func computeLiveDiff(dirId: String, readMtime: Int64, ownAllocated: Int64, ownLogical: Int64,
+                                fresh: [FreshChild], complete: Bool) -> (events: [ScanEvent], newChildIds: [String]) {
+        guard reducer.contains(dirId) else { return ([], []) }                        // pruned by an ancestor
+        if let known = reducer.mtime(of: dirId), known > readMtime { return ([], []) } // stale read — a newer one won
+        let d = reducer.revalidationDiff(dirId: dirId, mtime: readMtime,
+                                         ownAllocated: ownAllocated, ownLogical: ownLogical,
+                                         fresh: fresh, complete: complete)
+        return (d.events, d.newChildIds)
+    }
+
+    /// FOLD one live-update batch delivered THROUGH the `EventBatcher` (TZ-7 OPERATOR_NOTE #1). The
+    /// batcher hands its coalesced FIFO batches here; the reducer folds them exactly as it folds scan
+    /// batches (the reducer is the ordering authority — orphan events from a since-pruned subtree are
+    /// dropped INSIDE `reducer.apply`, OPERATOR_NOTE #2). Then the focus-fallback check: a batch that
+    /// pruned the focus re-roots it (emitting immediately); an ordinary structural change marks dirty for
+    /// the group's single `liveEmit`; a mtime-only refresh stays calm (no emit). Idempotent on empty.
+    public func applyLiveBatch(_ events: [ScanEvent]) {
+        guard !events.isEmpty else { return }
+        reducer.apply(events)
+        // `changed` for the dirty/emit decision: any non-`directoryMtime` event is a real structural or
+        // size change; a batch of only mtime refreshes is calm (the reducer cached the staleness key so
+        // the next check short-circuits, but nothing to re-render). This preserves `revalidationDiff`'s
+        // `changed` semantics across the flat batcher delivery, which does not carry that flag.
+        let changed = events.contains { if case .directoryMtime = $0 { return false } else { return true } }
+        handleFocusFallback(orMarkDirty: changed)
+    }
+
+    /// Atomically diff `dirId` against a fresh disk listing AND fold the result — the in-process
+    /// primitive (`computeLiveDiff` + `applyLiveBatch` in one actor step). The App's production path
+    /// routes through the batcher (`computeLiveDiff` → EventBatcher → `applyLiveBatch`); this compact
+    /// form is what the RenderPipeline tests drive (they cannot import the ScanFS `EventBatcher`) and the
+    /// equivalence — same guards, same fold, same fallback — is exactly why both are safe.
+    public func reconcile(dirId: String, readMtime: Int64, ownAllocated: Int64, ownLogical: Int64,
+                          fresh: [FreshChild], complete: Bool) -> [String] {
+        let (events, newChildIds) = computeLiveDiff(dirId: dirId, readMtime: readMtime,
+                                                    ownAllocated: ownAllocated, ownLogical: ownLogical,
+                                                    fresh: fresh, complete: complete)
+        applyLiveBatch(events)
+        return newChildIds
+    }
+
+    /// COMPUTE the opaque bundle-leaf re-size events WITHOUT folding (review-1 change 3; batcher-delivered
+    /// per OPERATOR_NOTE #1). Same contains/stale guards as `computeLiveDiff`; a single `sizeUpdated` when
+    /// the recursive total changed (else just the mtime refresh — calm). Descendants are NEVER exposed.
+    public func computeBundleDiff(bundleId: String, readMtime: Int64, allocated: Int64, logical: Int64) -> [ScanEvent] {
+        guard reducer.kind(of: bundleId) == .bundleLeaf else { return [] }         // pruned / re-typed — stale
+        if let known = reducer.mtime(of: bundleId), known > readMtime { return [] }
+        let own = reducer.ownSize(of: bundleId)
+        if own?.allocated != allocated || own?.logical != logical {
+            return [.directoryMtime(nodeId: bundleId, mtime: readMtime),
+                    .sizeUpdated(nodeId: bundleId, allocated: allocated, logical: logical)]
+        }
+        return [.directoryMtime(nodeId: bundleId, mtime: readMtime)] // cache mtime only (calm)
+    }
+
+    /// Opaque re-size of a bundle leaf — the in-process primitive (`computeBundleDiff` + `applyLiveBatch`).
+    /// A bundle is never a focus, so `applyLiveBatch`'s fallback is a no-op here. Retained for the tests
+    /// and equivalence with the batcher-delivered path.
+    public func reconcileBundle(bundleId: String, readMtime: Int64, allocated: Int64, logical: Int64) {
+        applyLiveBatch(computeBundleDiff(bundleId: bundleId, readMtime: readMtime,
+                                         allocated: allocated, logical: logical))
+    }
+
+    /// The reducer's running count of live events DROPPED as orphans of a pruned subtree (OPERATOR_NOTE
+    /// #2) — surfaced by the App in TZTRACE ("honesty over silence"). O(1) read of reducer state.
+    public var droppedOrphanEvents: Int { reducer.droppedOrphanEvents }
+
+    /// Emit a live-update scene IFF a reconcile marked the reducer dirty since the last emit — called
+    /// ONCE per logical revalidation group (a Tier-1 poke or a whole Tier-2 drain) so a coalesced storm
+    /// yields one scene, not one per directory.
+    public func liveEmit() { if dirty { emit(force: true) } }
+
+    /// EVERY retained directory-like id under `id` (for a `MustScanSubDirs` / dropped-events recovery,
+    /// review-1 change 4). Complete (review-2 change 2): the caller drains this full list in bounded
+    /// per-drain batches and stays degraded until done, rather than the reducer truncating it at a cap
+    /// (which silently left retained directories un-revalidated). O(subtree) strings, on the actor.
+    public func retainedDirIds(under id: String) -> [String] {
+        reducer.retainedDirIds(under: id)
+    }
+
+    /// The nearest retained ancestor of `id` (inclusive) — used by the App to re-target a `.unreadable`
+    /// revalidation (a deleted focus/dir) at the nearest surviving ancestor, whose re-enumeration then
+    /// `childRemoved`s the vanished subtree (review-0 change 2). Pure read of reducer state, on the actor.
+    public func nearestRetainedAncestor(of id: String) -> String? {
+        reducer.nearestRetainedAncestor(of: id)
+    }
+
+    /// Shared reconcile tail (deliverable 1). If the focused subtree was just pruned (its focus id or
+    /// an ancestor of it), re-root the focus at the nearest surviving ancestor, emit that scene NOW
+    /// (so `emit` builds a real frame instead of freezing on the `contains(focusId)` guard), and yield
+    /// the ancestor to `focusFallbacks` so the App re-seeds navigation — the map never points at a
+    /// ghost. Otherwise a real change just marks dirty for the group's single `liveEmit` (calm: a
+    /// mtime-only refresh marks nothing).
+    private func handleFocusFallback(orMarkDirty changed: Bool) {
+        if !reducer.contains(focusId), let anc = reducer.nearestRetainedAncestor(of: focusId) {
+            focusId = anc
+            lastQuadById.removeAll(keepingCapacity: true) // cross-focus: no same-focus settle source
+            fallbackContinuation.yield(anc)
+            dirty = true
+            emit(force: true)
+            return
+        }
+        if changed { dirty = true }
     }
 
     // MARK: - Denied-overflow disclosure (TZ-4b OPERATOR_NOTE #3.2; review-5 correction)

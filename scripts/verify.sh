@@ -120,6 +120,7 @@ swiftc \
 	-framework Metal \
 	-framework CoreGraphics \
 	-framework ImageIO \
+	-framework CoreServices \
 	-target arm64-apple-macos14
 
 echo "==> (3b) Walk a real fixture tree to completion, assert golden, render two frames + a PROMOTED-root frame (TZ-4b)"

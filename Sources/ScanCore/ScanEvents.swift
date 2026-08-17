@@ -58,12 +58,21 @@ public struct ChildStub: Equatable, Sendable {
     /// gets `isHidden` filled when the stub arrives). Additive (default `false`) so every
     /// existing `ChildStub(id:name:kind:)` call site (tests, harnesses) compiles unchanged.
     public let isHidden: Bool
+    /// The child DIRECTORY's mtime (nanoseconds since the epoch) as the parent's enumeration
+    /// observed it — the TZ-7 scan-time staleness key (`SizeTree.mtime`). Set only for directory
+    /// kinds (`.dir`/`.bundleLeaf`), `nil` for files/symlinks (never re-listed, so no revalidation
+    /// mtime is meaningful). Carried on the STUB — the same write-once channel as `name`/`kind`/
+    /// `isHidden` — so it folds order-independently: a size event that created a bare record before
+    /// its stub just gets `mtime` filled when the stub arrives. Additive (default `nil`) so every
+    /// existing `ChildStub(id:name:kind:)`/`(…isHidden:)` call site compiles unchanged.
+    public let mtime: Int64?
 
-    public init(id: String, name: String, kind: NodeKind, isHidden: Bool = false) {
+    public init(id: String, name: String, kind: NodeKind, isHidden: Bool = false, mtime: Int64? = nil) {
         self.id = id
         self.name = name
         self.kind = kind
         self.isHidden = isHidden
+        self.mtime = mtime
     }
 }
 
@@ -81,6 +90,63 @@ public enum ScanEvent: Equatable, Sendable {
     case accessDenied(nodeId: String)
     /// The subtree rooted at `nodeId` is fully scanned.
     case subtreeCompleted(nodeId: String)
+    /// TZ-7 (the living map): a child that WAS present under `parentId` is gone from disk — the
+    /// reducer PRUNES the whole subtree rooted at `childId` and RIPPLES the freed bytes up every
+    /// ancestor's retained total (so a deleted folder's tile retires without a rescan; VISION §"the
+    /// living map"). Additive vocabulary, ratified in PLAN §TZ-7. Idempotent: a `childRemoved` for
+    /// a `childId` no longer linked under `parentId` is a no-op (the edge is already gone).
+    case childRemoved(parentId: String, childId: String)
+    /// TZ-7: a directory's own modification time, learned DIRECTLY (not via a parent stub) — the
+    /// revalidation walk emits it after re-listing a directory, and it seeds the scan root's mtime
+    /// (which has no parent stub to carry it). Sets `Node.mtime`; a write of a MORE RECENT mtime is
+    /// what a subsequent revalidation compares against so an unchanged directory costs one `stat`.
+    case directoryMtime(nodeId: String, mtime: Int64)
+}
+
+/// One freshly-enumerated child of a directory being REVALIDATED (TZ-7), as a raw value crossing
+/// from the I/O layer (`ScanFS.FileSystemWalker.revalidationRead`) into the pure diff below. It is
+/// `ChildStub` PLUS the own size the enumeration already read — the reducer needs both to decide
+/// what changed. `kind` is already policy-classified by the enumerator (`.dir`/`.bundleLeaf`/
+/// `.file`; a symlink is a `.file` leaf), so the diff stays policy-agnostic.
+///
+/// ABSTRACTION LEDGER — FreshChild: a boundary DTO (raw value crossing ScanFS→ScanCore-diff).
+/// Concrete users: `FileSystemWalker.revalidationRead` (producer) + `ScanReducer.revalidationDiff`
+/// (consumer). Axis: none (a fixed value shape). Rejected simpler alternative: reuse `ChildStub` —
+/// it deliberately omits size (discovery/sizing orthogonality), which the diff needs, so a distinct
+/// DTO is the honest carrier.
+public struct FreshChild: Equatable, Sendable {
+    public let id: String
+    public let name: String
+    public let kind: NodeKind
+    public let allocated: Int64
+    public let logical: Int64
+    public let isHidden: Bool
+    public let mtime: Int64?
+    public init(id: String, name: String, kind: NodeKind, allocated: Int64, logical: Int64,
+                isHidden: Bool = false, mtime: Int64? = nil) {
+        self.id = id; self.name = name; self.kind = kind
+        self.allocated = allocated; self.logical = logical
+        self.isHidden = isHidden; self.mtime = mtime
+    }
+}
+
+/// The result of diffing a directory's retained children against a fresh listing (TZ-7). The
+/// composition layer applies `events`, launches streamed sub-scans for `newChildIds`, and re-emits
+/// only when `changed`. A struct (not a tuple) because it has three fields and two callers (pipeline
+/// + the dry reducer test).
+public struct RevalidationDiff: Equatable, Sendable {
+    /// The fold to apply: a `directoryMtime` refresh, `childRemoved` for vanished children, a
+    /// single `childrenDiscovered` for the new ones, and `sizeUpdated` for new/changed LEAVES.
+    public var events: [ScanEvent]
+    /// New child DIRECTORIES/bundles (absolute-path ids) needing a normal streamed sub-scan — their
+    /// own size + descent (dir) or recursive total (bundle) arrive via that sub-scan, not here.
+    public var newChildIds: [String]
+    /// Any structural change (a removal, addition, or leaf-size change). `false` ⇒ only the mtime was
+    /// refreshed, so the caller can apply the events (to cache the mtime) WITHOUT re-emitting a scene.
+    public var changed: Bool
+    public init(events: [ScanEvent], newChildIds: [String], changed: Bool) {
+        self.events = events; self.newChildIds = newChildIds; self.changed = changed
+    }
 }
 
 /// Pure, single-threaded fold of `ScanEvent` batches into a `SizeTree`.
@@ -142,6 +208,12 @@ public struct ScanReducer {
         /// order-independent (the reducer's defining property). The visualization
         /// "Show hidden" filter reads it during projection; `false` until the stub arrives.
         var isHidden = false
+        /// Directory mtime (nanoseconds) — the TZ-7 staleness key. `nil` until learned, then set
+        /// by the parent's stub (scan-time capture) OR by a `directoryMtime` event (revalidation /
+        /// scan-root seed). NOT order-sensitive in a way that corrupts state: whichever write lands
+        /// last wins, and revalidation always re-stats to establish truth, so a transient stale
+        /// value only ever causes one extra (idempotent) re-enumeration, never a wrong tree.
+        var mtime: Int64?
     }
 
     private var nodes: [String: Node]
@@ -149,6 +221,36 @@ public struct ScanReducer {
     /// in place (`reRoot`) — the whole node map is preserved and a new parent is
     /// grafted above the old root. Everywhere else this is written once at init.
     private var rootId: String
+
+    /// TZ-7 (OPERATOR_NOTE 2026-08-17 #2) — TOMBSTONES: the subtree ROOTS a live `childRemoved` pruned.
+    /// The reducer is "the single-threaded ordering authority"; it is where the deleted-while-subscanning
+    /// race is fixed. When a directory `D` is revalidated and a new child `C` is discovered, the App
+    /// launches an ASYNCHRONOUS streamed sub-scan of `C` (its own size + descent). If `C` (or an ancestor
+    /// of it) is then DELETED before that sub-scan drains, the sub-scan's late events (`sizeUpdated(C…)`,
+    /// `childrenDiscovered(C,…)`, …) still arrive — addressed to a node the prune already removed. Folding
+    /// them via `nodes[id] ?? Node()` would FABRICATE an ORPHAN: it never renders (no parent edge, so
+    /// `bumpSubtree` cannot reach the root and no tile is projected), but the flat scan-root accumulators
+    /// `rootAllocatedBytes`/`processedCount` — incremented on the first own-size write regardless of
+    /// linkage — would INFLATE (the reviewer's finding). So: a `childRemoved` that actually removes an edge
+    /// records the removed child id here, and `apply` DROPS any fabricating event whose target lies at or
+    /// under a tombstoned root (counting the drop in `droppedOrphanEvents`). A legitimate re-appearance — a
+    /// RETAINED parent re-linking the id via `childrenDiscovered` — CLEARS the tombstone, so a
+    /// delete+recreate re-admits the child. Empty during the initial scan (prunes are live-only), so the
+    /// reducer's order-independence property (shuffle test) is untouched: the gate is inert until a live
+    /// prune records the first tombstone.
+    ///
+    /// DEFERRED (documented tech debt): a tombstone is cleared only on re-appearance, so over a long
+    /// session `prunedRoots` grows with distinct deleted-and-never-recreated subtree roots (one string
+    /// each — bounded by real filesystem churn, not node count). Time/task-scoped eviction (drop a
+    /// tombstone once the subtree's in-flight sub-scan has provably drained) is the named extension point;
+    /// v1 keeps the simple self-healing set because correctness never depends on eviction — only memory.
+    private var prunedRoots: Set<String> = []
+
+    /// Count of events DROPPED because they addressed a pruned/unknown (tombstoned) subtree — surfaced in
+    /// TZTRACE (OPERATOR_NOTE #2: "honesty over silence"). A late sub-scan of a since-deleted child
+    /// contributes its dropped events here rather than silently inflating totals. Monotonic; 0 whenever no
+    /// live prune has orphaned any in-flight sub-scan.
+    public private(set) var droppedOrphanEvents: Int = 0
 
     /// Count of filesystem entries the walker has STAT'd so far — the numerator of the
     /// file-count progress bar (TZ-4, PLAN ratified). Incremented exactly once per node
@@ -240,15 +342,24 @@ public struct ScanReducer {
     public mutating func apply(_ event: ScanEvent) {
         switch event {
         case let .childrenDiscovered(parentId, children):
+            // TZ-7 drop (OPERATOR_NOTE #2): a discovery under a pruned/unknown (tombstoned) parent is a
+            // late sub-scan of a since-deleted subtree — DROP the whole event (never re-materialize the
+            // parent or attach orphan children) and count it. Inert during the initial scan (no tombstones).
+            if isTombstoned(parentId) { droppedOrphanEvents += 1; return }
             // Create/merge each child record first (different ids), then write the
             // parent last. name/kind come ONLY from the stub → a single write; a
             // size event that created a bare record first just gets its identity
             // filled here. Creation order is irrelevant (write-once fields).
             for stub in children {
+                // A RETAINED parent re-linking this child is a legitimate re-appearance (delete+recreate):
+                // clear any tombstone so the child's fresh sub-scan folds normally. Idempotent for a child
+                // that was never tombstoned (the common case).
+                prunedRoots.remove(stub.id)
                 var child = nodes[stub.id] ?? Node(name: stub.name)
                 child.name = stub.name
                 child.stubKind = stub.kind
                 child.isHidden = stub.isHidden // write-once from the stub (order-independent)
+                if let m = stub.mtime { child.mtime = m } // scan-time dir mtime (TZ-7); nil for leaves
                 nodes[stub.id] = child
             }
             var parent = nodes[parentId] ?? Node(name: "")
@@ -275,21 +386,27 @@ public struct ScanReducer {
             }
 
         case let .sizeUpdated(nodeId, allocated, logical):
+            // TZ-7 drop (OPERATOR_NOTE #2): an own-size for a tombstoned node is a late sub-scan of a
+            // pruned subtree. Dropping it here is THE fix for the flat-accumulator inflation — this is the
+            // one arm that would otherwise bump `rootAllocatedBytes`/`processedCount` for an orphan.
+            if isTombstoned(nodeId) { droppedOrphanEvents += 1; return }
             var node = nodes[nodeId] ?? Node(name: "")
             // Count this entry as "processed" exactly once (the first own-size write), and
             // accumulate its own size into the scan-root total on the SAME transition. The
             // walker emits one size event per stat'd node, but count/accumulate from the
             // false→true transition so both stay robust to a duplicate/replayed batch and a
             // pure function of the accumulated state.
-            if !node.hasSize {
-                processedCount += 1
-                rootAllocatedBytes += allocated
-            }
-            // The retained-total delta is the CHANGE in own size (normally 0→size on the first
-            // write; a re-stated same size is a no-op delta). Push it up the ancestor chain so
-            // every ancestor's retained subtree total stays exact.
+            if !node.hasSize { processedCount += 1 }
+            // The retained-total delta is the CHANGE in own size (first write: 0→size, so the
+            // delta equals the full size; a live re-size: old→new; a replayed same-size batch:
+            // a no-op 0). Push it up the ancestor chain AND into the scan-root accumulator —
+            // review-4 (TZ-7): the accumulator previously moved only on the FIRST write, so
+            // live re-sizes updated subtree totals while `scannedBytes`/status drifted from
+            // the truth. Delta-accumulation keeps root == Σ own sizes under first writes,
+            // live changes, replays, and prunes (prune subtracts own sizes symmetrically).
             let dAllocated = allocated - node.ownAllocated
             let dLogical = logical - node.ownLogical
+            rootAllocatedBytes += dAllocated
             node.ownAllocated = allocated
             node.ownLogical = logical
             node.hasSize = true
@@ -297,15 +414,95 @@ public struct ScanReducer {
             bumpSubtree(from: nodeId, allocated: dAllocated, logical: dLogical)
 
         case let .accessDenied(nodeId):
+            if isTombstoned(nodeId) { droppedOrphanEvents += 1; return } // late event under a pruned root
             var node = nodes[nodeId] ?? Node(name: "")
             node.denied = true
             nodes[nodeId] = node
 
         case let .subtreeCompleted(nodeId):
+            if isTombstoned(nodeId) { droppedOrphanEvents += 1; return } // late event under a pruned root
             var node = nodes[nodeId] ?? Node(name: "")
             node.completed = true
             nodes[nodeId] = node
+
+        case let .childRemoved(parentId, childId):
+            prune(parentId: parentId, childId: childId)
+
+        case let .directoryMtime(nodeId, mtime):
+            // TZ-7 drop (OPERATOR_NOTE #2 / review-1 change 1): a delayed `directoryMtime` for a
+            // tombstoned node (e.g. an ancestor prune removed it while its own read was in flight) would
+            // otherwise re-materialize an unlinked orphan via `nodes[id] ?? Node()`. Drop + count.
+            if isTombstoned(nodeId) { droppedOrphanEvents += 1; return }
+            var node = nodes[nodeId] ?? Node(name: "")
+            node.mtime = mtime
+            nodes[nodeId] = node
         }
+    }
+
+    /// Whether `id` lies at or under a pruned subtree root (TZ-7 tombstone check, OPERATOR_NOTE #2). Fast
+    /// path: no tombstones ⇒ never (so the initial scan pays nothing and stays order-independent). Else
+    /// the id itself, then each `/`-separated ANCESTOR, is checked against `prunedRoots` — O(path depth),
+    /// a small bounded constant. A pruned subtree records only its ROOT (not every descendant), so a
+    /// late `sizeUpdated` for a deep descendant of a pruned dir is caught by walking up to that root.
+    private func isTombstoned(_ id: String) -> Bool {
+        guard !prunedRoots.isEmpty else { return false }
+        if prunedRoots.contains(id) { return true }
+        var cur = id
+        while let slash = cur.lastIndex(of: "/"), slash != cur.startIndex {
+            cur = String(cur[cur.startIndex..<slash])
+            if prunedRoots.contains(cur) { return true }
+        }
+        return false
+    }
+
+    // MARK: - Prune (TZ-7 — the living map)
+
+    /// Remove `childId` (and its whole subtree) from under `parentId`, rippling the freed bytes up
+    /// every ancestor's retained total and out of the scan-root accumulators. The inverse of an edge
+    /// addition + a fold: exactly the mutations `apply` made to grow the subtree, reversed, so the
+    /// reducer's invariants (`subtree == own + Σ linked children.subtree`, `rootAllocatedBytes ==
+    /// Σ retained own sizes`, `processedCount == retained stat'd entries`) hold AFTER the prune too.
+    ///
+    /// Idempotent / honest: only prunes when the edge is actually present. A `childRemoved` for a
+    /// child not currently linked under `parentId` (a duplicate, or a race with an ancestor prune
+    /// that already took the whole subtree) removes NO edge and returns — it can neither double-
+    /// subtract nor delete an unrelated node. No cycles: a `childIds` set is a tree by filesystem
+    /// structure (ids are absolute paths), so the DFS deletion terminates.
+    private mutating func prune(parentId: String, childId: String) {
+        guard var parent = nodes[parentId], parent.childIds.remove(childId) != nil else {
+            return // edge not present — nothing to remove (idempotent)
+        }
+        nodes[parentId] = parent
+        // TOMBSTONE the removed subtree root (OPERATOR_NOTE #2): late events from an in-flight sub-scan of
+        // this now-deleted child (or its descendants) are DROPPED by `apply` until a retained parent
+        // legitimately re-links it. Only the root is recorded — `isTombstoned` catches descendants by
+        // walking up their path — so a mass delete records one id per removed edge, not one per node.
+        prunedRoots.insert(childId)
+        // Ripple the pruned child's WHOLE retained total out of the parent and every ancestor —
+        // one negative delta up the chain, the exact reverse of the edge-addition bump. (The child's
+        // own subtree total already includes its descendants, so a single delta suffices.)
+        let child = nodes[childId]
+        bumpSubtree(from: parentId,
+                    allocated: -(child?.subtreeAllocated ?? 0),
+                    logical: -(child?.subtreeLogical ?? 0))
+        // Delete the subtree node-by-node, backing out each node's own contribution to the
+        // scan-root accumulators (so "Scanned" and the processed count track the LIVE tree, the
+        // documented invariant of both — they are Σ/count over *retained* nodes).
+        removeSubtree(childId)
+    }
+
+    /// DFS-delete the subtree rooted at `id` from the node map, decrementing `rootAllocatedBytes`
+    /// and `processedCount` by each removed node's own contribution (only where it was counted — a
+    /// node whose size never arrived contributed to neither). Reads children before deleting.
+    private mutating func removeSubtree(_ id: String) {
+        guard let node = nodes[id] else { return }
+        if node.hasSize {
+            processedCount -= 1
+            rootAllocatedBytes -= node.ownAllocated
+        }
+        let children = node.childIds
+        nodes[id] = nil
+        for c in children { removeSubtree(c) }
     }
 
     // MARK: - Projection
@@ -517,7 +714,8 @@ public struct ScanReducer {
             logicalBytes: node.subtreeLogical,
             children: retained,
             scanState: outputState(node, kind: kind),
-            isHidden: node.isHidden
+            isHidden: node.isHidden,
+            mtime: node.mtime // TZ-7 staleness key; nil for leaves/until-known (root before first revalidation)
         )
     }
 
@@ -547,6 +745,163 @@ public struct ScanReducer {
     /// path returned an empty layout there and the pipeline kept the last good scene. This
     /// preserves that streaming behavior (never flash a bare fill for an unknown focus).
     public func contains(_ id: String) -> Bool { nodes[id] != nil }
+
+    /// The retained KIND of `id` (denial-aware, derived exactly as the projection does — order-
+    /// independent), or `nil` if the scan has never recorded `id`. TZ-7 (review-1 change 3): the
+    /// composition layer reads this to decide whether a flagged path is a DIRECTORY to re-enumerate
+    /// or an opaque BUNDLE LEAF to re-size — a bundle's descendants must never be exposed.
+    public func kind(of id: String) -> NodeKind? {
+        guard let n = nodes[id] else { return nil }
+        return outputKind(n)
+    }
+
+    /// The directory mtime the reducer currently holds for `id` (the staleness key), or `nil` if not
+    /// yet known. TZ-7 SERIAL CORRECTNESS (review-1 change 1): a live reconcile whose freshly-stat'd
+    /// mtime is OLDER than this is a STALE snapshot — a newer revalidation already folded the
+    /// directory's later state — and is dropped whole, so a slow read can never un-do a newer one
+    /// (e.g. a stale `childRemoved` retiring a just-recreated child). A directory's mtime rises
+    /// monotonically with every structural change to it, which is what makes the comparison sound.
+    public func mtime(of id: String) -> Int64? { nodes[id]?.mtime }
+
+    /// The retained OWN (intrinsic) size of `id`, or `nil` if unknown. TZ-7 (review-1 change 3): the
+    /// bundle re-size path compares a freshly-measured recursive total against this to stay CALM —
+    /// emit no `sizeUpdated` when the opaque total is unchanged — mirroring `revalidationDiff`'s
+    /// own-size discipline for directories.
+    public func ownSize(of id: String) -> (allocated: Int64, logical: Int64)? {
+        guard let n = nodes[id] else { return nil }
+        return (n.ownAllocated, n.ownLogical)
+    }
+
+    /// EVERY retained DIRECTORY-like node id (`.dir`/`.bundleLeaf`) in the subtree rooted at `id`,
+    /// inclusive. TZ-7 (review-1 change 4 + review-2 change 2): a `MustScanSubDirs`/dropped-events
+    /// recovery re-validates every retained directory under the flagged path (each diffed against
+    /// disk). This enumeration is now COMPLETE — the earlier `cap` truncated it, so a loss over a
+    /// subtree larger than the cap silently left retained directories un-revalidated while the status
+    /// resumed claiming full "Live" (the reviewer's 513-dir gap). The bound that keeps a huge-subtree
+    /// recovery safe now lives where it belongs — the caller's PER-DRAIN batch cap with carry-across-
+    /// drains (`ScanController.drainRecovery`), which processes this full list a bounded batch at a
+    /// time and stays `.degraded` until it is entirely drained. Producing the id list is O(subtree) in
+    /// strings only (no I/O); the I/O — the actual re-validation — is what the caller bounds per drain.
+    /// Pre-order; empty if `id` is not retained.
+    public func retainedDirIds(under id: String) -> [String] {
+        guard nodes[id] != nil else { return [] }
+        var out: [String] = []
+        var stack = [id]
+        while let cur = stack.popLast() {
+            guard let n = nodes[cur] else { continue }
+            let k = outputKind(n)
+            if k == .dir || k == .bundleLeaf { out.append(cur) }
+            stack.append(contentsOf: n.childIds)
+        }
+        return out
+    }
+
+    /// The set of `dirId`'s current child ids — what the reducer BELIEVES is in a directory. The
+    /// revalidation enumerator does not need it (the diff below reads it internally), but the FSEvents
+    /// path uses `contains` to gate; kept `internal`-free (public) only if a future caller needs it.
+    // (No standalone accessor is exported: `revalidationDiff` is the single entry that reads child state.)
+
+    // MARK: - Revalidation diff (TZ-7 — the living map)
+
+    /// Diff `dirId`'s RETAINED children against a `fresh` disk listing and produce the fold + the new
+    /// children to sub-scan. PURE over the accumulated state (dry-tested in ScanCoreTests) — the I/O
+    /// that produced `fresh` lives in ScanFS; applying the events + launching sub-scans is the
+    /// composition layer's job. This is Tier-1/Tier-2's shared core: "re-enumerate that one directory,
+    /// diff against the retained tree, emit childRemoved/childrenDiscovered/sizeUpdated accordingly"
+    /// (PLAN §TZ-7).
+    ///
+    /// - `mtime`: the directory's freshly-stat'd mtime — always refreshed (so the next revalidation
+    ///   can short-circuit on an unchanged directory).
+    /// - `ownAllocated`/`ownLogical`: the directory's OWN entry size, freshly stat'd (TZ-7 review-0
+    ///   change 5). A directory's own allocation grows/shrinks as entries are added/removed, so a
+    ///   changed directory's rectangle total would otherwise stay stale by its own-entry allocation.
+    ///   Emitted as a `sizeUpdated(dirId, …)` ONLY when it differs from the retained own size — the
+    ///   fresh value is computed the SAME way the initial scan did (`st_blocks * 512`, the
+    ///   `DirectoryReader` dir-own-size formula), so an unchanged directory yields NO event (calm).
+    /// - `complete`: whether the enumeration read the WHOLE directory. On a PARTIAL read a child
+    ///   missing from `fresh` may simply be unread, not deleted, so removals are SUPPRESSED — never
+    ///   prune on incomplete data (the invisible-space / no-silent-loss discipline, inverted: do not
+    ///   silently DROP a tile we merely failed to re-read). The own-size refresh is INDEPENDENT of
+    ///   completeness (it comes from the directory's own `lstat`), so it still applies on a partial read.
+    ///
+    /// New DIRECTORIES/bundles get a stub here (so the tile appears immediately, pending) and their
+    /// sizes arrive from the streamed sub-scan (`newChildIds`); new FILES/symlinks carry their size
+    /// inline (the enumeration already read it). An existing file whose size changed in place emits a
+    /// fresh `sizeUpdated`. Existing subdirectories are untouched — nested change is caught by THEIR
+    /// own revalidation / FSEvents flag, not by a one-level focus revalidation.
+    public func revalidationDiff(dirId: String, mtime: Int64,
+                                 ownAllocated: Int64, ownLogical: Int64,
+                                 fresh: [FreshChild], complete: Bool) -> RevalidationDiff {
+        var events: [ScanEvent] = [.directoryMtime(nodeId: dirId, mtime: mtime)]
+        var newChildIds: [String] = []
+        var newStubs: [ChildStub] = []
+        var changed = false
+
+        let node = nodes[dirId]
+        // Own-entry size refresh (review-0 change 5): emit only on a real change to the directory's
+        // own allocation, so a stale own-size does not keep a changed directory's total short, while
+        // an unchanged directory (same `st_blocks * 512`) stays calm — no event, no re-emit.
+        if node?.ownAllocated != ownAllocated || node?.ownLogical != ownLogical {
+            events.append(.sizeUpdated(nodeId: dirId, allocated: ownAllocated, logical: ownLogical))
+            changed = true
+        }
+
+        let known = node?.childIds ?? []
+        let freshIds = Set(fresh.map(\.id))
+
+        // Removals (only on a COMPLETE read — see `complete` doc).
+        if complete {
+            for kid in known where !freshIds.contains(kid) {
+                events.append(.childRemoved(parentId: dirId, childId: kid))
+                changed = true
+            }
+        }
+
+        // Additions + in-place leaf-size refresh.
+        for f in fresh {
+            let isLinked = known.contains(f.id)
+            if !isLinked {
+                newStubs.append(ChildStub(id: f.id, name: f.name, kind: f.kind,
+                                          isHidden: f.isHidden, mtime: f.mtime))
+                changed = true
+                switch f.kind {
+                case .dir, .bundleLeaf:
+                    newChildIds.append(f.id) // own size + descent (dir) / recursive total (bundle) via sub-scan
+                case .file, .denied, .pending, .synthetic:
+                    events.append(.sizeUpdated(nodeId: f.id, allocated: f.allocated, logical: f.logical))
+                }
+            } else if f.kind == .file {
+                let node = nodes[f.id]
+                if node?.ownAllocated != f.allocated || node?.ownLogical != f.logical {
+                    events.append(.sizeUpdated(nodeId: f.id, allocated: f.allocated, logical: f.logical))
+                    changed = true
+                }
+            }
+        }
+        if !newStubs.isEmpty {
+            events.append(.childrenDiscovered(parentId: dirId, children: newStubs))
+        }
+        return RevalidationDiff(events: events, newChildIds: newChildIds, changed: changed)
+    }
+
+    /// The nearest retained ANCESTOR of `id` (inclusive) — the TZ-7 focus fallback. When a prune
+    /// removes the current focus subtree, "the map never points at a ghost": the focus falls back to
+    /// the nearest surviving ancestor. PURE path logic over the id contract (`id` is an absolute
+    /// path, a descendant's id is `ancestor + "/" + name`) plus `contains`, so it holds even before a
+    /// node's stub arrives. Returns `id` itself if still retained; walks up the `/`-separated path
+    /// otherwise; `nil` only if not even the volume root survives (the scan root was deleted — the App
+    /// then has nothing to show and keeps its last scene). Used by the pipeline on the emit path.
+    public func nearestRetainedAncestor(of id: String) -> String? {
+        if nodes[id] != nil { return id }
+        var cur = id
+        while let slash = cur.lastIndex(of: "/") {
+            let parent = slash == cur.startIndex ? "/" : String(cur[cur.startIndex..<slash])
+            if nodes[parent] != nil { return parent }
+            if parent == "/" { return nil }
+            cur = parent
+        }
+        return nil
+    }
 
     /// The EXACT excluded-mass accounting for the IGNORE lens (TZ-5 deliverable 1), computed
     /// from CURRENT reducer state — the single explicit rule the App renders (review-0 change 2,

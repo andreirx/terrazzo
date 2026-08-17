@@ -264,6 +264,164 @@ public enum FileSystemWalker {
         }
     }
 
+    // MARK: - Revalidation (TZ-7 — the living map)
+
+    /// The outcome of re-reading a directory for staleness (Tier-1/Tier-2). A SUM TYPE because the
+    /// three cases demand different handling and an exhaustive `switch` at the one call site is the
+    /// deterministic list of what must be decided — never a tuple a caller could half-read.
+    public enum RevalidationRead: Sendable, Equatable {
+        /// The directory's mtime matched the `known` value — its listing is CURRENT. ONE `lstat`, no
+        /// enumeration, nothing to diff (the near-free Tier-1 fast path, PLAN §TZ-7).
+        case unchanged
+        /// The directory changed (or `known` was nil). Its fresh children, own mtime, own-entry size
+        /// (`st_blocks * 512` / `st_size` from the same `lstat` — matching the scan's dir own-size so
+        /// an unchanged directory's own size does not spuriously churn; review-0 change 5), and whether
+        /// the read was COMPLETE (a partial read must NOT drive removals — see `revalidationDiff`).
+        case changed(mtime: Int64, ownAllocated: Int64, ownLogical: Int64, fresh: [FreshChild], complete: Bool)
+        /// The directory is gone, is not a directory, or could not be opened — its own parent's
+        /// revalidation will `childRemoved` it; here there is nothing to do.
+        case unreadable
+    }
+
+    /// Re-read `dirId` (an absolute path == its node id) for TZ-7 revalidation: `lstat` its mtime and,
+    /// if it differs from `known` (or `known` is nil), enumerate it into policy-classified `FreshChild`
+    /// values the pure `ScanReducer.revalidationDiff` folds. The mtime SHORT-CIRCUIT is the near-free
+    /// Tier-1 property: an unchanged directory costs exactly one `lstat`. All syscalls stay in ScanFS
+    /// (CLAUDE.md constraint 1); the diff itself is pure and lives in ScanCore.
+    public static func revalidationRead(dirId: String, ifUnchangedFrom known: Int64?,
+                                        policy: ScanPolicy = .default) -> RevalidationRead {
+        var st = stat()
+        guard lstat(dirId, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR else { return .unreadable }
+        let m = DirectoryReader.mtimeNanos(st)
+        if let known, known == m { return .unchanged }
+        // The directory's OWN entry size, from the SAME lstat (review-0 change 5). `st_blocks * 512`
+        // is exactly the `DirectoryReader` dir-own-size formula the initial scan used, so an unchanged
+        // directory yields the identical value and the diff stays calm.
+        let ownAllocated = Int64(st.st_blocks) * 512
+        let ownLogical = Int64(st.st_size)
+        let children: [DirectoryReader.Child]
+        let complete: Bool
+        switch DirectoryReader.read(dirId) {
+        case .unreadable: return .unreadable
+        case .complete(let c): children = c; complete = true
+        case .partial(let c): children = c; complete = false
+        }
+        var fresh: [FreshChild] = []
+        fresh.reserveCapacity(children.count)
+        for child in children {
+            let cid = joinId(dirId, child.name)
+            // SAME classification the initial walk applies (symlink → leaf; `.app` dir → bundle leaf).
+            let kind: NodeKind
+            switch child.kind {
+            case .symlink, .file: kind = .file
+            case .dir: kind = policy.isBundleLeaf(name: child.name) ? .bundleLeaf : .dir
+            }
+            fresh.append(FreshChild(
+                id: cid, name: child.name, kind: kind,
+                allocated: child.allocated, logical: child.logical, isHidden: child.isHidden,
+                mtime: (kind == .dir || kind == .bundleLeaf) ? child.mtime : nil))
+        }
+        return .changed(mtime: m, ownAllocated: ownAllocated, ownLogical: ownLogical,
+                        fresh: fresh, complete: complete)
+    }
+
+    /// The outcome of re-measuring an opaque `.app` BUNDLE LEAF for a TZ-7 live update (review-1
+    /// change 3). A bundle stays a SINGLE opaque tile — its descendants are NEVER exposed — so a
+    /// change inside (or at) it refreshes only its recursive TOTAL, never a child diff. Three honest
+    /// cases, like a directory read but with no child listing.
+    public enum BundleRevalidationRead: Sendable, Equatable {
+        /// Fully re-measured: the bundle's own mtime + fresh recursive (allocated, logical) total.
+        case sized(mtime: Int64, allocated: Int64, logical: Int64)
+        /// Present but not fully readable (a directory inside is denied), OR the read was torn down —
+        /// the total is UNKNOWN, so the retained size is LEFT AS-IS (never a false shrink). The
+        /// caller skips the update. Distinct from `unreadable`: the bundle is still there.
+        case incomplete
+        /// The bundle is gone / not a directory — its parent's revalidation `childRemoved`s it.
+        case unreadable
+    }
+
+    /// Re-measure an opaque bundle leaf (`bundleId` == its path == node id) for a live update
+    /// (review-1 change 3): `lstat` its mtime, then recompute its recursive total the SAME way the
+    /// initial scan did (`bundleTotal` — sums own + descendants, emitting NO child events).
+    /// Enumerating the bundle here is how a deep change inside it is caught, but NOTHING about its
+    /// descendants crosses back into the reducer — the composition layer folds only a single
+    /// `sizeUpdated`, so the opaque-leaf contract holds. All syscalls stay in ScanFS (constraint 1).
+    /// A bundle lives on one volume by construction (the initial scan sized it within the scan root's
+    /// device), so its OWN device is the boundary — a cross-device symlink inside is not followed
+    /// (invariant 4), matching the initial `sizeBundle` measurement exactly.
+    public static func revalidationBundleRead(bundleId: String) -> BundleRevalidationRead {
+        var st = stat()
+        guard lstat(bundleId, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR else { return .unreadable }
+        let mtime = DirectoryReader.mtimeNanos(st)
+        // `bundleTotal` returns nil only on cancellation (teardown) — treat that as `incomplete` (a
+        // safe no-op), never `unreadable` (which would wrongly retire a still-present bundle).
+        guard let (a, l, fullyRead) = bundleTotal(bundleId, boundaryDevice: st.st_dev) else { return .incomplete }
+        return fullyRead ? .sized(mtime: mtime, allocated: a, logical: l) : .incomplete
+    }
+
+    /// Stream a NORMAL sub-scan of a single new child discovered by revalidation (a new directory or
+    /// bundle at a revalidated focus). Rooted at `id` (the child's node id == its path) so its
+    /// descendants share the scan-root identity prefix; the SCAN ROOT's device is derived HERE from
+    /// `scanRootPath` (the syscall stays in ScanFS — CLAUDE.md constraint 1) so the one-scan-one-device
+    /// rule (invariant 4) holds for a live-added mount too. A `.app` is sized as an opaque leaf (never
+    /// expanded); a plain directory emits its own size then descends fully. Folded into the SAME
+    /// pipeline as the primary scan (`ScenePipeline.ingest`), so a new subtree streams into the live
+    /// map exactly like first-scan data.
+    public static func scanNewChild(url: URL, id: String, scanRootPath: String,
+                                    policy: ScanPolicy = .default) -> AsyncStream<[ScanEvent]> {
+        AsyncStream { continuation in
+            let work = Task {
+                var rootStat = stat()
+                let boundaryDevice: dev_t? = stat(scanRootPath, &rootStat) == 0 ? rootStat.st_dev : nil
+                let batcher = EventBatcher { continuation.yield($0) }
+                let ticker = Task {
+                    while !Task.isCancelled {
+                        try? await Task.sleep(nanoseconds: BatchLimits.flushIntervalNanos)
+                        await batcher.flush()
+                    }
+                }
+                await walkNewChild(url: url, id: id, boundaryDevice: boundaryDevice,
+                                   policy: policy, batcher: batcher)
+                ticker.cancel()
+                await batcher.flush()
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in work.cancel() }
+        }
+    }
+
+    /// One new child: opaque-bundle sizing, cross-device boundary stub, or ordinary directory descent.
+    private static func walkNewChild(url: URL, id: String, boundaryDevice: dev_t?,
+                                     policy: ScanPolicy, batcher: EventBatcher) async {
+        if Task.isCancelled { return }
+        let path = url.path
+        let name = url.lastPathComponent
+        var st = stat()
+        let childDev: dev_t? = stat(path, &st) == 0 ? st.st_dev : nil
+        // One device (invariant 4): a child on a different device than the scan root is a boundary
+        // stub — sized by its own entry + completed, never entered (kills a live-mounted volume from
+        // double-counting into the map).
+        if let boundaryDevice, let childDev, childDev != boundaryDevice {
+            let (a, l) = measure(url)
+            await batcher.add([.sizeUpdated(nodeId: id, allocated: a, logical: l),
+                               .subtreeCompleted(nodeId: id)])
+            return
+        }
+        let dev = childDev ?? boundaryDevice
+        if policy.isBundleLeaf(name: name) {
+            // Opaque `.app`: one recursive total (bundleTotal includes own) + completed/denied.
+            await sizeBundle(path, id: id, batcher: batcher, boundaryDevice: dev)
+            return
+        }
+        // Ordinary directory: the revalidation diff emitted only its stub, so emit its OWN size here
+        // (as the parent's classify would have), then descend fully through the shared gated fan-out.
+        let (a, l) = measure(url)
+        await batcher.add([.sizeUpdated(nodeId: id, allocated: a, logical: l)])
+        let gate = SpawnGate(max: WalkTuning.maxConcurrentSpawns)
+        await walkDirectory(path, id: id, policy: policy, batcher: batcher,
+                            boundaryDevice: dev, depth: 0, gate: gate)
+    }
+
     /// ANTICIPATORY ROOT SCAN (PLAN §TZ-6 deliverable 5). Warm the scan root's VOLUME
     /// metadata cache — every directory EXCEPT the active scan root's subtree — at the
     /// `priority` QoS (default `defaultAnticipatoryPriority`), so a later zoom-out promotion
@@ -439,6 +597,11 @@ public enum FileSystemWalker {
         // scan is unaffected — every descendant shares this device, so nothing is excluded.
         var rootStat = stat()
         let rootDev: dev_t? = stat(root.path, &rootStat) == 0 ? rootStat.st_dev : nil
+        // TZ-7 review-0 change 1: capture the SCAN ROOT's mtime at scan time. The root has no parent
+        // stub to carry its mtime (unlike every descendant dir, sized by `classifyChildren`), so it
+        // would project as `nil` and its FIRST Tier-1 revalidation would re-enumerate instead of taking
+        // the one-`stat` unchanged fast path. Seed it here from the same `stat` used for the device.
+        let rootMtime: Int64? = rootDev != nil ? DirectoryReader.mtimeNanos(rootStat) : nil
         let (a, l) = measure(root)
 
         guard let classified = classifyChildren(of: root, parentId: rootId, policy: policy,
@@ -452,6 +615,7 @@ public enum FileSystemWalker {
         // the unread remainder renders "we don't know", never a silent omission (finding 1).
         var batch: [ScanEvent] = [.sizeUpdated(nodeId: rootId, allocated: a, logical: l),
                                   .childrenDiscovered(parentId: rootId, children: classified.stubs)]
+        if let m = rootMtime { batch.append(.directoryMtime(nodeId: rootId, mtime: m)) }
         batch.append(contentsOf: classified.sizeEvents)
         if classified.incomplete { batch.append(.accessDenied(nodeId: rootId)) }
         await batcher.add(batch)
@@ -481,6 +645,10 @@ public enum FileSystemWalker {
 
         var rootStat = stat()
         let rootDev: dev_t? = stat(root.path, &rootStat) == 0 ? rootStat.st_dev : nil
+        // TZ-7 review-0 change 1: seed the PROMOTED root's mtime too (same reasoning as `walkRoot` —
+        // the new root has no parent stub, so its focus revalidation needs a scan-time mtime to
+        // short-circuit). The grafted child keeps its own (already-captured) mtimes.
+        let rootMtime: Int64? = rootDev != nil ? DirectoryReader.mtimeNanos(rootStat) : nil
 
         guard let classified = classifyChildren(of: root, parentId: newRootId, policy: policy,
                                                 boundaryDevice: rootDev, excluding: excluded) else {
@@ -492,6 +660,7 @@ public enum FileSystemWalker {
         // included); truncation rides its own `accessDenied` in the same batch (finding 1).
         var batch: [ScanEvent] = [.sizeUpdated(nodeId: newRootId, allocated: a, logical: l),
                                   .childrenDiscovered(parentId: newRootId, children: classified.stubs)]
+        if let m = rootMtime { batch.append(.directoryMtime(nodeId: newRootId, mtime: m)) }
         batch.append(contentsOf: classified.sizeEvents)
         if classified.incomplete { batch.append(.accessDenied(nodeId: newRootId)) }
         await batcher.add(batch)
@@ -690,7 +859,10 @@ public enum FileSystemWalker {
             let cid = Self.joinId(parentId, name)
             let childPath = dirPath.hasSuffix("/") ? dirPath + name : dirPath + "/" + name
 
-            // GRAFT REFERENCE (invariant 5): the already-scanned child — a stub only.
+            // GRAFT REFERENCE (invariant 5): the already-scanned child — a stub only. It carries NO
+            // mtime (like it carries no size): the graft preserves the existing subtree's reducer
+            // state EXACTLY ("nothing re-counted"), and a mtime write is state the grafted node did
+            // not have. A later revalidation of that child establishes its mtime via directoryMtime.
             if let excluding, cid == excluding {
                 out.stubs.append(ChildStub(id: cid, name: name, kind: .dir, isHidden: child.isHidden))
                 continue
@@ -706,17 +878,17 @@ public enum FileSystemWalker {
                 if let boundaryDevice, child.device != boundaryDevice {
                     // One device (invariant 4): a cross-device dir is a boundary stub —
                     // shown + sized + completed, but NEVER entered.
-                    out.stubs.append(ChildStub(id: cid, name: name, kind: .dir, isHidden: child.isHidden))
+                    out.stubs.append(ChildStub(id: cid, name: name, kind: .dir, isHidden: child.isHidden, mtime: child.mtime))
                     out.sizeEvents.append(.sizeUpdated(nodeId: cid, allocated: child.allocated, logical: child.logical))
                     out.sizeEvents.append(.subtreeCompleted(nodeId: cid))
                 } else if policy.isBundleLeaf(name: name) {
                     // Opaque leaf. Its stub appears NOW (rendered pending); its recursive
                     // sizing is DEFERRED to `sizeBundle`. No size event here — the bundle
                     // carries exactly one, delivered later.
-                    out.stubs.append(ChildStub(id: cid, name: name, kind: .bundleLeaf, isHidden: child.isHidden))
+                    out.stubs.append(ChildStub(id: cid, name: name, kind: .bundleLeaf, isHidden: child.isHidden, mtime: child.mtime))
                     out.bundlesToSize.append((childPath, cid))
                 } else {
-                    out.stubs.append(ChildStub(id: cid, name: name, kind: .dir, isHidden: child.isHidden))
+                    out.stubs.append(ChildStub(id: cid, name: name, kind: .dir, isHidden: child.isHidden, mtime: child.mtime))
                     out.sizeEvents.append(.sizeUpdated(nodeId: cid, allocated: child.allocated, logical: child.logical))
                     out.dirsToRecurse.append((childPath, cid))
                 }

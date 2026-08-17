@@ -946,4 +946,198 @@ final class ScenePipelineTests: XCTestCase {
         XCTAssertEqual(afterParent?.ignoredBytes, 400,
                        "ancestor+descendant excluded together = the ancestor's subtree ONCE (union, not 700)")
     }
+
+    // MARK: - TZ-7 live updates (atomic reconcile → fold + focus fallback; review-1 change 1)
+
+    /// A revalidation reconciled ATOMICALLY on the actor (diff-and-apply in one isolated step) retires
+    /// a deleted child's tile in the NEXT scene, no rescan. Pins that `reconcile` folds the change and
+    /// `liveEmit` presents it once for the group (the storm-safe emit).
+    func testLiveReconcileRetiresTileWithoutRescan() async {
+        let root = "/r"
+        let pipe = ScenePipeline(rootId: root, rootName: "r")
+        await pipe.setViewport(viewport)
+        let (stream, cont) = AsyncStream<[ScanEvent]>.makeStream(bufferingPolicy: .unbounded)
+        let ingestTask = Task { await pipe.ingest(stream) }
+        cont.yield([
+            .sizeUpdated(nodeId: root, allocated: 0, logical: 0),
+            .directoryMtime(nodeId: root, mtime: 100),
+            .childrenDiscovered(parentId: root, children: [
+                ChildStub(id: "\(root)/a", name: "a", kind: .dir, mtime: 10),
+                ChildStub(id: "\(root)/b", name: "b", kind: .dir, mtime: 20)]),
+            .sizeUpdated(nodeId: "\(root)/a", allocated: 4096, logical: 100),
+            .sizeUpdated(nodeId: "\(root)/b", allocated: 4096, logical: 100),
+            .childrenDiscovered(parentId: "\(root)/a", children: [ChildStub(id: "\(root)/a/f", name: "f", kind: .file)]),
+            .sizeUpdated(nodeId: "\(root)/a/f", allocated: 500_000, logical: 500_000),
+            .subtreeCompleted(nodeId: root),
+        ])
+        cont.finish()
+        await ingestTask.value
+
+        // Re-list /r as containing ONLY b (a deleted). `reconcile` computes the childRemoved AND folds
+        // it in one atomic actor step (no stale-snapshot gap), returning the new children to sub-scan.
+        let fresh = [FreshChild(id: "\(root)/b", name: "b", kind: .dir, allocated: 4096, logical: 100, mtime: 20)]
+        let newChildIds = await pipe.reconcile(dirId: root, readMtime: 200, ownAllocated: 0, ownLogical: 0,
+                                               fresh: fresh, complete: true)
+        XCTAssertTrue(newChildIds.isEmpty, "no new directories to sub-scan")
+        await pipe.liveEmit()
+
+        var scene: RenderScene?
+        for await s in pipe.scenes { scene = s; break }
+        guard let scene else { return XCTFail("no scene after the live reconcile was folded") }
+        XCTAssertEqual(scene.focusId, root)
+        XCTAssertEqual(scene.tree.children.map(\.name), ["b"], "the deleted child's tile retired without a rescan")
+    }
+
+    /// When a live prune removes the FOCUSED subtree, `reconcile` re-roots the focus at the nearest
+    /// surviving ancestor, EMITS that ancestor's scene immediately, and SIGNALS the ancestor on
+    /// `focusFallbacks` — the App re-seeds navigation (the map never points at a ghost).
+    func testLiveFocusFallbackReRootsAndSignals() async {
+        let root = "/r"
+        let pipe = ScenePipeline(rootId: root, rootName: "r")
+        await pipe.setViewport(viewport)
+        let (stream, cont) = AsyncStream<[ScanEvent]>.makeStream(bufferingPolicy: .unbounded)
+        let ingestTask = Task { await pipe.ingest(stream) }
+        cont.yield([
+            .sizeUpdated(nodeId: root, allocated: 0, logical: 0),
+            .directoryMtime(nodeId: root, mtime: 100),
+            .childrenDiscovered(parentId: root, children: [
+                ChildStub(id: "\(root)/a", name: "a", kind: .dir, mtime: 10),
+                ChildStub(id: "\(root)/c", name: "c", kind: .dir, mtime: 30)]),
+            .sizeUpdated(nodeId: "\(root)/a", allocated: 4096, logical: 100),
+            .sizeUpdated(nodeId: "\(root)/c", allocated: 4096, logical: 100),
+            .childrenDiscovered(parentId: "\(root)/a", children: [ChildStub(id: "\(root)/a/b", name: "b", kind: .dir, mtime: 40)]),
+            .sizeUpdated(nodeId: "\(root)/a/b", allocated: 200_000, logical: 200_000),
+            .subtreeCompleted(nodeId: root),
+        ])
+        cont.finish()
+        await ingestTask.value
+
+        // Dive the focus into /r/a/b, then delete its ancestor a on disk.
+        await pipe.setFocus("\(root)/a/b")
+        var fbIt = pipe.focusFallbacks.makeAsyncIterator()
+
+        let fresh = [FreshChild(id: "\(root)/c", name: "c", kind: .dir, allocated: 4096, logical: 100, mtime: 30)]
+        _ = await pipe.reconcile(dirId: root, readMtime: 200, ownAllocated: 0, ownLogical: 0,
+                                 fresh: fresh, complete: true)
+
+        let fellBackTo = await fbIt.next()
+        XCTAssertEqual(fellBackTo, root, "the pruned focus falls back to the nearest surviving ancestor")
+        var scene: RenderScene?
+        for await s in pipe.scenes { scene = s; break }
+        XCTAssertEqual(scene?.focusId, root, "and a real scene is emitted at the ancestor — no frozen ghost")
+        XCTAssertFalse(scene?.tree.children.contains { $0.name == "a" } ?? true, "the deleted branch is gone")
+    }
+
+    // MARK: - TZ-7 serial correctness (review-1 change 1): stale reads + ancestor-prune orphans
+
+    /// The reconciliation-serialization guarantee the reviewer required. Two interleavings that the old
+    /// diff-then-batched-apply split corrupted, now provably safe because `reconcile` diffs-and-applies
+    /// atomically with a CONTAINS guard (no orphan) and a STALE-MTIME guard (a slow read cannot un-do a
+    /// newer one):
+    ///   (A) DELETE/RECREATE: a stale read (older dir-mtime) seeing a child ABSENT, applied AFTER a
+    ///       newer read saw it present, must NOT retire the just-recreated child.
+    ///   (B) ANCESTOR-PRUNE vs CHILD-UPDATE: after an ancestor prune removed a child subtree, a
+    ///       late reconcile of the pruned child must NOT re-materialize an orphan node.
+    /// Asserted via the emitted scene (totals/children) and `revalidationTarget` (no orphan record).
+    func testLiveReconcileSerialCorrectnessUnderStaleAndAncestorPrune() async {
+        let root = "/r"
+        let pipe = ScenePipeline(rootId: root, rootName: "r")
+        await pipe.setViewport(viewport)
+        let (stream, cont) = AsyncStream<[ScanEvent]>.makeStream(bufferingPolicy: .unbounded)
+        let ingestTask = Task { await pipe.ingest(stream) }
+        cont.yield([
+            .sizeUpdated(nodeId: root, allocated: 0, logical: 0),
+            .directoryMtime(nodeId: root, mtime: 50),
+            .childrenDiscovered(parentId: root, children: [
+                ChildStub(id: "\(root)/a", name: "a", kind: .dir, mtime: 10),
+                ChildStub(id: "\(root)/k", name: "k", kind: .file)]),
+            .sizeUpdated(nodeId: "\(root)/a", allocated: 4096, logical: 100),
+            .sizeUpdated(nodeId: "\(root)/k", allocated: 7, logical: 7),
+            .childrenDiscovered(parentId: "\(root)/a", children: [ChildStub(id: "\(root)/a/b", name: "b", kind: .dir, mtime: 20)]),
+            .sizeUpdated(nodeId: "\(root)/a/b", allocated: 30_000, logical: 30_000),
+            .subtreeCompleted(nodeId: root),
+        ])
+        cont.finish()
+        await ingestTask.value
+
+        // (A) A NEWER read (mtime 200) sees `a` present → records mtime 200. Then a STALE read (mtime
+        // 100 < 200) sees `a` ABSENT → must be DROPPED WHOLE, so `a` survives (no ghost).
+        let presentA = [FreshChild(id: "\(root)/a", name: "a", kind: .dir, allocated: 4096, logical: 100, mtime: 200),
+                        FreshChild(id: "\(root)/k", name: "k", kind: .file, allocated: 7, logical: 7)]
+        _ = await pipe.reconcile(dirId: root, readMtime: 200, ownAllocated: 0, ownLogical: 0,
+                                 fresh: presentA, complete: true)
+        _ = await pipe.reconcile(dirId: root, readMtime: 100, ownAllocated: 0, ownLogical: 0,
+                                 fresh: [FreshChild(id: "\(root)/k", name: "k", kind: .file, allocated: 7, logical: 7)],
+                                 complete: true) // STALE: claims `a` deleted — must be ignored
+        await pipe.liveEmit()
+        var afterStale: RenderScene?
+        for await s in pipe.scenes { afterStale = s; break }
+        XCTAssertEqual(afterStale?.tree.children.map(\.name).sorted(), ["a", "k"],
+                       "a stale read (older mtime) cannot retire a child a newer read kept — no ghost")
+
+        // (B) A NEWER read (mtime 300) sees `a` DELETED → prunes a and its child b (correct removal).
+        _ = await pipe.reconcile(dirId: root, readMtime: 300, ownAllocated: 0, ownLogical: 0,
+                                 fresh: [FreshChild(id: "\(root)/k", name: "k", kind: .file, allocated: 7, logical: 7)],
+                                 complete: true)
+        // A LATE reconcile of the now-pruned child `a` (as if its own in-flight read landed after the
+        // ancestor prune) must NOT re-materialize an orphan node.
+        _ = await pipe.reconcile(dirId: "\(root)/a", readMtime: 250, ownAllocated: 4096, ownLogical: 100,
+                                 fresh: [FreshChild(id: "\(root)/a/b", name: "b", kind: .dir, allocated: 4096, logical: 100, mtime: 20)],
+                                 complete: true)
+        await pipe.liveEmit()
+        var afterPrune: RenderScene?
+        for await s in pipe.scenes { afterPrune = s; break }
+        XCTAssertEqual(afterPrune?.tree.children.map(\.name), ["k"], "the pruned subtree is gone, totals ripple down")
+        XCTAssertEqual(afterPrune?.scannedBytes, 7, "Scanned total tracks the live tree (only k's 7 bytes remain)")
+        // No orphan node was created for the pruned child: it is not retained, and its nearest
+        // retained ancestor is the root (the reducer never re-added it via the late reconcile).
+        let target = await pipe.revalidationTarget(for: "\(root)/a")
+        XCTAssertEqual(target, .skip, "the pruned child is not re-materialized as an orphan record")
+        let anc = await pipe.nearestRetainedAncestor(of: "\(root)/a")
+        XCTAssertEqual(anc, root, "the pruned child's nearest surviving ancestor is the root — no ghost node")
+    }
+
+    // MARK: - TZ-7 opaque bundle semantics on live update (review-1 change 3)
+
+    /// A flagged path AT or INSIDE a `.app` bundle leaf must resolve to the OPAQUE LEAF and re-size it
+    /// WITHOUT exposing its descendants (the established bundle contract). Pins `revalidationTarget`'s
+    /// resolution (at-bundle, inside-bundle, plain-directory) and `reconcileBundle`'s opaque re-size.
+    func testFlaggedBundlePathResolvesToOpaqueLeafAndResizes() async {
+        let root = "/r"
+        let pipe = ScenePipeline(rootId: root, rootName: "r")
+        await pipe.setViewport(viewport)
+        let (stream, cont) = AsyncStream<[ScanEvent]>.makeStream(bufferingPolicy: .unbounded)
+        let ingestTask = Task { await pipe.ingest(stream) }
+        cont.yield([
+            .sizeUpdated(nodeId: root, allocated: 0, logical: 0),
+            .directoryMtime(nodeId: root, mtime: 50),
+            .childrenDiscovered(parentId: root, children: [
+                ChildStub(id: "\(root)/App.app", name: "App.app", kind: .bundleLeaf, mtime: 5),
+                ChildStub(id: "\(root)/plain", name: "plain", kind: .dir, mtime: 6)]),
+            .sizeUpdated(nodeId: "\(root)/App.app", allocated: 1_000_000, logical: 1_000_000),
+            .sizeUpdated(nodeId: "\(root)/plain", allocated: 100, logical: 100),
+            .subtreeCompleted(nodeId: root),
+        ])
+        cont.finish()
+        await ingestTask.value
+
+        let appId = "\(root)/App.app"
+        let atBundle = await pipe.revalidationTarget(for: appId)
+        XCTAssertEqual(atBundle, .bundle(appId), "a flag AT the bundle resolves to the opaque leaf")
+        let insideBundle = await pipe.revalidationTarget(for: "\(appId)/Contents/MacOS")
+        XCTAssertEqual(insideBundle, .bundle(appId), "a flag INSIDE the bundle resolves to the opaque leaf, not a descendant")
+        let atDir = await pipe.revalidationTarget(for: "\(root)/plain")
+        XCTAssertEqual(atDir, .directory("\(root)/plain"), "a plain directory re-enumerates")
+
+        // Opaque re-size: the total grows; descendants are NEVER exposed.
+        await pipe.reconcileBundle(bundleId: appId, readMtime: 60, allocated: 5_000_000, logical: 5_000_000)
+        await pipe.liveEmit()
+        var scene: RenderScene?
+        for await s in pipe.scenes { scene = s; break }
+        guard let scene else { return XCTFail("no scene after the bundle re-size") }
+        let appNode = scene.tree.children.first { $0.id == appId }
+        XCTAssertEqual(appNode?.kind, .bundleLeaf)
+        XCTAssertTrue(appNode?.children.isEmpty ?? false, "the bundle stays an opaque leaf — no descendants exposed")
+        XCTAssertEqual(appNode?.allocatedBytes, 5_000_000, "the opaque recursive total refreshed on the live update")
+    }
 }

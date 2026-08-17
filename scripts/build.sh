@@ -39,6 +39,7 @@ swiftc \
 	-framework MetalKit \
 	-framework QuartzCore \
 	-framework CoreGraphics \
+	-framework CoreServices \
 	-target arm64-apple-macos14
 
 echo "==> Copy Info.plist"

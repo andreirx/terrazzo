@@ -558,4 +558,34 @@ final class ScanReducerTests: XCTestCase {
         XCTAssertLessThan(tree.nodeCount, r.makeTree(focusId: "/r").nodeCount,
                           "area-bounded projection materializes fewer nodes than the full window")
     }
+    /// Review-4 (TZ-7) regression: the scan-root accumulator must track LIVE re-sizes,
+    /// not only each node's first own-size write. Before the fix, a file growing from
+    /// 100 -> 250 updated ancestor subtree totals but left rootAllocatedBytes at the
+    /// first-write value — scannedBytes/status drifted from the truth in the living map.
+    func testRootAllocatedTracksLiveResizeAndReplayAndPrune() {
+        var r = ScanReducer(rootId: "/r", rootName: "r")
+        r.apply([
+            .sizeUpdated(nodeId: "/r", allocated: 10, logical: 10),
+            .childrenDiscovered(parentId: "/r", children: [
+                ChildStub(id: "/r/f", name: "f", kind: .file),
+                ChildStub(id: "/r/d", name: "d", kind: .dir),
+            ]),
+            .sizeUpdated(nodeId: "/r/f", allocated: 100, logical: 100),
+            .sizeUpdated(nodeId: "/r/d", allocated: 5, logical: 5),
+        ])
+        XCTAssertEqual(r.rootAllocatedBytes, 115, "first writes accumulate")
+        // Live re-size: the whole point of TZ-7.
+        r.apply([.sizeUpdated(nodeId: "/r/f", allocated: 250, logical: 250)])
+        XCTAssertEqual(r.rootAllocatedBytes, 265, "re-size moves the root accumulator by the delta")
+        // Replayed same-size batch: a no-op delta, robust to duplicates.
+        r.apply([.sizeUpdated(nodeId: "/r/f", allocated: 250, logical: 250)])
+        XCTAssertEqual(r.rootAllocatedBytes, 265, "replay is a no-op")
+        // Shrink is a negative delta.
+        r.apply([.sizeUpdated(nodeId: "/r/f", allocated: 50, logical: 50)])
+        XCTAssertEqual(r.rootAllocatedBytes, 65, "shrink subtracts")
+        // Prune stays symmetric with the accumulator.
+        r.apply([.childRemoved(parentId: "/r", childId: "/r/f")])
+        XCTAssertEqual(r.rootAllocatedBytes, 15, "prune removes the pruned own sizes exactly")
+    }
+
 }

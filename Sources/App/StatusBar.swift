@@ -32,6 +32,20 @@
 
 import AppKit
 
+/// The live-monitoring capability the status strip reports (TZ-7 deliverable 5, review-1 change 4).
+/// A SUM TYPE, not a bool, because "recovering" is a distinct third state the reviewer requires be
+/// stated honestly: after a kernel event LOSS a one-level check cannot be trusted, so the map is
+/// re-scanning the affected subtrees and SAYS so until it catches up — never silently "Live".
+enum LiveStatus: Equatable {
+    /// FSEvents stream up; the map updates from kernel notifications with no rescan.
+    case live
+    /// FSEvents stream up but recovering from a dropped-events burst (`MustScanSubDirs`/overflow):
+    /// affected subtrees are being re-validated; some tiles may lag until it finishes.
+    case degraded
+    /// FSEvents stream unavailable — Tier-1 only (focus/idle mtime checks). Rescan for a full refresh.
+    case off
+}
+
 /// The values the status strip renders. Plain value type; `volume` is nil until
 /// the probe returns (or if it failed — surfaced as "—", not faked).
 struct ScanStatus {
@@ -61,6 +75,11 @@ struct ScanStatus {
     /// Drives the "hidden filtered · X GB" field, shown only when non-zero (show-hidden off AND
     /// hidden mass in view). Default 0 keeps pre-TZ-5 call sites compiling.
     var hiddenFilteredBytes: Int64 = 0
+    /// TZ-7 deliverable 5: the live change-monitoring capability (`.live`/`.degraded`/`.off`). Drives
+    /// the subtle "Live" indicator; a `.degraded` (recovering from an event loss) or `.off` (stream
+    /// unavailable, Tier-1 only) state is STATED in the field/tooltip — never a silent drop or a false
+    /// "Live" claim (review-1 change 4). Default `.live` keeps pre-TZ-7 call sites compiling.
+    var live: LiveStatus = .live
 
     /// The file-count progress derived from this status (TZ-4). The ControlBar renders
     /// its clamped fraction + ETA (volume-root scan) or files/sec + count (subtree scan);
@@ -98,9 +117,8 @@ final class StatusBar: NSView {
     /// subset; extra labels hide.
     private var fieldLabels: [NSTextField] = []
     /// Up to: Capacity/Free/Reclaimable/Available up to/Scanned/Unaccounted (6) + Ignored +
-    /// Hidden-filtered + below-pixel + Scale + scan-indicator (5) = 11 (TZ-5 added the last 3
-    /// visualization-lens fields to the TZ-4 set).
-    private static let maxFields = 11
+    /// Hidden-filtered + below-pixel + Scale + scan-indicator (5) + Live (1, TZ-7) = 12.
+    private static let maxFields = 12
 
     /// IGNORE accounting (TZ-5 deliverable 1) — the count of ignored tiles + the EXCLUDED UNION
     /// mass, pushed by NavigationController. The count is App-owned (the ignore set it holds); the
@@ -416,6 +434,32 @@ final class StatusBar: NSView {
             tooltip: s.running ? "A scan is in progress; sizes are still growing."
                                : "The scan has finished; sizes are final for this run.",
             importance: .essential)) // the running/complete state must never be clipped off
+        // LIVE indicator (TZ-7 deliverable 5) — a subtle marker that the FSEvents change stream is
+        // active, so deletions/additions retire or add tiles WITHOUT a rescan. If the stream could not
+        // be created the map degrades to Tier-1 (focus/idle mtime checks); that degradation is stated
+        // in the tooltip HERE (never a silent drop — the invisible-space principle applied to
+        // capability honesty). Kept subtle (`.normal`) so it yields before the essentials on a narrow
+        // strip; at normal widths it is always readable.
+        switch s.live {
+        case .live:
+            out.append(VolumeField(
+                value: "◉ Live",
+                tooltip: "The map is watching the filesystem: deletions, additions, and changes update tiles automatically (FSEvents), no rescan needed.",
+                importance: .normal))
+        case .degraded:
+            // review-1 change 4: a kernel event loss (MustScanSubDirs / dropped queue) means a
+            // one-level check cannot be trusted; the map is re-validating the affected subtrees. Say
+            // so — never keep claiming full "Live" while recovering.
+            out.append(VolumeField(
+                value: "◉ Live · recovering",
+                tooltip: "A burst of filesystem changes overflowed the live event stream, so some events were dropped. Terrazzo is re-scanning the affected folders to catch up; a few tiles may lag until it finishes. If something still looks stale, use Rescan.",
+                importance: .normal))
+        case .off:
+            out.append(VolumeField(
+                value: "Live off",
+                tooltip: "Live file-change monitoring (FSEvents) is unavailable, so the map refreshes only when you change focus or reactivate the app (Tier-1 mtime checks). Use Rescan for a full refresh.",
+                importance: .normal))
+        }
         return out
     }
 }

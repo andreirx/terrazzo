@@ -98,6 +98,18 @@ public struct SizeTree: Codable, Equatable, Sendable, Identifiable {
     /// not-yet-expanded `pending`).
     public let children: [SizeTree]
     public let scanState: ScanState
+    /// The directory's modification time (nanoseconds since the epoch) captured AT SCAN TIME —
+    /// the near-free staleness key for TZ-7 Tier-1 revalidation. Present only for directory nodes
+    /// whose mtime a parent enumeration observed (via `ChildStub.mtime`) or a revalidation set
+    /// (via `ScanEvent.directoryMtime`); `nil` for files, symlinks, and any directory whose mtime
+    /// is not yet known (notably the scan root before its first revalidation — a `nil` here just
+    /// means "no cheap comparison possible, always re-enumerate", never a fabricated value). A
+    /// directory listing is CURRENT iff a fresh `stat` of the directory yields this same mtime; a
+    /// change means an entry was added/removed/renamed there and the directory must be re-listed
+    /// and diffed. Additive DTO field (default `nil`) — pre-TZ-7 fixtures/JSON and every existing
+    /// call site are source- and JSON-compatible (see `init(from:)`). Never used for layout; the
+    /// App reads only the FOCUS node's value off the focus-rooted projection root (O(1), on main).
+    public let mtime: Int64?
     /// Whether the walker judged this node HIDDEN at scan time (TZ-5 deliverable 3;
     /// PLAN "requires an `isHidden` flag on SizeTree nodes captured by the walker").
     /// The RULE (see `DirectoryReader`/`FileSystemWalker`): a leading-dot name OR the
@@ -118,7 +130,8 @@ public struct SizeTree: Codable, Equatable, Sendable, Identifiable {
         logicalBytes: Int64,
         children: [SizeTree] = [],
         scanState: ScanState = .complete,
-        isHidden: Bool = false
+        isHidden: Bool = false,
+        mtime: Int64? = nil
     ) {
         self.id = id
         self.name = name
@@ -128,10 +141,11 @@ public struct SizeTree: Codable, Equatable, Sendable, Identifiable {
         self.children = children
         self.scanState = scanState
         self.isHidden = isHidden
+        self.mtime = mtime
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, kind, allocatedBytes, logicalBytes, children, scanState, isHidden
+        case id, name, kind, allocatedBytes, logicalBytes, children, scanState, isHidden, mtime
     }
 
     /// Custom decoder so `isHidden` (added in TZ-5) is BACKWARD-COMPATIBLE with the
@@ -150,6 +164,7 @@ public struct SizeTree: Codable, Equatable, Sendable, Identifiable {
         self.children = try c.decodeIfPresent([SizeTree].self, forKey: .children) ?? []
         self.scanState = try c.decodeIfPresent(ScanState.self, forKey: .scanState) ?? .complete
         self.isHidden = try c.decodeIfPresent(Bool.self, forKey: .isHidden) ?? false
+        self.mtime = try c.decodeIfPresent(Int64.self, forKey: .mtime) // nil when absent (pre-TZ-7)
     }
 }
 

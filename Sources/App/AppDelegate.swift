@@ -136,6 +136,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         )
         navigation.scanController = controller
+        // TZ-7: a live update that prunes the focused subtree re-seeds navigation to the surviving
+        // ancestor (the map never points at a ghost). Main-assembly late binding, like onScene.
+        controller.onFocusFallback = { [weak navigation] ancestorId in
+            navigation?.focusFellBack(to: ancestorId)
+        }
         controller.start()
         // The pipeline cannot lay out until it knows the viewport. The initial
         // viewport-change (viewDidMoveToWindow) fired BEFORE `scanController` was
@@ -185,6 +190,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    /// TZ-7 Tier-1 trigger: reactivating the app revalidates the current focus (one `stat` if its
+    /// mtime is unchanged) — so a folder deleted while Terrazzo was in the background retires its tile
+    /// the moment you return. Fires on launch too (harmless: `controller` may be nil, and a
+    /// just-scanned focus's mtime matches → the fast path returns immediately).
+    func applicationDidBecomeActive(_ notification: Notification) {
+        controller?.revalidateFocus()
+    }
 
     func applicationWillTerminate(_ notification: Notification) {
         controller?.cancel()

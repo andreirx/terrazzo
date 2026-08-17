@@ -72,6 +72,10 @@ final class RootPromotionWalkTests: XCTestCase {
         case let .sizeUpdated(nodeId, _, _): return [nodeId]
         case let .accessDenied(nodeId): return [nodeId]
         case let .subtreeCompleted(nodeId): return [nodeId]
+        // TZ-7 additive vocabulary — the walker's promotion path never emits these (they are the
+        // living-map revalidation events), so they name no ids for this graft assertion.
+        case let .childRemoved(parentId, childId): return [parentId, childId]
+        case let .directoryMtime(nodeId, _): return [nodeId]
         }
     }
 
