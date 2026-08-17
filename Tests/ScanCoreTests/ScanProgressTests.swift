@@ -124,4 +124,48 @@ final class ScanProgressTests: XCTestCase {
         XCTAssertFalse(p.isVolumeRoot)
         XCTAssertNil(p.fraction)
     }
+
+    // MARK: 7. ETA SANITY — adversarial inputs (OPERATOR_NOTE 2026-08-17 B)
+    //
+    // The field bug ("~1931379388h 44m left" during a rescan): the ETA rendered an absurd
+    // duration. These pin that no adversarial input can yield a negative or absurd ETA — the
+    // pure type returns nil (the App then shows "—"/"estimating…"), never a fabricated number.
+
+    func testEtaCeilingSuppressesAbsurdExtrapolation() {
+        // A tiny early rate over the huge volume-wide denominator: raw remaining/rate is ~5e9 s
+        // (≈ 1.6M hours) — exactly the shape of the field "1931379388h". The ceiling declines it.
+        let p = ScanProgress(filesProcessed: 1, usedInodes: 5_000_000, running: true, isVolumeRoot: true)
+        let raw = Double(p.remainingInodes!) / 0.001 // what the un-clamped formula would give
+        XCTAssertGreaterThan(raw, ScanProgress.etaCeilingSeconds, "precondition: this input IS absurd")
+        XCTAssertNil(p.etaSeconds(filesPerSecond: 0.001),
+                     "an ETA beyond the 99h ceiling is not credible — return nil, never render it")
+    }
+
+    func testEtaBoundaryAroundCeiling() {
+        // remaining chosen so that at 1 file/sec the ETA equals the ceiling exactly (accepted),
+        // and one second more of work is declined — the boundary is inclusive of the ceiling.
+        let atCeiling = ScanProgress(filesProcessed: 0, usedInodes: Int64(ScanProgress.etaCeilingSeconds),
+                                     running: true, isVolumeRoot: true)
+        XCTAssertEqual(atCeiling.etaSeconds(filesPerSecond: 1.0)!, ScanProgress.etaCeilingSeconds, accuracy: 1e-6,
+                       "an ETA exactly at the ceiling is still shown")
+        let overCeiling = ScanProgress(filesProcessed: 0, usedInodes: Int64(ScanProgress.etaCeilingSeconds) + 1,
+                                       running: true, isVolumeRoot: true)
+        XCTAssertNil(overCeiling.etaSeconds(filesPerSecond: 1.0), "one second past the ceiling is declined")
+    }
+
+    func testEtaNilWhenProcessedExceedsDenominator() {
+        // The suspected field root cause: rescan processed-count vs a stale/smaller volume-wide
+        // denominator. remaining clamps to 0, so there is no ETA (never a negative/absurd number).
+        let p = ScanProgress(filesProcessed: 6_000_000, usedInodes: 5_000_000, running: true, isVolumeRoot: true)
+        XCTAssertEqual(p.remainingInodes, 0, "processed > denominator clamps remaining to 0, not negative")
+        XCTAssertNil(p.etaSeconds(filesPerSecond: 100_000), "no remaining work ⇒ no ETA")
+    }
+
+    func testEtaSuppressedWhenCompletedWithStragglers() {
+        // Scan finished (running == false) with the numerator BELOW the denominator (unreachable
+        // stragglers): the fraction snaps to done, and there is no ETA to render.
+        let p = ScanProgress(filesProcessed: 4_000_000, usedInodes: 5_000_000, running: false, isVolumeRoot: true)
+        XCTAssertEqual(p.fraction!, 1.0, accuracy: 1e-12)
+        XCTAssertNil(p.etaSeconds(filesPerSecond: 100_000), "a completed scan has no ETA even with stragglers")
+    }
 }

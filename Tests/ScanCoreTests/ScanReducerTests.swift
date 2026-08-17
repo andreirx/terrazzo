@@ -450,34 +450,34 @@ final class ScanReducerTests: XCTestCase {
         XCTAssertTrue(r.contains("/r/a"), "a discovered id is present")
     }
 
-    // MARK: - Ignore accounting (review-0 change 2): union rule, streaming-current
+    // MARK: - Watchlist accounting (review-0 change 2): union rule, streaming-current
 
-    /// The excluded figure is computed from CURRENT reducer state, so it GROWS as an ignored
-    /// directory keeps receiving size events — the property a size-at-ignore snapshot could not
-    /// have (the ignored node is dropped from later scenes, so a snapshot froze). Structure:
-    /// root → dir A (ignored). A's own size arrives first small, then a child inflates it.
-    func testIgnoreAccountingTracksStreamingGrowth() {
+    /// The excluded figure is computed from CURRENT reducer state, so it GROWS as an watchlisted
+    /// directory keeps receiving size events — the property a size-at-watchlist snapshot could not
+    /// have (the watchlisted node is dropped from later scenes, so a snapshot froze). Structure:
+    /// root → dir A (watchlisted). A's own size arrives first small, then a child inflates it.
+    func testWatchlistAccountingTracksStreamingGrowth() {
         var r = ScanReducer(rootId: "/r", rootName: "r")
         r.apply([.sizeUpdated(nodeId: "/r", allocated: 0, logical: 0),
                  .childrenDiscovered(parentId: "/r", children: [
                     ChildStub(id: "/r/A", name: "A", kind: .dir)]),
                  .sizeUpdated(nodeId: "/r/A", allocated: 100, logical: 100)])
-        XCTAssertEqual(r.ignoreAccounting(["/r/A"]).total, 100,
+        XCTAssertEqual(r.watchlistAccounting(["/r/A"]).total, 100,
                        "the excluded figure reflects A's retained total so far")
         // A directory child of A arrives LATER and inflates A's subtree total.
         r.apply([.childrenDiscovered(parentId: "/r/A", children: [
                     ChildStub(id: "/r/A/big", name: "big", kind: .dir)]),
                  .sizeUpdated(nodeId: "/r/A/big", allocated: 9_000, logical: 9_000)])
-        XCTAssertEqual(r.ignoreAccounting(["/r/A"]).total, 9_100,
+        XCTAssertEqual(r.watchlistAccounting(["/r/A"]).total, 9_100,
                        "the excluded figure GREW with the streaming subtree (not a frozen snapshot)")
-        XCTAssertEqual(r.ignoreAccounting(["/r/A"]).currentById["/r/A"], 9_100,
+        XCTAssertEqual(r.watchlistAccounting(["/r/A"]).currentById["/r/A"], 9_100,
                        "the per-row size is the live retained total too")
     }
 
-    /// The UNION rule: ignoring BOTH an ancestor and one of its descendants must NOT double-count
+    /// The UNION rule: watchlisting BOTH an ancestor and one of its descendants must NOT double-count
     /// the overlapping mass — only the ancestor's subtree total is added (the descendant is
-    /// subsumed). Structure: root → A → {x, y}; ignore A AND A/x.
-    func testIgnoreAccountingDeduplicatesAncestorDescendantOverlap() {
+    /// subsumed). Structure: root → A → {x, y}; watchlist A AND A/x.
+    func testWatchlistAccountingDeduplicatesAncestorDescendantOverlap() {
         var r = ScanReducer(rootId: "/r", rootName: "r")
         r.apply([.sizeUpdated(nodeId: "/r", allocated: 0, logical: 0),
                  .childrenDiscovered(parentId: "/r", children: [
@@ -489,35 +489,35 @@ final class ScanReducerTests: XCTestCase {
                  .sizeUpdated(nodeId: "/r/A/y", allocated: 700, logical: 700),
                  .subtreeCompleted(nodeId: "/r")])
         // A's subtree total is 1000 (x 300 + y 700).
-        XCTAssertEqual(r.ignoreAccounting(["/r/A"]).total, 1_000, "ancestor alone = its subtree total")
-        XCTAssertEqual(r.ignoreAccounting(["/r/A/x"]).total, 300, "descendant alone = its own total")
-        // Ignoring BOTH must still be 1000 — x's 300 is already inside A's 1000, not added again.
-        XCTAssertEqual(r.ignoreAccounting(["/r/A", "/r/A/x"]).total, 1_000,
+        XCTAssertEqual(r.watchlistAccounting(["/r/A"]).total, 1_000, "ancestor alone = its subtree total")
+        XCTAssertEqual(r.watchlistAccounting(["/r/A/x"]).total, 300, "descendant alone = its own total")
+        // Watchlisting BOTH must still be 1000 — x's 300 is already inside A's 1000, not added again.
+        XCTAssertEqual(r.watchlistAccounting(["/r/A", "/r/A/x"]).total, 1_000,
                        "ancestor+descendant is the UNION (1000), not the sum of snapshots (1300)")
-        // Two INDEPENDENT (non-overlapping) ignores DO add up.
-        XCTAssertEqual(r.ignoreAccounting(["/r/A/x", "/r/A/y"]).total, 1_000,
-                       "two disjoint ignored siblings add up (no overlap to dedup)")
-        // An ignored id the scan has not produced yet contributes 0 and reports 0 current bytes.
-        let acct = r.ignoreAccounting(["/r/ghost"])
-        XCTAssertEqual(acct.total, 0, "an un-retained ignored id contributes nothing")
+        // Two INDEPENDENT (non-overlapping) watchlists DO add up.
+        XCTAssertEqual(r.watchlistAccounting(["/r/A/x", "/r/A/y"]).total, 1_000,
+                       "two disjoint watchlisted siblings add up (no overlap to dedup)")
+        // A watchlisted id the scan has not produced yet contributes 0 and reports 0 current bytes.
+        let acct = r.watchlistAccounting(["/r/ghost"])
+        XCTAssertEqual(acct.total, 0, "an un-retained watchlisted id contributes nothing")
         XCTAssertEqual(acct.currentById["/r/ghost"], 0, "and reports 0 current bytes")
     }
 
-    /// `IgnorePath.isAncestor` — the pure path primitive the App's antichain normalization uses to
-    /// keep the ignore set free of ancestor/descendant overlap (review-2 change 2). Boundary-checked
+    /// `WatchlistPath.isAncestor` — the pure path primitive the App's antichain normalization uses to
+    /// keep the watchlist set free of ancestor/descendant overlap (review-2 change 2). Boundary-checked
     /// on the separator, no self-ancestry, and correct for the volume root whose id is "/".
-    func testIgnorePathAncestryIsBoundaryChecked() {
-        XCTAssertTrue(IgnorePath.isAncestor("/Users", of: "/Users/apple"))
-        XCTAssertTrue(IgnorePath.isAncestor("/Users", of: "/Users/apple/Library"), "transitive descendant")
-        XCTAssertFalse(IgnorePath.isAncestor("/Users/apple", of: "/Users"), "not reversed")
-        XCTAssertFalse(IgnorePath.isAncestor("/Users", of: "/Users"), "a node is not its own ancestor")
+    func testWatchlistPathAncestryIsBoundaryChecked() {
+        XCTAssertTrue(WatchlistPath.isAncestor("/Users", of: "/Users/apple"))
+        XCTAssertTrue(WatchlistPath.isAncestor("/Users", of: "/Users/apple/Library"), "transitive descendant")
+        XCTAssertFalse(WatchlistPath.isAncestor("/Users/apple", of: "/Users"), "not reversed")
+        XCTAssertFalse(WatchlistPath.isAncestor("/Users", of: "/Users"), "a node is not its own ancestor")
         // The bug a naive `hasPrefix` would introduce: a sibling sharing a name prefix.
-        XCTAssertFalse(IgnorePath.isAncestor("/Users", of: "/UsersFoo"),
+        XCTAssertFalse(WatchlistPath.isAncestor("/Users", of: "/UsersFoo"),
                        "prefix without a path boundary is NOT ancestry")
-        XCTAssertFalse(IgnorePath.isAncestor("/a/b", of: "/a/bc"), "boundary-checked mid-path too")
+        XCTAssertFalse(WatchlistPath.isAncestor("/a/b", of: "/a/bc"), "boundary-checked mid-path too")
         // The volume root "/" ends in the separator — it is an ancestor of every absolute path.
-        XCTAssertTrue(IgnorePath.isAncestor("/", of: "/Users"))
-        XCTAssertFalse(IgnorePath.isAncestor("/", of: "/"), "root is not its own ancestor")
+        XCTAssertTrue(WatchlistPath.isAncestor("/", of: "/Users"))
+        XCTAssertFalse(WatchlistPath.isAncestor("/", of: "/"), "root is not its own ancestor")
     }
 
     // TZ-4b cycle-6: AREA-BOUNDED PROJECTION (`makeRenderTree`). A root with one big child and

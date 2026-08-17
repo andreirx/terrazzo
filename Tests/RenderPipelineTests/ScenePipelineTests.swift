@@ -175,9 +175,9 @@ final class ScenePipelineTests: XCTestCase {
         let rootId = "/r"
         let pipe = ScenePipeline(rootId: rootId, rootName: "r")
         // Pin the cull MECHANICS under LINEAR scale: this test is about which tiles the
-        // pixel cull drops, not the default scale. Under the ratified SQRT default the tail is
-        // deliberately EXPANDED (fewer culls) — that behavior is exercised by the TreemapCore
-        // scale tests; here we hold scale fixed so the exact culled count is deterministic.
+        // pixel cull drops, not the default scale. Under the SQRT option the tail is deliberately
+        // EXPANDED (fewer culls) — that behavior is exercised by the TreemapCore scale tests;
+        // here we hold scale fixed to LINEAR so the exact culled count is deterministic.
         await pipe.setScale(.linear)
         let (stream, cont) = AsyncStream<[ScanEvent]>.makeStream(bufferingPolicy: .unbounded)
         let ingestTask = Task { await pipe.ingest(stream) }
@@ -788,14 +788,14 @@ final class ScenePipelineTests: XCTestCase {
         await ingestTask.value
     }
 
-    // MARK: - 13. TZ-5 lenses: scale echoed, hidden + ignore filtered off main
+    // MARK: - 13. TZ-5 lenses: scale echoed, hidden + watchlist filtered off main
 
     /// The App-facing end of the TZ-5 lenses. Each setter force-emits, so reading the next scene
     /// after each pins: (a) the scene ECHOES the active scale (the status-bar label matches what is
     /// drawn); (b) show-hidden OFF excludes the hidden node AND reports its mass in
-    /// `hiddenFilteredBytes` (never a silent drop); (c) the ignore set excludes a node from the
+    /// `hiddenFilteredBytes` (never a silent drop); (c) the watchlist excludes a node from the
     /// rendered tiles. All computed on the actor (off main), exactly as the App consumes them.
-    func testLensesEchoScaleAndFilterHiddenAndIgnored() async {
+    func testLensesEchoScaleAndFilterHiddenAndWatchlisted() async {
         let rootId = "/r"
         let pipe = ScenePipeline(rootId: rootId, rootName: "r")
         await pipe.setViewport(viewport)
@@ -816,9 +816,9 @@ final class ScenePipelineTests: XCTestCase {
         await ingestTask.value
 
         var it = pipe.scenes.makeAsyncIterator()
-        // Final settle: SQRT is the ratified default scale; hidden is shown, nothing filtered.
+        // Final settle: LINEAR is the ratified default scale (TZ-10 item 6); hidden shown, none filtered.
         let first = await it.next()
-        XCTAssertEqual(first?.scaleMode, .sqrt, "the default scale is Sqrt, echoed on the scene")
+        XCTAssertEqual(first?.scaleMode, .linear, "the default scale is Linear, echoed on the scene")
         XCTAssertEqual(first?.hiddenFilteredBytes, 0, "nothing filtered while show-hidden is on")
         XCTAssertTrue(first?.tiles.contains { $0.nodeId == "\(rootId)/.H" } ?? false,
                       "the hidden node is drawn while show-hidden is on (the scan always includes it)")
@@ -831,29 +831,29 @@ final class ScenePipelineTests: XCTestCase {
         XCTAssertEqual(hiddenOff?.hiddenFilteredBytes, 300_000_000,
                        "the filtered hidden mass is reported (invisible-space accounting)")
 
-        // Scale toggled to LINEAR: echoed on the scene.
-        await pipe.setScale(.linear)
-        let linear = await it.next()
-        XCTAssertEqual(linear?.scaleMode, .linear, "the scale toggle is echoed on the scene")
+        // Scale toggled to SQRT (linear is the default now): echoed on the scene.
+        await pipe.setScale(.sqrt)
+        let sqrt = await it.next()
+        XCTAssertEqual(sqrt?.scaleMode, .sqrt, "the scale toggle is echoed on the scene")
 
-        // Ignore `big`: excluded from the rendered tiles.
-        await pipe.setIgnored(["\(rootId)/big"])
-        let ignored = await it.next()
-        XCTAssertFalse(ignored?.tiles.contains { $0.nodeId == "\(rootId)/big" } ?? true,
-                       "an ignored node is excluded from layout (its siblings renormalize)")
+        // Watchlist `big`: excluded from the rendered tiles.
+        await pipe.setWatchlist(["\(rootId)/big"])
+        let watched = await it.next()
+        XCTAssertFalse(watched?.tiles.contains { $0.nodeId == "\(rootId)/big" } ?? true,
+                       "a watchlisted node is excluded from layout (its siblings renormalize)")
     }
 
-    // MARK: - 14. TZ-5: pipeline-level cull counts (linear vs sqrt) + ignore accounting
+    // MARK: - 14. TZ-5: pipeline-level cull counts (linear vs sqrt) + watchlist accounting
 
     /// END-TO-END through the REAL changed path (review-0 change 4b): drive `ScenePipeline`'s
-    /// `setScale`/`setIgnored`, which run `ScanReducer.makeRenderTree(excluding:weight:)` +
+    /// `setScale`/`setWatchlist`, which run `ScanReducer.makeRenderTree(excluding:weight:)` +
     /// projection-prune + the final pixel cull on the actor, and read the EMITTED
-    /// `RenderScene.belowPixelCount`/`ignoredBytes`. This is the pipeline-level evidence the
+    /// `RenderScene.belowPixelCount`/`watchlistBytes`. This is the pipeline-level evidence the
     /// verify PNG host cannot give (it lays out a hand-filtered SizeTree directly, bypassing the
     /// reducer projection). A giant + 50 starved siblings: under LINEAR the siblings are sub-pixel
-    /// (culled/pruned and COUNTED); under SQRT the tail is exposed (fewer culls). Then ignoring the
+    /// (culled/pruned and COUNTED); under SQRT the tail is exposed (fewer culls). Then watchlisting the
     /// giant excludes it AND reports its exact excluded mass.
-    func testPipelineLinearVsSqrtCullCountsAndIgnoreAccounting() async {
+    func testPipelineLinearVsSqrtCullCountsAndWatchlistAccounting() async {
         let rootId = "/r"
         let pipe = ScenePipeline(rootId: rootId, rootName: "r")
         await pipe.setViewport(viewport)
@@ -874,10 +874,9 @@ final class ScenePipelineTests: XCTestCase {
         await ingestTask.value
 
         var it = pipe.scenes.makeAsyncIterator()
-        // Force LINEAR (default is SQRT) and read its cull count from the emitted scene.
-        await pipe.setScale(.linear)
+        // LINEAR is the default (TZ-10 item 6) — the final settle scene is already linear.
         let linear = await it.next()
-        // Back to SQRT and read again — the SAME scene under the other scale.
+        // Toggle to SQRT and read again — the SAME scene under the other scale.
         await pipe.setScale(.sqrt)
         let sqrt = await it.next()
         guard let linear, let sqrt else { return XCTFail("no scenes emitted for the scale toggle") }
@@ -889,29 +888,29 @@ final class ScenePipelineTests: XCTestCase {
         XCTAssertLessThan(sqrt.belowPixelCount, linear.belowPixelCount,
                           "sqrt reduces below-pixel culling through the real pipeline projection")
 
-        // Ignore the giant (under sqrt): excluded from the tiles AND its exact mass reported as the
+        // Watchlist the giant (under sqrt): excluded from the tiles AND its exact mass reported as the
         // excluded UNION figure (review-0 change 2, computed on the actor from reducer state).
-        await pipe.setIgnored(["\(rootId)/giant"])
-        let ignored = await it.next()
-        guard let ignored else { return XCTFail("no scene after ignore") }
-        XCTAssertFalse(ignored.tiles.contains { $0.nodeId == "\(rootId)/giant" },
-                       "the ignored giant is excluded from layout")
-        XCTAssertEqual(ignored.ignoredBytes, 1_000_000_000,
+        await pipe.setWatchlist(["\(rootId)/giant"])
+        let watched = await it.next()
+        guard let watched else { return XCTFail("no scene after watchlist") }
+        XCTAssertFalse(watched.tiles.contains { $0.nodeId == "\(rootId)/giant" },
+                       "the watchlisted giant is excluded from layout")
+        XCTAssertEqual(watched.watchlistBytes, 1_000_000_000,
                        "the excluded UNION mass is the giant's exact retained total")
-        XCTAssertEqual(ignored.ignoredCurrentById["\(rootId)/giant"], 1_000_000_000,
+        XCTAssertEqual(watched.watchlistCurrentById["\(rootId)/giant"], 1_000_000_000,
                        "the per-row live size matches the giant's retained total")
     }
 
-    // MARK: - 15. TZ-5: ignore child THEN parent — union accounting, never double-count
+    // MARK: - 15. TZ-5: watchlist child THEN parent — union accounting, never double-count
 
-    /// REGRESSION for review-1 change 2 (the snapshot-sum defect). Ignoring a CHILD and then its
+    /// REGRESSION for review-1 change 2 (the snapshot-sum defect). Watchlisting a CHILD and then its
     /// visible PARENT must report the excluded UNION (the parent's whole subtree, which already
     /// contains the child), NOT the sum of the two snapshots. This is checked at the REAL App→
-    /// pipeline handoff: `RenderScene.ignoredBytes`, the only figure the App is now allowed to show
+    /// pipeline handoff: `RenderScene.watchlistBytes`, the only figure the App is now allowed to show
     /// (the App-side `Σ row.bytes` that double-counted here is gone). Structure: root → P(own 100)
-    /// → C(300); ignore C (300) then P (400 total). The old snapshot sum would read 300+400=700;
+    /// → C(300); watchlist C (300) then P (400 total). The old snapshot sum would read 300+400=700;
     /// the union reads 400.
-    func testIgnoreChildThenParentReportsUnionNotDoubleCount() async {
+    func testWatchlistChildThenParentReportsUnionNotDoubleCount() async {
         let rootId = "/r"
         let pipe = ScenePipeline(rootId: rootId, rootName: "r")
         await pipe.setViewport(viewport)
@@ -934,16 +933,16 @@ final class ScenePipelineTests: XCTestCase {
 
         var it = pipe.scenes.makeAsyncIterator()
 
-        // Ignore the CHILD first: excluded mass = C's 300.
-        await pipe.setIgnored(["\(rootId)/P/C"])
+        // Watchlist the CHILD first: excluded mass = C's 300.
+        await pipe.setWatchlist(["\(rootId)/P/C"])
         let afterChild = await it.next()
-        XCTAssertEqual(afterChild?.ignoredBytes, 300, "child alone excludes its own subtree total")
+        XCTAssertEqual(afterChild?.watchlistBytes, 300, "child alone excludes its own subtree total")
 
-        // Now ALSO ignore its parent P (whose subtree already contains C). The union is P's whole
+        // Now ALSO watchlist its parent P (whose subtree already contains C). The union is P's whole
         // subtree (400) — NOT 300 + 400 = 700 (the snapshot double-count this test guards against).
-        await pipe.setIgnored(["\(rootId)/P/C", "\(rootId)/P"])
+        await pipe.setWatchlist(["\(rootId)/P/C", "\(rootId)/P"])
         let afterParent = await it.next()
-        XCTAssertEqual(afterParent?.ignoredBytes, 400,
+        XCTAssertEqual(afterParent?.watchlistBytes, 400,
                        "ancestor+descendant excluded together = the ancestor's subtree ONCE (union, not 700)")
     }
 

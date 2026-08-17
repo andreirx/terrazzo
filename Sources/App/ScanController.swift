@@ -193,9 +193,9 @@ final class ScanController {
     // The scale/hidden/depth lens choices are the App's source of truth (updated by the
     // control-bar callbacks) and are RE-APPLIED to every freshly-built pipeline in `scan`, so a
     // user's choice survives a rescan/volume switch (the new pipeline defaults would otherwise
-    // reset them). The IGNORE set is owned by NavigationController (it drives the panel + status)
+    // reset them). The WATCHLIST set is owned by NavigationController (it drives the panel + status)
     // and cleared on a new scan (a fresh pipeline starts with none), so it is NOT stored here.
-    private(set) var currentScale: AreaScale = .sqrt
+    private(set) var currentScale: AreaScale = .linear // TZ-10 item 6: linear is the default
     private(set) var currentIncludeHidden = true
     private(set) var currentDepthWindow = ScanPolicy.default.depthDetailWindow
 
@@ -253,7 +253,7 @@ final class ScanController {
         let pipe = ScenePipeline(rootId: root.path, rootName: root.lastPathComponent)
         pipeline = pipe
         // TZ-5: re-apply the current lens choices so a rescan/volume-switch keeps the user's
-        // scale/hidden/depth (a new pipeline defaults to sqrt/shown/5). The ignore set is not
+        // scale/hidden/depth (a new pipeline defaults to linear/shown/5). The watchlist is not
         // re-applied — a new scan starts with none (NavigationController.resetForNewScan clears it).
         Task {
             await pipe.setScale(currentScale)
@@ -263,9 +263,11 @@ final class ScanController {
 
         // NOTE (TZ-4b, HUMAN FIELD RULING #1): the pipeline is no longer told the volume
         // accounting — the synthetic UNACCOUNTED tile it fed was retracted. The
-        // "Unaccounted" figure is now a STATUS-BAR field the App composes from `volume`
-        // (VolumeProbe) + the scene's `scannedBytes` via the pure `UnaccountedSpace`
-        // math (see StatusBar.fields). The pipeline composes tiles from the SizeTree only.
+        // "Unaccounted" figure is now a DETAILS-dialog field (TZ-10 item 5 moved all
+        // accounting except the retained "Free X of Y capacity" out of the status bar);
+        // the App composes it from `volume` (VolumeProbe) + the scene's `scannedBytes`
+        // via the pure `UnaccountedSpace` math (see `DetailsReport`). The pipeline
+        // composes tiles from the SizeTree only.
 
         // Feed the real walker's event stream into the pipeline. The fold + all the
         // node-count-scaling projection/layout run inside the actor, off main.
@@ -779,11 +781,11 @@ final class ScanController {
         if let pipe = pipeline { Task { await pipe.setDepthWindow(currentDepthWindow) } }
     }
 
-    /// Post the IGNORE set (deliverable 1). NavigationController owns the authoritative set; this
-    /// forwards it to the pipeline so the ignored nodes are excluded from layout (siblings
-    /// renormalize) off main. Not stored here — a new scan starts with an empty ignore set.
-    func setIgnored(_ ids: Set<String>) {
-        if let pipe = pipeline { Task { await pipe.setIgnored(ids) } }
+    /// Post the WATCHLIST set (TZ-10 item 1). NavigationController owns the authoritative set; this
+    /// forwards it to the pipeline so the watchlisted nodes are excluded from layout (siblings
+    /// renormalize) off main. Not stored here — a new scan starts with an empty watchlist.
+    func setWatchlist(_ ids: Set<String>) {
+        if let pipe = pipeline { Task { await pipe.setWatchlist(ids) } }
     }
 
     /// Coarse phase label for the hitch monitor (what main is doing).

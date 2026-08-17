@@ -88,15 +88,27 @@ public struct ScanProgress: Equatable, Sendable {
         return max(0, usedInodes - Int64(filesProcessed))
     }
 
+    /// A CREDIBLE-ETA ceiling (99 h). An extrapolation beyond this is not a believable
+    /// estimate — it comes from a tiny early rate over the huge volume-wide denominator, or a
+    /// near-stalled scan — so `etaSeconds` declines to return it and the App renders "—" instead
+    /// of an absurd duration. This is the pure-side guard behind OPERATOR_NOTE 2026-08-17 B (the
+    /// field bug "~1931379388h 44m left"): never render a negative OR an absurd duration.
+    public static let etaCeilingSeconds: Double = 99 * 3600
+
     /// Estimated seconds remaining, given a measured `filesPerSecond` rate. `nil` when
     /// the scan root is not the volume root (a subtree scan has no honest volume-inode
-    /// ETA — OPERATOR_NOTE #2 item 2), indeterminate (no denominator), already done, or
-    /// the rate is non-positive (no basis to extrapolate — show "estimating…" rather than
-    /// a fabricated number).
+    /// ETA — OPERATOR_NOTE #2 item 2), indeterminate (no denominator), already done, the
+    /// rate is non-positive (no basis to extrapolate), remaining is 0, OR the extrapolation
+    /// exceeds `etaCeilingSeconds` (an incredible number — the field bug B: a tiny early rate
+    /// over the volume-wide denominator produced "~1931379388h"). The App shows "estimating…"
+    /// when there is no rate yet and "—" when the ETA is not credible — never a fabricated or
+    /// absurd number.
     public func etaSeconds(filesPerSecond: Double) -> Double? {
         guard isVolumeRoot else { return nil } // subtree scan: no ETA
         guard running, filesPerSecond > 0, let remaining = remainingInodes, remaining > 0
         else { return nil }
-        return Double(remaining) / filesPerSecond
+        let seconds = Double(remaining) / filesPerSecond
+        guard seconds.isFinite, seconds <= Self.etaCeilingSeconds else { return nil } // absurd ⇒ no number
+        return seconds
     }
 }

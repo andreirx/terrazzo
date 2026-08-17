@@ -982,12 +982,12 @@ public struct ScanReducer {
     ///   - focusId: the node to root the projection at. `nil` ⇒ the scan root (the
     ///     original whole-tree behavior; used by the root view and the reducer's own tests).
     ///   - depthWindow: max retained child depth (the focus is depth 0).
-    ///   - excluding: node ids to EXCLUDE from the projection (the IGNORE lens, TZ-5): an
-    ///     excluded child is dropped from its parent's child list so its SIBLINGS renormalize
-    ///     into the freed area, while every ANCESTOR keeps its area (an ancestor's own weight
-    ///     among ITS siblings is untouched — only the excluded node's direct siblings share out
-    ///     its space). A pure projection parameter, NEUTRAL to the reducer (it never learns
-    ///     WHY a node is excluded); the pipeline owns the ignore-lens meaning. Default `[]`.
+    ///   - excluding: node ids to EXCLUDE from the projection (the WATCHLIST, TZ-5 lens renamed
+    ///     TZ-10 item 1): an excluded child is dropped from its parent's child list so its SIBLINGS
+    ///     renormalize into the freed area, while every ANCESTOR keeps its area (an ancestor's own
+    ///     weight among ITS siblings is untouched — only the excluded node's direct siblings share
+    ///     out its space). A pure projection parameter, NEUTRAL to the reducer (it never learns
+    ///     WHY a node is excluded); the pipeline owns the watchlist meaning. Default `[]`.
     ///   - includeHidden: when `false`, HIDDEN nodes (`Node.isHidden`) are excluded from the
     ///     projection too (the "Show hidden files" lens, TZ-5). Default `true` (scan always
     ///     includes hidden; the DEFAULT view shows them).
@@ -1028,12 +1028,12 @@ public struct ScanReducer {
     /// layout cull likewise took a culled parent's children with it).
     ///
     /// TZ-5 LENSES ride along as pure projection parameters (see `makeTree`): `excluding`
-    /// (the ignore set) and `includeHidden` drop nodes so siblings renormalize; `weight`
+    /// (the watchlist) and `includeHidden` drop nodes so siblings renormalize; `weight`
     /// weights the area split so sqrt/linear pruning matches the layer's Squarify (the
     /// composition layer passes the same transform to both). It ALSO
     /// returns `hiddenFilteredBytes` — the summed retained total of the nodes dropped for
-    /// being HIDDEN (not for being ignored: ignored subtrees are accounted by the App from
-    /// the ignored tile's bytes, and are never descended, so their hidden descendants are
+    /// being HIDDEN (not for being watchlisted: watchlisted subtrees are accounted by the App from
+    /// the watchlisted tile's bytes, and are never descended, so their hidden descendants are
     /// subsumed there — the no-double-count rule the composition requires). This keeps the
     /// filtered-hidden MASS reportable in the status bar (never a silent drop — the
     /// invisible-space principle applied to user-hidden mass).
@@ -1094,14 +1094,14 @@ public struct ScanReducer {
                 // weights and drop the sub-pixel subtrees, THEN sort only the survivors (whose
                 // count is viewport-bounded: a rect of area `area` holds at most `area/minArea`
                 // children ≥ minArea).
-                // TZ-5 LENSES first (one O(children) pass): SKIP ignored + hidden-filtered
+                // TZ-5 LENSES first (one O(children) pass): SKIP watchlisted + hidden-filtered
                 // children BEFORE weighting, so `totalW` excludes them and the survivors
-                // RENORMALIZE into the freed area (the ratified ignore behavior). Hidden mass
-                // is accounted HERE, exactly once; ignored children are skipped WITHOUT hidden
+                // RENORMALIZE into the freed area (the ratified watchlist behavior). Hidden mass
+                // is accounted HERE, exactly once; watchlisted children are skipped WITHOUT hidden
                 // accounting (the App owns their mass) — the no-double-count rule. Weights use
                 // the injected `weight` transform so a sqrt/linear projection prunes exactly what
                 // the same-weighted Squarify will render (the composition layer passes both).
-                // Phase B: the ignore test needs child IDS; deriving one per child would tax the
+                // Phase B: the watchlist test needs child IDS; deriving one per child would tax the
                 // high-fanout weighting pass for a lens that is usually OFF, so the derivation is
                 // gated on `excluding` being non-empty (the common empty set costs zero joins here).
                 let hasExclusions = !excluding.isEmpty
@@ -1117,7 +1117,7 @@ public struct ScanReducer {
                 var kept: [(slot: Int32, id: String, area: Double)] = []
                 for c in node.childIndices {
                     let cid = childId(c, parentId: id) // derived once; used by the lens test + the kept tuple
-                    if hasExclusions, excluding.contains(cid) { continue }         // ignored
+                    if hasExclusions, excluding.contains(cid) { continue }         // watchlisted
                     if !includeHidden, store[Int(c)].isHidden { continue }         // counted above
                     let w = weight(store[Int(c)].subtreeAllocated)
                     let childArea = totalW > 0 ? area * w / totalW : 0
@@ -1140,7 +1140,7 @@ public struct ScanReducer {
                 }
             } else {
                 // Full projection: sort children canonically so enumeration order never leaks in.
-                // The same TZ-5 lenses apply (ignored + hidden filtered), so a full-projection
+                // The same TZ-5 lenses apply (watchlisted + hidden filtered), so a full-projection
                 // consumer (e.g. a non-area-bounded view) sees the identical excluded set.
                 // Phase B: each child's id is derived once here (one `joinId` off the in-hand
                 // parent id) and carried through the sort + recursion.
@@ -1374,35 +1374,35 @@ public struct ScanReducer {
         return nil
     }
 
-    /// The EXACT excluded-mass accounting for the IGNORE lens (TZ-5 deliverable 1), computed
+    /// The EXACT excluded-mass accounting for the WATCHLIST (TZ-10 item 1), computed
     /// from CURRENT reducer state — the single explicit rule the App renders (review-0 change 2,
     /// replacing the App's stale/double-counting snapshot sums). Two properties the snapshot sums
     /// could not give:
     ///
-    ///   - STREAMING-CORRECT. An ignored directory is EXCLUDED from every later scene, so a
-    ///     snapshot taken at ignore time froze its size. Here `subtreeAllocated` is the node's
+    ///   - STREAMING-CORRECT. A watchlisted directory is EXCLUDED from every later scene, so a
+    ///     snapshot taken at add time froze its size. Here `subtreeAllocated` is the node's
     ///     current retained total (maintained incrementally by the fold), so re-calling this each
     ///     emit re-sums the growing subtree — the figure tracks the scan instead of lying low.
     ///   - OVERLAP-DEDUPLICATED (the UNION rule). If both an ancestor and one of its descendants
-    ///     are ignored, their masses OVERLAP; summing both snapshots double-counts. The total here
-    ///     adds `subtreeAllocated` only for ignored "ROOTS" — an ignored node with NO ignored
-    ///     ancestor — so a descendant under an already-ignored ancestor contributes nothing extra
+    ///     are watchlisted, their masses OVERLAP; summing both snapshots double-counts. The total here
+    ///     adds `subtreeAllocated` only for watchlisted "ROOTS" — a watchlisted node with NO watchlisted
+    ///     ancestor — so a descendant under an already-watchlisted ancestor contributes nothing extra
     ///     (its mass is already inside the ancestor's subtree total). This is the "one explicit
     ///     union/accounting rule from current reducer state" the review requires.
     ///
-    /// `currentById` carries each ignored id's current retained total (for the panel rows), so a
-    /// row's size is live too (0 for an id ignored before its stub arrived — retained as nil).
+    /// `currentById` carries each watchlisted id's current retained total (for the panel rows), so a
+    /// row's size is live too (0 for an id watchlisted before its stub arrived — retained as nil).
     /// Pure over the accumulated state; the pipeline calls it on its actor once per emit —
-    /// O(ignored × ancestor-chain-depth), never node-count. A tuple, not a new type: one caller.
-    public func ignoreAccounting(_ ids: Set<String>) -> (total: Int64, currentById: [String: Int64]) {
-        // Resolve the ignored ids to slots once; the ancestor test then walks `parent` slots and
+    /// O(watchlisted × ancestor-chain-depth), never node-count. A tuple, not a new type: one caller.
+    public func watchlistAccounting(_ ids: Set<String>) -> (total: Int64, currentById: [String: Int64]) {
+        // Resolve the watchlisted ids to slots once; the ancestor test then walks `parent` slots and
         // checks membership in this set (the lean store has no parent-id STRING to compare).
         var slotOf = [String: Int32](minimumCapacity: ids.count)
-        var ignoredSlots = Set<Int32>()
+        var watchlistedSlots = Set<Int32>()
         for id in ids where slot(of: id) != nil {
             let s = slot(of: id)!
             slotOf[id] = s
-            ignoredSlots.insert(s)
+            watchlistedSlots.insert(s)
         }
         var currentById = [String: Int64](minimumCapacity: ids.count)
         var total: Int64 = 0
@@ -1410,12 +1410,12 @@ public struct ScanReducer {
             let s = slotOf[id]
             let subtree = s.map { store[Int($0)].subtreeAllocated } ?? 0
             currentById[id] = subtree
-            // Walk the retained parent chain; if any ancestor is ALSO ignored, this node's mass is
+            // Walk the retained parent chain; if any ancestor is ALSO watchlisted, this node's mass is
             // already subsumed by that ancestor's subtree total — do not add it again (union dedup).
             var subsumed = false
             var pid: Int32 = s.map { store[Int($0)].parent } ?? ScanReducer.noIndex
             while pid != ScanReducer.noIndex {
-                if ignoredSlots.contains(pid) { subsumed = true; break }
+                if watchlistedSlots.contains(pid) { subsumed = true; break }
                 pid = store[Int(pid)].parent
             }
             if !subsumed { total += subtree }

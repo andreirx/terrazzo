@@ -4,7 +4,10 @@
 //
 //  A normal AppKit app (NOT a screensaver): a dark resizable window titled
 //  "Terrazzo" hosting the CanvasView (the live navigable map, with on-canvas tile
-//  labels + hover readout) above the StatusBar (focus path + volume accounting).
+//  labels + hover readout) above the simplified StatusBar (focus path · Free X of Y
+//  capacity · scan state · a Details button; the retained Free figure stays on the bar
+//  per OPERATOR_NOTE A, and the rest of the accounting lives in the Details dialog —
+//  TZ-10 item 5).
 //  On launch it starts a live scan of the home directory; the map fills
 //  progressively and — new in TZ-3 — is NAVIGABLE: hover tells, click/scroll
 //  dives, Esc/⌘↑/scroll-out surfaces, ⌘R and right-click reveal in Finder.
@@ -31,10 +34,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var controlBar: ControlBar!
     private var banner: FDABanner!
     private var consentBanner: ConsentBanner!
-    private var ignorePanel: IgnorePanel!
+    private var watchlistPanel: WatchlistPanel!
     private var container: ChromeContainer!
     private var navigation: NavigationController!
     private var controller: ScanController!
+
+    // MARK: - Details dialog (TZ-10 item 5)
+    /// The Details dialog is presented as a `.transient` NSPopover anchored to the status bar's
+    /// Details button (no separate window is raised — app behavior, builder-conduct-safe). Held
+    /// strongly so it survives while shown.
+    private lazy var detailsPopover: NSPopover = {
+        let p = NSPopover(); p.behavior = .transient; p.animates = true; return p
+    }()
+    private let detailsView = DetailsView(frame: .zero)
+    /// The latest status + watchlist accounting — the two inputs to the Details report. Held so the
+    /// dialog can rebuild live while open, and so the accounting change (which arrives without a new
+    /// status) can refresh it.
+    private var latestStatus: ScanStatus?
+    private var watchlistCount = 0
+    private var watchlistBytes: Int64 = 0
+    /// Auto-pop the Details dialog ONCE per scan when it completes (item 5). Armed at scan start,
+    /// disarmed after the first running→complete transition fires it.
+    private var detailsAutoPopArmed = false
+    private var scanWasRunning = false
 
     /// Giant-volume consent, REMEMBERED FOR THE SESSION (TZ-9 deliverable 4: "Non-modal, remembered
     /// for the session"). A volume path here has been acknowledged once — re-selecting it does not
@@ -74,21 +96,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         consentBanner = ConsentBanner(frame: NSRect(x: 0, y: 0, width: frame.width, height: ConsentBanner.height))
         statusBar = StatusBar(frame: NSRect(x: 0, y: 0, width: frame.width, height: StatusBar.height))
         canvas = CanvasView(frame: NSRect(x: 0, y: 0, width: frame.width, height: frame.height))
-        ignorePanel = IgnorePanel()
+        watchlistPanel = WatchlistPanel()
         container = ChromeContainer(controlBar: controlBar, banner: banner, consentBanner: consentBanner,
-                                    canvas: canvas, statusBar: statusBar, ignorePanel: ignorePanel)
+                                    canvas: canvas, statusBar: statusBar, watchlistPanel: watchlistPanel)
         container.frame = frame
         container.autoresizingMask = [.width, .height]
         window.contentView = container
 
-        // Navigation owns focus/camera/hover; wired to canvas + status bar + the Ignore panel.
-        navigation = NavigationController(canvas: canvas, bottomBar: statusBar, ignorePanel: ignorePanel)
+        // Navigation owns focus/camera/hover; wired to canvas + status bar + the Watchlist panel.
+        navigation = NavigationController(canvas: canvas, bottomBar: statusBar, watchlistPanel: watchlistPanel)
         canvas.escapeHandler = { [weak navigation] in navigation?.ascend() } // Esc → zoom out
-        // Show/hide the (only-while-non-empty) Ignore panel as the set changes.
-        navigation.onIgnoreChanged = { [weak self] in
+        // Show/hide the (only-while-non-empty) Watchlist panel as the set changes.
+        navigation.onWatchlistChanged = { [weak self] in
             guard let self else { return }
-            self.container.showsIgnorePanel = !self.ignorePanel.isEmpty
+            self.container.showsWatchlistPanel = !self.watchlistPanel.isEmpty
         }
+        // TZ-10 item 5: watchlist accounting flows into the Details dialog (not the status bar).
+        navigation.onWatchlistAccounting = { [weak self] count, bytes in
+            guard let self else { return }
+            self.watchlistCount = count
+            self.watchlistBytes = bytes
+            self.refreshDetailsIfOpen()
+        }
+        // TZ-10 item 5: the Details button opens the accounting dialog.
+        statusBar.onDetails = { [weak self] in self?.showDetails() }
 
         // TZ-4 chrome actions (Main-assembly wiring): rescan (toolbar + FDA banner) and
         // volume selection both funnel to the scan helpers below.
@@ -143,8 +174,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             root: root, policy: .default,
             onScene: { [weak self] scene in self?.navigation.onScene(scene) },
             onStatus: { [weak self] status in
-                self?.statusBar.update(status)
-                self?.controlBar.update(status.progress) // progress bar + ETA (TZ-4 D4)
+                guard let self else { return }
+                self.statusBar.update(status)
+                self.controlBar.update(status.progress) // progress bar + ETA (TZ-4 D4)
+                self.onStatus(status)                    // Details dialog + scan-complete auto-pop
             }
         )
         navigation.scanController = controller
@@ -223,16 +256,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// for `root` (D2/D5). All volume enumeration + the FDA probe live in ScanFS
     /// (CLAUDE.md constraint 1); this is one-time work at scan start, not node-count work.
     private func updateChromeForScan(root: URL) {
+        // TZ-10 item 5: arm the one-shot Details auto-pop for this scan; a fresh scan starts running.
+        detailsAutoPopArmed = true
+        scanWasRunning = false
         let volumes = VolumeEnumerator.selectableVolumes()
         let volumePaths = Set(volumes.map { $0.url.path })
         // If the scan root is a volume root, select it; otherwise (e.g. the ~ first-paint
         // scan) select the boot volume the home directory lives on.
         let selected = volumePaths.contains(root.path) ? root.path : "/"
         controlBar.volumePicker.setVolumes(volumes, selectedPath: selected)
+        // TZ-10 items 1: the Watchlist panel + export show paths relative to the scan's VOLUME. The
+        // volume root is the longest selectable-volume mount path that contains `root` (the boot
+        // volume "/" for a ~ scan); its display name is that volume's name (falls back to the path).
+        let volume = volumes
+            .filter { root.path == $0.url.path || root.path.hasPrefix($0.url.path == "/" ? "/" : $0.url.path + "/") }
+            .max { $0.url.path.count < $1.url.path.count }
+        navigation.volumeRootPath = volume?.url.path ?? "/"
+        navigation.volumeName = volume?.name ?? (volume?.url.path ?? "/")
         // FDA banner ONLY when mapping a whole volume AND a protected probe path is denied
         // — never for a sub-folder scan, and never blocking (D5).
         let isVolumeRoot = VolumeSkipPolicy.isVolumeRoot(path: root.path, volumePaths: volumePaths)
         container.showsBanner = isVolumeRoot && FDAProbe.probe() == .denied
+    }
+
+    // MARK: - Details dialog (TZ-10 item 5)
+
+    /// New-status handler: keep the latest status, refresh the dialog if it is open, and AUTO-POP the
+    /// Details dialog ONCE when a scan completes (running → not-running). Armed at each scan start.
+    private func onStatus(_ status: ScanStatus) {
+        latestStatus = status
+        refreshDetailsIfOpen()
+        if scanWasRunning && !status.running && detailsAutoPopArmed {
+            detailsAutoPopArmed = false
+            if !detailsPopover.isShown { showDetails() } // only OPEN — never toggle a user-opened dialog shut
+        }
+        scanWasRunning = status.running
+    }
+
+    /// Open (or toggle) the Details dialog, anchored to the status bar's Details button.
+    private func showDetails() {
+        rebuildDetailsView()
+        if detailsPopover.isShown { detailsPopover.performClose(nil); return }
+        detailsPopover.contentViewController = wrap(detailsView)
+        detailsPopover.contentSize = detailsView.preferredSize
+        detailsPopover.show(relativeTo: statusBar.detailsAnchor.bounds,
+                            of: statusBar.detailsAnchor, preferredEdge: .maxY)
+    }
+
+    private func refreshDetailsIfOpen() {
+        guard detailsPopover.isShown else { return }
+        rebuildDetailsView()
+        detailsPopover.contentSize = detailsView.preferredSize
+    }
+
+    private func rebuildDetailsView() {
+        guard let status = latestStatus else { return }
+        detailsView.set(lines: DetailsReport.lines(status, watchlistCount: watchlistCount,
+                                                   watchlistBytes: watchlistBytes))
+    }
+
+    /// Wrap a view in a bare view controller for the popover (its content must be a VC's view).
+    private func wrap(_ view: NSView) -> NSViewController {
+        let vc = NSViewController(); vc.view = view; return vc
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -302,10 +387,10 @@ final class ChromeContainer: NSView {
     private let consentBanner: ConsentBanner
     private let canvas: CanvasView
     private let statusBar: StatusBar
-    /// The Ignore list (TZ-5 deliverable 1) — FLOATS at the top-right of the canvas region, over
+    /// The Watchlist panel (TZ-10 item 1) — FLOATS at the top-right of the canvas region, over
     /// the map (not re-flowing it), shown only while non-empty. Positioned here, filled by
     /// NavigationController.
-    private let ignorePanel: IgnorePanel
+    private let watchlistPanel: WatchlistPanel
 
     /// Whether the FDA banner is shown (D5). Toggling re-flows the canvas.
     var showsBanner = false {
@@ -326,35 +411,35 @@ final class ChromeContainer: NSView {
         }
     }
 
-    /// Whether the Ignore panel is shown (TZ-5) — set by AppDelegate from the panel's non-empty
+    /// Whether the Watchlist panel is shown (TZ-10) — set by AppDelegate from the panel's non-empty
     /// state. It FLOATS over the canvas, so toggling repositions it without re-flowing the map.
-    var showsIgnorePanel = false {
+    var showsWatchlistPanel = false {
         didSet {
-            guard showsIgnorePanel != oldValue else { return }
-            ignorePanel.isHidden = !showsIgnorePanel
+            guard showsWatchlistPanel != oldValue else { return }
+            watchlistPanel.isHidden = !showsWatchlistPanel
             relayout()
         }
     }
 
     init(controlBar: ControlBar, banner: FDABanner, consentBanner: ConsentBanner,
-         canvas: CanvasView, statusBar: StatusBar, ignorePanel: IgnorePanel) {
+         canvas: CanvasView, statusBar: StatusBar, watchlistPanel: WatchlistPanel) {
         self.controlBar = controlBar
         self.banner = banner
         self.consentBanner = consentBanner
         self.canvas = canvas
         self.statusBar = statusBar
-        self.ignorePanel = ignorePanel
+        self.watchlistPanel = watchlistPanel
         super.init(frame: .zero)
         wantsLayer = true
         banner.isHidden = true
         consentBanner.isHidden = true
-        ignorePanel.isHidden = true
+        watchlistPanel.isHidden = true
         addSubview(controlBar)
         addSubview(banner)
         addSubview(consentBanner)
         addSubview(canvas)
         addSubview(statusBar)
-        addSubview(ignorePanel) // on top of the canvas
+        addSubview(watchlistPanel) // on top of the canvas
     }
 
     required init?(coder: NSCoder) { fatalError("ChromeContainer is code-only") }
@@ -389,14 +474,14 @@ final class ChromeContainer: NSView {
         canvas.frame = NSRect(x: 0, y: top, width: w, height: canvasHeight)
         statusBar.frame = NSRect(x: 0, y: h - statusH, width: w, height: statusH)
 
-        // Float the Ignore panel at the TOP-RIGHT of the canvas region, sized to its content
+        // Float the Watchlist panel at the TOP-RIGHT of the canvas region, sized to its content
         // (clamped to the canvas height), so it covers as little of the map as possible.
-        if showsIgnorePanel {
+        if showsWatchlistPanel {
             let margin: CGFloat = 10
-            let pw = IgnorePanel.width
-            let ph = min(ignorePanel.contentHeight(), max(0, canvasHeight - 2 * margin))
+            let pw = WatchlistPanel.width
+            let ph = min(watchlistPanel.contentHeight(), max(0, canvasHeight - 2 * margin))
             // isFlipped == true here (top-left origin), so y grows downward from the canvas top.
-            ignorePanel.frame = NSRect(x: w - pw - margin, y: top + margin, width: pw, height: ph)
+            watchlistPanel.frame = NSRect(x: w - pw - margin, y: top + margin, width: pw, height: ph)
         }
     }
 }

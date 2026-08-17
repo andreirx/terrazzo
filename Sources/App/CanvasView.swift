@@ -122,22 +122,27 @@ final class CanvasView: NSView {
     private var tileLabelViews: [NSTextField] = []
     private var currentTileLabels: [TileLabel] = []
 
-    /// The on-hover IGNORE button (TZ-5 deliverable 1) — a small pill anchored at the TOP-RIGHT
-    /// corner of the hovered top-level tile (labels sit top-LEFT, so no overlap). Shown by
-    /// `showIgnore(atPx:)` only for a tile wide enough to carry it (the SAME `minLabelWidthPx`
-    /// rule as labels — the packet's "sufficiently large tiles"); the context menu covers the
-    /// small ones. As a canvas SUBVIEW inside `bounds`, it consumes its own click (no dive) and
-    /// does NOT trigger `mouseExited` on the canvas, so hover stays live while the cursor is on it.
-    private let ignoreButton: NSButton = {
-        let b = NSButton(title: "Ignore", target: nil, action: nil)
+    /// The on-hover WATCHLIST button (TZ-10 item 1) — a small pill anchored at
+    /// the TOP-RIGHT corner of the hovered tile (labels sit top-LEFT, so no overlap).
+    ///
+    /// CONSISTENT AFFORDANCE RULE (TZ-10 item 2 — "one predictable rule; no sometimes-shows"): the
+    /// pill appears IFF the DEEPEST tile under the cursor is (a) a real filesystem node — not the
+    /// focus root and not a synthetic denied-aggregate badge — AND (b) at least `minLabelWidthPx`
+    /// wide (the SAME "sufficiently large" rule labels use). For tiles narrower than that, the pill
+    /// is not shown but the ancestor-chain CONTEXT MENU (item 9) always carries "Add to Watchlist"
+    /// for every level — so the action is reachable for EVERY tile, exactly one of the two ways.
+    /// As a canvas SUBVIEW inside `bounds`, the pill consumes its own click (no dive) and does NOT
+    /// trigger `mouseExited` on the canvas, so hover stays live while the cursor is on it.
+    private let watchlistButton: NSButton = {
+        let b = NSButton(title: "Watch", target: nil, action: nil)
         b.bezelStyle = .rounded
         b.controlSize = .mini
         b.isHidden = true
-        b.toolTip = "Exclude this tile from the map so its siblings fill the space. It stays in the Ignore list (click there to restore). Nothing is deleted."
+        b.toolTip = "Add to Watchlist: exclude this tile from the map so its siblings fill the space. It stays in the Watchlist panel (click a row there to restore). Nothing is deleted."
         return b
     }()
-    /// Bound by NavigationController — ignores the currently-hovered top-level tile.
-    var onIgnore: (() -> Void)?
+    /// Bound by NavigationController — watchlists the currently-hovered (deepest) tile.
+    var onWatchlist: (() -> Void)?
     /// The denied-overflow disclosure POPOVER (TZ-4b OPERATOR_NOTE #3.2, review-4 change 3 —
     /// the ratified "click shows the list (popover)", replacing the earlier NSMenu). One
     /// reused instance: `.transient` so a click elsewhere dismisses it; its content view
@@ -167,12 +172,12 @@ final class CanvasView: NSView {
         layerContentsRedrawPolicy = .duringViewResize
         addSubview(calloutChip)
         calloutChip.isHidden = true
-        ignoreButton.target = self
-        ignoreButton.action = #selector(ignoreClicked)
-        addSubview(ignoreButton)
+        watchlistButton.target = self
+        watchlistButton.action = #selector(watchlistClicked)
+        addSubview(watchlistButton)
     }
 
-    @objc private func ignoreClicked() { onIgnore?() }
+    @objc private func watchlistClicked() { onWatchlist?() }
 
     required init?(coder: NSCoder) { fatalError("CanvasView is code-only (no storyboard)") }
 
@@ -321,16 +326,16 @@ final class CanvasView: NSView {
     /// Hide the hover callout chip.
     func clearCallout() { calloutChip.isHidden = true }
 
-    /// Show the on-hover IGNORE button anchored at the top-right of `tileRect` (DEVICE PIXELS),
+    /// Show the on-hover WATCHLIST button anchored at the top-right of `tileRect` (DEVICE PIXELS),
     /// but ONLY when the tile is at least `minLabelWidthPx` wide — the SAME "sufficiently large"
-    /// rule labels use (small tiles are ignored via the context menu instead). Returns whether
-    /// the button is shown, so NavigationController can wire its `onIgnore` only when it is.
+    /// rule labels use (small tiles use the context menu instead). Returns whether
+    /// the button is shown, so NavigationController can wire its `onWatchlist` only when it is.
     @discardableResult
-    func showIgnore(atPx tileRect: Rect) -> Bool {
-        guard tileRect.width >= Self.minLabelWidthPx else { ignoreButton.isHidden = true; return false }
+    func showWatchlist(atPx tileRect: Rect) -> Bool {
+        guard tileRect.width >= Self.minLabelWidthPx else { watchlistButton.isHidden = true; return false }
         let scale = Double(window?.backingScaleFactor ?? 2.0)
-        ignoreButton.sizeToFit()
-        let size = ignoreButton.frame.size
+        watchlistButton.sizeToFit()
+        let size = watchlistButton.frame.size
         let bw = Double(size.width), bh = Double(size.height)
         let pad = 4.0
         // Tile top-right in top-left-origin POINTS; clamp inside the tile so the pill never
@@ -341,13 +346,13 @@ final class CanvasView: NSView {
         let yTopPt = topPt + pad
         // NSView is y-up — convert the top-left y to a frame origin.
         let frameY = Double(bounds.height) - yTopPt - bh
-        ignoreButton.frame = NSRect(x: xPt, y: frameY, width: bw, height: bh)
-        ignoreButton.isHidden = false
+        watchlistButton.frame = NSRect(x: xPt, y: frameY, width: bw, height: bh)
+        watchlistButton.isHidden = false
         return true
     }
 
-    /// Hide the on-hover ignore button (hover-out, dive, animation).
-    func hideIgnore() { ignoreButton.isHidden = true }
+    /// Hide the on-hover watchlist button (hover-out, dive, animation).
+    func hideWatchlist() { watchlistButton.isHidden = true }
 
     /// Disclose the collapsed denied list of a clicked denied-overflow AGGREGATE badge (TZ-4b
     /// OPERATOR_NOTE #3.2, review-4 change 3). The ratified affordance is a POPOVER anchored at the

@@ -24,12 +24,12 @@
 //  business — RenderPipeline is the pure COMPOSITION of the two engines through
 //  `SizeTree` (CLAUDE.md charter), and status-accounting policy is not composition. Cores
 //  are Foundation-only value math, which this is; ScanCore is its honest home. The App's
-//  `StatusBar` composes the displayed field from this; the pipeline no longer touches
-//  volume accounting at all.
+//  `DetailsReport` (the Details dialog's pure line builder) composes the displayed figure
+//  from this; the pipeline no longer touches volume accounting at all.
 //
 //  ABSTRACTION LEDGER: a namespace of pure functions over Int64 byte counts, no protocol,
-//  no state, no SizeTree dependency. Concrete users: the App's `StatusBar.fields` (formats
-//  the figure) and `UnaccountedSpaceTests` (pins residual + clamp + the ADDITIVE decompose
+//  no state, no SizeTree dependency. Concrete users: the App's `DetailsReport` (formats
+//  the figure for the Details dialog) and `UnaccountedSpaceTests` (pins residual + clamp + the ADDITIVE decompose
 //  + the composed status triple). Axis of variation: none — fixed arithmetic. Rejected
 //  simpler alternative — inline the subtraction in the AppKit view — would put the
 //  load-bearing clamps (the honest-zero rule + the additive-decomposition rule below) in

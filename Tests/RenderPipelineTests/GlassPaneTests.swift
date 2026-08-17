@@ -21,9 +21,9 @@
 //      fixes the depth, so it pins the hue identity AT that depth, not RGB focus-invariance.)
 //   2. REST endpoint == today's INHERITED (pane) rendering, composed: at a hue root
 //      rest == own EXACTLY (own == pane there); for a deep descendant rest is the pane
-//      composited over own at `paneRestAlpha` (0.5) — the pane hue contributes exactly
+//      composited over own at `paneRestAlpha` (0.72) — the pane hue contributes exactly
 //      that fraction (the "within epsilon of the inherited hue" the packet states, made
-//      exact as the 0.5 composite the ratified model defines).
+//      exact as the paneRestAlpha composite the ratified model defines).
 //   3. The dissolve is MONOTONE in t and ASCEND (1−t) is its exact reverse.
 //   4. RESERVED colours (denied / pending) are UNAFFECTED by the dissolve — both endpoints
 //      are the same reserved colour, so the pane never touches them (VISION invisible-space).
@@ -83,7 +83,7 @@ final class GlassPaneTests: XCTestCase {
         }
     }
 
-    // MARK: - 2. Rest endpoint: exact at hue roots, 0.5 pane-composite deeper
+    // MARK: - 2. Rest endpoint: exact at hue roots, paneRestAlpha pane-composite deeper
 
     func testRestEndpointAtHueRootReproducesTodayExactly() {
         // At a hue root own == pane, so REST == OWN == today's (inherited==own) rendering — the
@@ -188,7 +188,7 @@ final class GlassPaneTests: XCTestCase {
 
         // The two references, straight off the production colour path.
         let childXDisplayed = rgb(childQuads[1]) // X in the child scene renders at rest (== its own hue @1)
-        let parentXPaned = rgb(parentQuads[2])   // X in the parent scene = pane over own @0.5, dimmer
+        let parentXPaned = rgb(parentQuads[2])   // X in the parent scene = pane over own @paneRestAlpha, dimmer
 
         // The endpoints the ascend flight actually SHOWS (via the shader mirror).
         assertClose(QuadBuilder.displayedColor(bX, dissolveT: 1), childXDisplayed,
@@ -315,8 +315,11 @@ final class GlassPaneTests: XCTestCase {
             let q = QuadBuilder.quad(for: dataTile(name: "Child", paneHue: TileColor.hue(for: "Ancestor"),
                                                    dimLevel: depth))
             let restLum = lum(rgb(q)), ownLum = lum(ownRGB(q))
-            XCTAssertLessThanOrEqual(restLum, prevRestLum + eps, "rest colour dims with depth \(depth)")
-            XCTAssertLessThanOrEqual(ownLum, prevOwnLum + eps, "own colour dims with depth \(depth)")
+            // STRICT (review-1): each deeper level must be MEASURABLY dimmer than the one above,
+            // not merely non-increasing — a flat cascade (dimFalloff regressed to 1.0) must FAIL
+            // this guard, matching the acceptance gate's "brightness per level must decrease".
+            XCTAssertLessThan(restLum, prevRestLum - eps, "rest colour dims measurably with depth \(depth)")
+            XCTAssertLessThan(ownLum, prevOwnLum - eps, "own colour dims measurably with depth \(depth)")
             prevRestLum = restLum; prevOwnLum = ownLum
         }
     }

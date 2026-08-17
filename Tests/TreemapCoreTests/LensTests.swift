@@ -1,5 +1,5 @@
 //
-//  LensTests.swift — the TZ-5 visualization lenses (scale / ignore / show-hidden).
+//  LensTests.swift — the TZ-5 visualization lenses (scale / watchlist / show-hidden).
 //  Module maturity: PROTOTYPE (slice TZ-5)
 //
 //  These pin the pure behavior of the three layout lenses end-to-end across BOTH cores that
@@ -87,11 +87,11 @@ final class LensTests: XCTestCase {
                           "sqrt reduces below-pixel culling (the sibling-starvation exposure, quantified)")
     }
 
-    // MARK: - Ignore (deliverable 1)
+    // MARK: - Watchlist (deliverable 1)
 
-    /// Ignoring a child EXCLUDES it, its SIBLINGS renormalize into the freed area (tiling stays
-    /// exact), and every ANCESTOR keeps its area. Structure: root → {P, Q}; P → {A, B, C}. Ignore C.
-    func testIgnoreRenormalizesSiblingsLocallyAndAncestorsUnchanged() {
+    /// Watchlisting a child EXCLUDES it, its SIBLINGS renormalize into the freed area (tiling stays
+    /// exact), and every ANCESTOR keeps its area. Structure: root → {P, Q}; P → {A, B, C}. Watchlist C.
+    func testWatchlistRenormalizesSiblingsLocallyAndAncestorsUnchanged() {
         var r = ScanReducer(rootId: "/r", rootName: "r")
         r.apply([.sizeUpdated(nodeId: "/r", allocated: 0, logical: 0),
                  .childrenDiscovered(parentId: "/r", children: [
@@ -118,13 +118,13 @@ final class LensTests: XCTestCase {
         let after = layout(excluding: ["/r/P/C"])
 
         // C is gone; A and B remain.
-        XCTAssertNil(after.first { $0.nodeId == "/r/P/C" }, "the ignored child is excluded from layout")
+        XCTAssertNil(after.first { $0.nodeId == "/r/P/C" }, "the watchlisted child is excluded from layout")
         XCTAssertNotNil(after.first { $0.nodeId == "/r/P/A" })
 
         // ANCESTORS keep their areas: P's and Q's rects are byte-identical before/after (P's weight
         // among root's children still includes C's bytes — only C's DIRECT siblings share its space).
         XCTAssertEqual(areaOf(after, "/r/P"), areaOf(before, "/r/P"), accuracy: 1e-6,
-                       "the ancestor P keeps its area — ignoring a grandchild does not shrink it")
+                       "the ancestor P keeps its area — watchlisting a grandchild does not shrink it")
         XCTAssertEqual(areaOf(after, "/r/Q"), areaOf(before, "/r/Q"), accuracy: 1e-6,
                        "the sibling-of-ancestor Q is untouched")
 
@@ -134,14 +134,14 @@ final class LensTests: XCTestCase {
         let abSum = after.filter { $0.dimLevel == 2 && ($0.nodeId == "/r/P/A" || $0.nodeId == "/r/P/B") }
             .reduce(0.0) { $0 + $1.rect.area }
         XCTAssertEqual(abSum, pInner.area, accuracy: pInner.area * 1e-9 + 1e-6,
-                       "A and B renormalize to tile P's inner area exactly after C is ignored")
+                       "A and B renormalize to tile P's inner area exactly after C is watchlisted")
         // And each grew (freed area is claimed, not left blank).
         XCTAssertGreaterThan(areaOf(after, "/r/P/A"), areaOf(before, "/r/P/A"))
     }
 
-    /// Ignore → restore ROUND-TRIP restores the EXACT prior layout (a pure function of the excluded
+    /// Watchlist → restore ROUND-TRIP restores the EXACT prior layout (a pure function of the excluded
     /// set, so removing an id then re-adding it reproduces the original tiles byte-for-byte).
-    func testIgnoreRestoreRoundTripRestoresExactLayout() {
+    func testWatchlistRestoreRoundTripRestoresExactLayout() {
         let r = flatReducer([("A", 1000), ("B", 600), ("C", 300)].map { ($0.0, $0.1, false) })
         func layout(excluding ids: Set<String>) -> [TileRect] {
             let (tree, _, _) = r.makeRenderTree(focusId: "/r", depthWindow: 5,
@@ -150,19 +150,19 @@ final class LensTests: XCTestCase {
             return TreemapScene.layout(tree: tree, focusId: "/r", viewport: viewport, scale: .sqrt)
         }
         let original = layout(excluding: [])
-        _ = layout(excluding: ["/r/B"])          // ignore B
+        _ = layout(excluding: ["/r/B"])          // watchlist B
         let restored = layout(excluding: [])     // restore B
-        XCTAssertEqual(restored, original, "restoring an ignored tile reproduces the exact prior layout")
+        XCTAssertEqual(restored, original, "restoring an watchlisted tile reproduces the exact prior layout")
     }
 
-    /// NESTED-IGNORE restore semantics (review-2 change 2). The App keeps its ignore set an
-    /// ANTICHAIN so every panel row restores its own tile: ignoring an ANCESTOR drops any
-    /// already-ignored DESCENDANTS (subsumed — the ancestor already excludes the whole subtree, so
+    /// NESTED-WATCHLIST restore semantics (review-2 change 2). The App keeps its watchlist set an
+    /// ANTICHAIN so every panel row restores its own tile: watchlisting an ANCESTOR drops any
+    /// already-watchlisted DESCENDANTS (subsumed — the ancestor already excludes the whole subtree, so
     /// a descendant row could never restore its tile). This pins that normalization against the
-    /// SAME production primitive the App uses (`ScanCore.IgnorePath.isAncestor`) AND the projection
+    /// SAME production primitive the App uses (`ScanCore.WatchlistPath.isAncestor`) AND the projection
     /// consequence: after normalization the excluded set is coherent, and restoring the surviving
     /// row brings its subtree — descendants included — back.
-    func testNestedIgnoreNormalizesToAntichainAndRestores() {
+    func testNestedWatchlistNormalizesToAntichainAndRestores() {
         // root → {P, Q}; P → {A, B, C}. (Same shape as the sibling-renormalization test.)
         var r = ScanReducer(rootId: "/r", rootName: "r")
         r.apply([.sizeUpdated(nodeId: "/r", allocated: 0, logical: 0),
@@ -179,26 +179,26 @@ final class LensTests: XCTestCase {
                  .sizeUpdated(nodeId: "/r/Q", allocated: 1000, logical: 1000),
                  .subtreeCompleted(nodeId: "/r")])
 
-        // The App's antichain normalization (NavigationController.ignore), using the SAME primitive.
+        // The App's antichain normalization (NavigationController.addToWatchlist), using the SAME primitive.
         func insert(_ id: String, into set: [String]) -> [String] {
             if set.contains(id) { return set }
-            // already excluded by an ignored ancestor → nothing to add
-            if set.contains(where: { IgnorePath.isAncestor($0, of: id) }) { return set }
-            var next = set.filter { !IgnorePath.isAncestor(id, of: $0) } // drop subsumed descendants
+            // already excluded by an watchlisted ancestor → nothing to add
+            if set.contains(where: { WatchlistPath.isAncestor($0, of: id) }) { return set }
+            var next = set.filter { !WatchlistPath.isAncestor(id, of: $0) } // drop subsumed descendants
             next.append(id)
             return next
         }
 
-        // Ignore grandchild C, THEN ancestor P — the exact case the reviewer flagged.
+        // Watchlist grandchild C, THEN ancestor P — the exact case the reviewer flagged.
         var ig: [String] = []
         ig = insert("/r/P/C", into: ig)
         XCTAssertEqual(ig, ["/r/P/C"])
         ig = insert("/r/P", into: ig)
         XCTAssertEqual(ig, ["/r/P"],
-                       "ignoring ancestor P subsumes descendant C — the set stays an antichain")
-        // Defensive: re-ignoring the now-hidden descendant is a no-op (it has an ignored ancestor).
+                       "watchlisting ancestor P subsumes descendant C — the set stays an antichain")
+        // Defensive: re-watchlisting the now-hidden descendant is a no-op (it has an watchlisted ancestor).
         XCTAssertEqual(insert("/r/P/C", into: ig), ["/r/P"],
-                       "a descendant of an ignored ancestor is never added (it could not restore)")
+                       "a descendant of an watchlisted ancestor is never added (it could not restore)")
 
         func present(_ ids: [String]) -> [TileRect] {
             let (tree, _, _) = r.makeRenderTree(focusId: "/r", depthWindow: 5,
@@ -208,10 +208,10 @@ final class LensTests: XCTestCase {
         }
 
         // With the normalized set {P}: P's whole subtree is excluded, Q renormalizes to fill.
-        let ignored = present(ig)
-        XCTAssertNil(ignored.first { $0.nodeId == "/r/P" }, "the ignored ancestor is excluded")
-        XCTAssertNil(ignored.first { $0.nodeId == "/r/P/C" }, "its descendant is excluded with it")
-        XCTAssertNotNil(ignored.first { $0.nodeId == "/r/Q" })
+        let watchlisted = present(ig)
+        XCTAssertNil(watchlisted.first { $0.nodeId == "/r/P" }, "the watchlisted ancestor is excluded")
+        XCTAssertNil(watchlisted.first { $0.nodeId == "/r/P/C" }, "its descendant is excluded with it")
+        XCTAssertNotNil(watchlisted.first { $0.nodeId == "/r/Q" })
 
         // Restore the ONE surviving row (P) → set empty → P AND its descendant C are back.
         let restored = present(ig.filter { $0 != "/r/P" })
@@ -238,17 +238,17 @@ final class LensTests: XCTestCase {
         XCTAssertEqual(filteredHidden, 300, "the filtered hidden MASS is accounted (never silently dropped)")
     }
 
-    /// Composition rule (packet): ignored ∩ hidden-filtered must NOT double-count. A node that is
-    /// BOTH ignored AND hidden is excluded as IGNORED (the App accounts its bytes) and is NOT also
+    /// Composition rule (packet): watchlisted ∩ hidden-filtered must NOT double-count. A node that is
+    /// BOTH watchlisted AND hidden is excluded as WATCHLISTED (the App accounts its bytes) and is NOT also
     /// counted in the hidden-filtered mass.
-    func testIgnoredHiddenNodeIsNotDoubleCountedAsHiddenFiltered() {
+    func testWatchlistedHiddenNodeIsNotDoubleCountedAsHiddenFiltered() {
         let r = flatReducer([("V", 700, false), (".H", 300, true)])
-        // Ignore the hidden node AND turn show-hidden off.
+        // Watchlist the hidden node AND turn show-hidden off.
         let (tree, _, hiddenBytes) = r.makeRenderTree(focusId: "/r", depthWindow: 5,
             minRenderArea: minArea, viewportArea: vpArea,
             excluding: ["/r/.H"], includeHidden: false)
         XCTAssertNil(tree.children.first { $0.id == "/r/.H" }, "the node is excluded")
         XCTAssertEqual(hiddenBytes, 0,
-                       "a node excluded for being IGNORED is not ALSO counted as hidden-filtered (no double-count)")
+                       "a node excluded for being WATCHLISTED is not ALSO counted as hidden-filtered (no double-count)")
     }
 }

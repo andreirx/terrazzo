@@ -42,7 +42,7 @@ FOCUS_ROOT="build/verify-focus-root.png"
 FOCUS_CHILD="build/verify-focus-child.png"
 SCALE_LINEAR="build/verify-scale-linear.png"
 SCALE_SQRT="build/verify-scale-sqrt.png"
-SCALE_SQRT_IGNORE="build/verify-scale-sqrt-ignore.png"
+SCALE_SQRT_WATCHLIST="build/verify-scale-sqrt-watchlist.png"
 DISSOLVE_0="build/verify-dissolve-0.png"
 DISSOLVE_HALF="build/verify-dissolve-half.png"
 DISSOLVE_1="build/verify-dissolve-1.png"
@@ -51,7 +51,7 @@ SCAN_OUT2="build/verify-scan-2.png"
 SCAN_PROMOTED="build/verify-scan-promoted.png"
 
 mkdir -p build
-rm -f "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD" "$SCALE_LINEAR" "$SCALE_SQRT" "$SCALE_SQRT_IGNORE" "$DISSOLVE_0" "$DISSOLVE_HALF" "$DISSOLVE_1" "$SCAN_OUT1" "$SCAN_OUT2" "$SCAN_PROMOTED"
+rm -f "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD" "$SCALE_LINEAR" "$SCALE_SQRT" "$SCALE_SQRT_WATCHLIST" "$DISSOLVE_0" "$DISSOLVE_HALF" "$DISSOLVE_1" "$SCAN_OUT1" "$SCAN_OUT2" "$SCAN_PROMOTED"
 
 echo "==> (2a) Build the app bundle (also needed for structure assertions)"
 scripts/build.sh
@@ -70,13 +70,13 @@ swiftc \
 	-framework ImageIO \
 	-target arm64-apple-macos14
 
-echo "==> (1b) Render two viewport frames + two focus frames + three TZ-5 scale/ignore frames + three TZ-8 dissolve frames"
+echo "==> (1b) Render two viewport frames + two focus frames + three TZ-5 scale/watchlist frames + three TZ-8 dissolve frames"
 "$HOST_BIN" "$SHADER" "$FIXTURE" "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD" \
-	"$SCALE_LINEAR" "$SCALE_SQRT" "$SCALE_SQRT_IGNORE" \
+	"$SCALE_LINEAR" "$SCALE_SQRT" "$SCALE_SQRT_WATCHLIST" \
 	"$DISSOLVE_0" "$DISSOLVE_HALF" "$DISSOLVE_1"
 
 echo "==> (1c) Assert all ten frames were written and are non-empty"
-for f in "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD" "$SCALE_LINEAR" "$SCALE_SQRT" "$SCALE_SQRT_IGNORE" \
+for f in "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD" "$SCALE_LINEAR" "$SCALE_SQRT" "$SCALE_SQRT_WATCHLIST" \
 	"$DISSOLVE_0" "$DISSOLVE_HALF" "$DISSOLVE_1"; do
 	if [[ ! -s "$f" ]]; then
 		echo "VERIFY FAILED: a frame is missing/empty ($f)" >&2
@@ -96,19 +96,19 @@ if cmp -s "$FOCUS_ROOT" "$FOCUS_CHILD"; then
 	exit 1
 fi
 
-echo "==> (1f) TZ-5: assert linear / sqrt / sqrt+ignore frames all DIFFER (scale toggle + ignore change the map)"
+echo "==> (1f) TZ-5: assert linear / sqrt / sqrt+watchlist frames all DIFFER (scale toggle + watchlist change the map)"
 if cmp -s "$SCALE_LINEAR" "$SCALE_SQRT"; then
 	echo "VERIFY FAILED: $SCALE_LINEAR and $SCALE_SQRT are byte-identical — the sqrt scale did not change the layout" >&2
 	exit 1
 fi
-if cmp -s "$SCALE_SQRT" "$SCALE_SQRT_IGNORE"; then
-	echo "VERIFY FAILED: $SCALE_SQRT and $SCALE_SQRT_IGNORE are byte-identical — ignoring the largest tile did not change the layout" >&2
+if cmp -s "$SCALE_SQRT" "$SCALE_SQRT_WATCHLIST"; then
+	echo "VERIFY FAILED: $SCALE_SQRT and $SCALE_SQRT_WATCHLIST are byte-identical — watchlisting the largest tile did not change the layout" >&2
 	exit 1
 fi
 # review-0 change 4a: assert the THIRD pair too, so ALL THREE frames are proven distinct
-# (linear ≠ sqrt ≠ sqrt+ignore ≠ linear) rather than only the two adjacent pairs.
-if cmp -s "$SCALE_LINEAR" "$SCALE_SQRT_IGNORE"; then
-	echo "VERIFY FAILED: $SCALE_LINEAR and $SCALE_SQRT_IGNORE are byte-identical — the three scale/ignore frames are not all distinct" >&2
+# (linear ≠ sqrt ≠ sqrt+watchlist ≠ linear) rather than only the two adjacent pairs.
+if cmp -s "$SCALE_LINEAR" "$SCALE_SQRT_WATCHLIST"; then
+	echo "VERIFY FAILED: $SCALE_LINEAR and $SCALE_SQRT_WATCHLIST are byte-identical — the three scale/watchlist frames are not all distinct" >&2
 	exit 1
 fi
 

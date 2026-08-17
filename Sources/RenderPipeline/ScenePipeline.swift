@@ -79,17 +79,18 @@ public actor ScenePipeline {
     // (the ratified threading law). The scan reducer is never mutated — these only change WHICH
     // retained nodes are projected and with WHAT area weighting.
 
-    /// The IGNORE set: node ids excluded from layout so their SIBLINGS renormalize into the freed
+    /// The WATCHLIST: node ids excluded from layout so their SIBLINGS renormalize into the freed
     /// area (ancestors keep their areas). The App owns the authoritative set + the panel/accounting;
-    /// this is the copy the projection filters on. Ids are absolute paths, so an ignored node stays
+    /// this is the copy the projection filters on. Ids are absolute paths, so a watchlisted node stays
     /// excluded wherever it appears under the current focus.
-    private var ignoredIds: Set<String> = []
+    private var watchlistIds: Set<String> = []
     /// Show-hidden lens (deliverable 3): `true` (default) shows hidden nodes; `false` filters
     /// dotfile/UF_HIDDEN nodes from layout, their mass reported as `hiddenFilteredBytes`.
     private var includeHidden = true
-    /// Area scale (deliverable 2): `.sqrt` is the ratified DEFAULT (PLAN §TZ-5, 2026-08-17,
-    /// superseding log). The App's toggle flips it via `setScale`.
-    private var scale: AreaScale = .sqrt
+    /// Area scale: `.linear` is the ratified DEFAULT (PLAN §TZ-10 item 6, 2026-08-17 — "impact
+    /// first"; reverses the sqrt-default half of the earlier decision, sqrt stays as the option).
+    /// The App's toggle flips it via `setScale`.
+    private var scale: AreaScale = .linear
 
     /// Sub-pixel cull threshold (device-px area). A tile smaller than ~2×2 device px
     /// carries no readable pixels, and the tail of a deep tree is almost all such
@@ -532,11 +533,11 @@ public actor ScenePipeline {
 
     // MARK: - TZ-5 lens setters (each re-projects immediately, off main)
 
-    /// Post the IGNORE set (deliverable 1). A no-op emit is skipped when the set is unchanged so a
+    /// Post the WATCHLIST (deliverable 1). A no-op emit is skipped when the set is unchanged so a
     /// redundant push (e.g. on a new-scan reset) does not churn a scene.
-    public func setIgnored(_ ids: Set<String>) {
-        guard ids != ignoredIds else { return }
-        ignoredIds = ids
+    public func setWatchlist(_ ids: Set<String>) {
+        guard ids != watchlistIds else { return }
+        watchlistIds = ids
         emit(force: true)
     }
 
@@ -592,7 +593,7 @@ public actor ScenePipeline {
         // the visible set. The pruned subtrees are exactly those the cull below would drop, so
         // the rendered scene is unchanged, and `prunedBelowArea` is folded into `belowPixelCount`
         // so the drop is never SILENT (invisible-space contract).
-        // TZ-5 LENSES applied HERE (off main): the ignore set + show-hidden filter drop nodes so
+        // TZ-5 LENSES applied HERE (off main): the watchlist + show-hidden filter drop nodes so
         // siblings renormalize (makeRenderTree). COHERENCE OF SCALE IS ENFORCED HERE, at the one
         // module that imports both cores (review-1 change 3): this composition layer hands the
         // reducer projection `scale.weight` (a bare `(bytes) -> weight` function — ScanCore stays
@@ -603,13 +604,13 @@ public actor ScenePipeline {
         let (tree, prunedBelowArea, hiddenFilteredBytes) = reducer.makeRenderTree(
             focusId: focusId, depthWindow: renderWindow,
             minRenderArea: Self.minRenderAreaPx, viewportArea: vp.area,
-            excluding: ignoredIds, includeHidden: includeHidden, weight: scale.weight)
-        // IGNORE accounting (review-0 change 2): the EXACT excluded UNION mass + each ignored id's
-        // current retained total, from CURRENT reducer state — recomputed every emit so the
-        // status figure and the panel rows stay honest while the scan streams and never
-        // double-count overlapping ancestor/descendant ignores. O(ignored × chain-depth), on the
-        // actor. Empty/zero when nothing is ignored (the common case — no allocation cost).
-        let ignoreAcct = reducer.ignoreAccounting(ignoredIds)
+            excluding: watchlistIds, includeHidden: includeHidden, weight: scale.weight)
+        // WATCHLIST accounting (review-0 change 2): the EXACT excluded UNION mass + each watchlisted
+        // id's current retained total, from CURRENT reducer state — recomputed every emit so the
+        // Details figure and the panel rows stay honest while the scan streams and never
+        // double-count overlapping ancestor/descendant entries. O(watchlisted × chain-depth), on the
+        // actor. Empty/zero when nothing is watchlisted (the common case — no allocation cost).
+        let watchlistAcct = reducer.watchlistAccounting(watchlistIds)
         let laidOut = TreemapScene.layout(tree: tree, focusId: focusId,
                                           depthWindow: renderWindow, viewport: vp, scale: scale)
         guard !laidOut.isEmpty else { return } // focus not present yet — keep last scene
@@ -679,7 +680,7 @@ public actor ScenePipeline {
             // `RenderScene.scannedBytes` / `ScanReducer.rootAllocatedBytes`.
             scannedBytes: reducer.rootAllocatedBytes,
             scaleMode: scale, hiddenFilteredBytes: hiddenFilteredBytes,
-            ignoredBytes: ignoreAcct.total, ignoredCurrentById: ignoreAcct.currentById))
+            watchlistBytes: watchlistAcct.total, watchlistCurrentById: watchlistAcct.currentById))
     }
 
     /// Compose a label (name + human size) for each top-level (dimLevel 1) tile.

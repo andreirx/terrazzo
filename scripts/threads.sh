@@ -35,7 +35,7 @@ swiftc \
 	scripts/thread_host.swift \
 	Sources/App/CanvasView.swift \
 	Sources/App/NavigationController.swift \
-	Sources/App/IgnorePanel.swift \
+	Sources/App/WatchlistPanel.swift \
 	Sources/App/ScanController.swift \
 	Sources/App/QuadRenderer.swift \
 	Sources/App/HitchMonitor.swift \

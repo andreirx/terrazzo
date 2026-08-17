@@ -199,14 +199,14 @@ public extension SizeTree {
     }
 }
 
-/// Path-ancestry over node ids, used by the IGNORE lens to keep its set an ANTICHAIN.
+/// Path-ancestry over node ids, used by the WATCHLIST to keep its set an ANTICHAIN.
 ///
-/// WHY IT EXISTS (TZ-5 review-2, nested-ignore restore). The ignore set excludes each id's
+/// WHY IT EXISTS (TZ-5 review-2, nested-watchlist restore). The watchlist excludes each id’s
 /// WHOLE subtree from layout (`ScanReducer.makeRenderTree(excluding:)`). If both an ancestor
-/// and one of its descendants were listed at once, the descendant's Ignore-panel row could
+/// and one of its descendants were listed at once, the descendant’s Watchlist row could
 /// never restore its tile — its ancestor still excludes the whole subtree — so a one-click
 /// "restore" would silently do nothing, a name-honesty defect. The App therefore keeps its
-/// ignore list an antichain (no id is an ancestor of another): ignoring an ancestor DROPS any
+/// watchlist an antichain (no id is an ancestor of another): watchlisting an ancestor DROPS any
 /// already-listed descendants (subsumed), so every remaining row is an independent, restorable
 /// exclusion.
 ///
@@ -217,11 +217,11 @@ public extension SizeTree {
 /// can pin it (the App layer is not an SPM target).
 ///
 /// ABSTRACTION LEDGER: a namespace of pure static funcs (not a type — no state). Concrete
-/// users: `NavigationController.ignore(tile:)` (production) + `ScanReducerTests` (the regression
+/// users: `NavigationController.addToWatchlist(tile:)` (production) + `ScanReducerTests` (the regression
 /// test). Axis: none — fixed path-string relation. Rejected simpler alternative: inline the
 /// prefix check in the App — but the App is SPM-invisible, so the rule could not be unit-tested,
 /// which the reviewer requires.
-public enum IgnorePath {
+public enum WatchlistPath {
     /// Is `descendant` strictly inside the directory `ancestor`? Boundary-checked on the path
     /// separator so `/Users` is NOT reported an ancestor of `/UsersFoo`, and an id is never its
     /// own ancestor. Handles a root whose id already ends in "/" (the volume root, `"/"`).

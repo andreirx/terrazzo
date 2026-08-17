@@ -43,12 +43,12 @@ struct VerifyHost {
     static func main() {
         let args = CommandLine.arguments
         guard args.count == 13 else {
-            FileHandle.standardError.write(Data("usage: \(args.first ?? "verify_host") <shaders.metal> <fixture.json> <out1.png> <out2.png> <focus-root.png> <focus-child.png> <scale-linear.png> <scale-sqrt.png> <scale-sqrt-ignore.png> <dissolve-0.png> <dissolve-half.png> <dissolve-1.png>\n".utf8))
+            FileHandle.standardError.write(Data("usage: \(args.first ?? "verify_host") <shaders.metal> <fixture.json> <out1.png> <out2.png> <focus-root.png> <focus-child.png> <scale-linear.png> <scale-sqrt.png> <scale-sqrt-watchlist.png> <dissolve-0.png> <dissolve-half.png> <dissolve-1.png>\n".utf8))
             exit(2)
         }
         let shaderPath = args[1], fixturePath = args[2], out1 = args[3], out2 = args[4]
         let focusRootOut = args[5], focusChildOut = args[6]
-        let scaleLinearOut = args[7], scaleSqrtOut = args[8], scaleSqrtIgnoreOut = args[9]
+        let scaleLinearOut = args[7], scaleSqrtOut = args[8], scaleSqrtWatchlistOut = args[9]
         let dissolve0Out = args[10], dissolveHalfOut = args[11], dissolve1Out = args[12]
 
         guard let device = MTLCreateSystemDefaultDevice() else { die("no Metal device") }
@@ -92,8 +92,8 @@ struct VerifyHost {
         renderFrame(device: device, renderer: renderer, tree: tree, focusId: focusChild.id,
                     px: viewportA.w, py: viewportA.h, out: focusChildOut)
 
-        // TZ-5 scale + ignore frames (packet acceptance + review-0 change 4b): the SAME fixture
-        // scene under (a) linear, (b) sqrt, and (c) sqrt with the LARGEST top-level tile IGNORED —
+        // TZ-5 scale + watchlist frames (packet acceptance + review-0 change 4b): the SAME fixture
+        // scene under (a) linear, (b) sqrt, and (c) sqrt with the LARGEST top-level tile WATCHLISTED —
         // all three must differ. These now go through the REAL CHANGED PATH: a `ScanReducer`
         // rebuilt from the fixture tree, then `makeRenderTree(excluding:weight:)` — the same
         // area-bounded projection + prune the pipeline runs — instead of hand-filtering a
@@ -101,7 +101,7 @@ struct VerifyHost {
         // removes a child" and its cull metric "bypasses the pipeline's projection-prune"). The
         // reported cull count is now `prunedBelowArea (projection) + final pixel cull` — the exact
         // `RenderScene.belowPixelCount` accounting. The rigorous deterministic quantification is
-        // TZ-14 (ScenePipelineTests.testPipelineLinearVsLogCullCountsAndIgnoreAccounting).
+        // (ScenePipelineTests.testPipelineLinearVsSqrtCullCountsAndWatchlistAccounting).
         let reducer = buildReducer(from: tree)
         let largest = tree.children.max { $0.allocatedBytes < $1.allocatedBytes }
         let cullLinear = renderProjectedFrame(device: device, renderer: renderer, reducer: reducer,
@@ -112,11 +112,11 @@ struct VerifyHost {
                                            px: viewportA.w, py: viewportA.h, out: scaleSqrtOut)
         _ = renderProjectedFrame(device: device, renderer: renderer, reducer: reducer,
                                  focusId: tree.id, excluding: Set([largest?.id].compactMap { $0 }),
-                                 scale: .sqrt, px: viewportA.w, py: viewportA.h, out: scaleSqrtIgnoreOut)
+                                 scale: .sqrt, px: viewportA.w, py: viewportA.h, out: scaleSqrtWatchlistOut)
 
         print("VERIFY_HOST CULL (fixture @ \(viewportA.w)x\(viewportA.h), via ScanReducer.makeRenderTree): "
               + "linear=\(cullLinear) sqrt=\(cullSqrt) below-pixel tiles (projection-prune + final cull)"
-              + " (sqrt ≤ linear — sqrt exposes starved siblings; largest ignored = \(largest?.name ?? "<none>"))")
+              + " (sqrt ≤ linear — sqrt exposes starved siblings; largest watchlisted = \(largest?.name ?? "<none>"))")
         // TZ-8 GLASS-PANE DISSOLVE gate (packet acceptance): the SAME fixture at focus=root,
         // rendered at dissolveT = 0 (rest/paned), 0.5, and 1 (dived/own) through the REAL
         // shader path (renderSynchronously(dissolveT:)). The scene mean channel value is a
@@ -145,9 +145,16 @@ struct VerifyHost {
         if !linear { die("TZ-8 dissolve 0.5 frame is not the midpoint of 0 and 1 (shader mix not linear)") }
         if abs(mean1 - mean0) < 1.0 { die("TZ-8 dissolve endpoints barely differ — the fixture's focus child has no paned descendant to dissolve") }
 
+        // TZ-10 item 7 (COLOR CASCADE v3): the monotone darkening cascade into depth. Through the
+        // REAL colour path (`QuadBuilder`, linked here via GPUQuad.swift), build a hue-root tile at
+        // each dim level and confirm its rest-colour mean brightness (Rec.709 luminance) STRICTLY
+        // DECREASES with depth — the "darker and dimmer" cascade the ruling asks for, replacing the
+        // flat confetti look. Deterministic and constant-free (reads whatever QuadBuilder produces).
+        checkCascadeBrightness()
+
         print("VERIFY_HOST OK: wrote \(out1) (\(viewportA.w)x\(viewportA.h)) and \(out2) (\(viewportB.w)x\(viewportB.h)); "
               + "focus frames \(focusRootOut) (root) and \(focusChildOut) (child \(focusChild.id)); "
-              + "scale frames \(scaleLinearOut) (linear), \(scaleSqrtOut) (sqrt), \(scaleSqrtIgnoreOut) (sqrt+ignore); "
+              + "scale frames \(scaleLinearOut) (linear), \(scaleSqrtOut) (sqrt), \(scaleSqrtWatchlistOut) (sqrt+watchlist); "
               + "dissolve frames \(dissolve0Out) (t=0), \(dissolveHalfOut) (t=0.5), \(dissolve1Out) (t=1)")
     }
 
@@ -234,7 +241,7 @@ struct VerifyHost {
     /// minus its children's recursive totals (the reducer accumulates own sizes up the tree, so
     /// this inversion reproduces the exact totals). Denied nodes are discovered as dirs then
     /// `accessDenied` (how the reducer derives `.denied`); bundle leaves keep their kind. This lets
-    /// the scale/ignore frames go through the REAL `makeRenderTree` projection rather than a
+    /// the scale/watchlist frames go through the REAL `makeRenderTree` projection rather than a
     /// hand-filtered tree.
     static func buildReducer(from root: SizeTree) -> ScanReducer {
         var reducer = ScanReducer(rootId: root.id, rootName: root.name)
@@ -308,6 +315,36 @@ struct VerifyHost {
               + "below-pixel=\(belowPixel) (pruned \(prunedBelowArea) + culled \(tiles.count - kept.count)), "
               + "excluding=\(excluding.count)")
         return belowPixel
+    }
+
+    /// TZ-10 item 7 acceptance: state the mean brightness per nesting level and assert it DECREASES
+    /// (COLOR CASCADE v3, the monotone darkening cascade). Uses the production `QuadBuilder` rest
+    /// colour of a hue-root tile at each dim level — no hand-derived constants.
+    static func checkCascadeBrightness() {
+        let unit = Rect(x: 0, y: 0, width: 100, height: 100)
+        func lum(_ c: (Float, Float, Float)) -> Double {
+            0.2126 * Double(c.0) + 0.7152 * Double(c.1) + 0.0722 * Double(c.2)
+        }
+        var prev = Double.greatestFiniteMagnitude
+        var means: [String] = []
+        for depth in 1...5 {
+            let tile = TileRect(rect: unit, dimLevel: depth, nodeId: "L\(depth)", kind: .dir,
+                                scanState: .complete, hue: TileColor.hue(for: "Library"),
+                                name: "Library", allocatedBytes: 1, logicalBytes: 1)
+            let q = QuadBuilder.quad(for: tile)
+            let l = lum((q.r, q.g, q.b))
+            means.append("L\(depth)=\(String(format: "%.3f", l))")
+            // STRICT (review-1): each level must be MEASURABLY dimmer than the one above — a flat
+            // cascade (dimFalloff regressed to 1.0) leaves l == prev and MUST fail this gate, matching
+            // the acceptance requirement "mean brightness per level must decrease".
+            if l >= prev - 1e-6 {
+                die("TZ-10 cascade brightness NOT strictly decreasing at level \(depth) "
+                    + "(\(String(format: "%.3f", l)) not below \(String(format: "%.3f", prev)))")
+            }
+            prev = l
+        }
+        print("VERIFY_HOST TZ-10 cascade v3 mean brightness per level (must decrease): "
+              + means.joined(separator: "  ") + " — monotone darkening confirmed")
     }
 
     static func writePNG(pixels: inout [UInt8], width: Int, height: Int,

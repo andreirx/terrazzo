@@ -74,7 +74,7 @@ import TreemapCore
 ///   • `QuadBuilder.quad` — PIPELINE-SCENE quads (the steady-state render). Here the slots
 ///     carry the ratified PANED / OWN endpoints:
 ///       - `r/g/b`          = REST (paned): the tile's own hue composited under the level-1
-///         ancestor's translucent pane at `paneRestAlpha` (0.5). FOCUS-RELATIVE — its pane hue
+///         ancestor's translucent pane at `paneRestAlpha` (0.72). FOCUS-RELATIVE — its pane hue
 ///         is the inherited ancestor hue, which changes when the tile becomes a hue root under
 ///         a new focus; QuadGeometry.commitFrom carries it. Equals own for hue roots (focus +
 ///         level-1 tiles), where own == pane.
@@ -140,18 +140,33 @@ public struct GPUQuad: Equatable, Sendable {
 /// Pure builder: `TileRect` → `GPUQuad`. Owns the colour language that used to live
 /// in QuadRenderer (VISION §Experience 2 dim ladder; PLAN §"Visual language" hue).
 public enum QuadBuilder {
-    // Depth-dim ladder (VISION §Experience 2): brightness = base · falloff^dimLevel,
-    // WITHIN each subtree's own hue (PLAN §"Visual language"). Medium saturation over
-    // black. Verbatim the constants QuadRenderer carried — moved, not re-tuned.
+    // COLOR CASCADE v3 (PLAN §TZ-10 item 7, human field ruling 2026-08-17). The prior tuning
+    // (paneRestAlpha 0.5, dimFalloff 0.74) read as a "flat confetti" look where every depth
+    // competed at similar brightness. v3 RETUNES the CONSTANTS ONLY — the dissolve/continuity
+    // MECHANISM (TZ-8) is untouched (packet: "replaces the pane PARAMETERS, not the pane
+    // MECHANISM") — into a monotone DARKENING CASCADE into depth:
+    //   • level-1 tiles TINT STRONGER: `paneRestAlpha` raised 0.5 → 0.72, so a level-1
+    //     ancestor's hue dominates its descendants' rest colour far more (the pane presence
+    //     the ruling asks for). Level-1 tiles are hue roots (pane == own there), so this
+    //     strengthens the tint they CAST on their subtree, not their own colour.
+    //   • each level below goes progressively DARKER AND DIMMER: `dimFalloff` steepened
+    //     0.74 → 0.66 (a deeper per-level brightness drop). "Darker and dimmer" are ONE
+    //     axis here — a darker medium-saturation colour reads as dimmer — realised through
+    //     the SINGLE monotone brightness ladder. NAME HONESTY (CLAUDE.md 5): a second
+    //     per-level SATURATION factor was deliberately NOT added — it would break the TZ-8
+    //     dive-rebase continuity (a scalar `brightnessRebase` cannot restore a per-level
+    //     saturation change), and naming two knobs that both drive brightness would be two
+    //     names for one axis. Operator tunes the exact curve at checkpoint with the human.
     private static let baseBrightness: Float = 0.92
     private static let tileSaturation: Float = 0.55
-    // Per-level brightness falloff. INTERNAL (not private) as an earned test seam: the dive
-    // REBASE handoff-continuity test (QuadGeometryTests.testDiveRebaseRgbContinuityAtCommit,
-    // TZ-8 OPERATOR_NOTE #4) must pin the OLD-scene dive endpoint against the NEW-scene rest to
-    // EXACTLY one dim-ladder step — that identity IS this constant, so the test reads it rather
-    // than duplicating the literal 0.74. Simpler alternative rejected: hardcoding 0.74 in the
-    // test, which would silently drift if the ladder were ever re-tuned.
-    static let dimFalloff: Float = 0.74
+    // Per-level brightness falloff (COLOR CASCADE v3: 0.74 → 0.66, steeper = darker with depth).
+    // INTERNAL (not private) as an earned test seam: the dive REBASE handoff-continuity test
+    // (QuadGeometryTests.testDiveRebaseRgbContinuityAtCommit, TZ-8 OPERATOR_NOTE #4) must pin the
+    // OLD-scene dive endpoint against the NEW-scene rest to EXACTLY one dim-ladder step — that
+    // identity IS this constant (rebase == 1/dimFalloff), so the test reads it rather than
+    // duplicating the literal. The continuity holds by construction for ANY falloff value, so the
+    // v3 retune leaves every GlassPane/QuadGeometry endpoint equality green.
+    static let dimFalloff: Float = 0.66
     // Denied space: its OWN warm amber-red, deliberately off the data ramp (VISION
     // §"invisible space is first-class"; name honesty — never approximated as data).
     private static let deniedColor: (Float, Float, Float) = (0.86, 0.34, 0.24)
@@ -166,10 +181,11 @@ public enum QuadBuilder {
     /// ancestor's hue acts as a translucent glass pane over its descendants; at rest the pane
     /// is at this alpha, so the REST (paned) colour is `alpha·pane + (1−alpha)·own` — the
     /// descendant's own hue shows through by `(1−alpha)`, the "rest glimmer" (deliverable 3).
-    /// 0.5 = the pane dominates ~50%, own hue glimmers ~50%. THE TUNING KNOB: if the map reads
-    /// mushy (sibling identity at the focus level unclear), raise this toward 1.0 (more pane,
-    /// less glimmer). Shipped at 0.5 — the ratified rest alpha.
-    public static let paneRestAlpha: Float = 0.5
+    /// 0.72 (COLOR CASCADE v3, PLAN §TZ-10 item 7 — raised from 0.5): the pane dominates ~72%,
+    /// own hue glimmers ~28%, so level-1 ancestors tint their descendants STRONGER. THE TUNING
+    /// KNOB: if the map reads mushy (sibling identity at the focus level unclear), raise toward
+    /// 1.0 (more pane, less glimmer); lower for more per-tile hue. Operator tunes at checkpoint.
+    public static let paneRestAlpha: Float = 0.72
 
     /// TZ-8 OPERATOR_NOTE #5 (2026-08-17, DECISION tz8-rebase-raw-rgb-continuity — RESOLVED): the
     /// DIVE brightness-rebase ENDPOINT. A dive reuses the OUTGOING (parent-focus) scene's ALREADY

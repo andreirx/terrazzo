@@ -86,26 +86,41 @@ final class NavigationController: CanvasInputDelegate {
 
     private let canvas: CanvasView
     private let bottomBar: StatusBar
-    /// The side-panel Ignore list (TZ-5 deliverable 1) — filled here, positioned by
+    /// The side-panel WATCHLIST (TZ-10 item 1) — filled here, positioned by
     /// ChromeContainer. Injected by the Main assembly.
-    private let ignorePanel: IgnorePanel
+    private let watchlistPanel: WatchlistPanel
     /// Set once, right after construction (the Main-assembly late binding that breaks
     /// the ScanController↔NavigationController construction cycle). Owned by AppDelegate.
     weak var scanController: ScanController?
 
-    // MARK: TZ-5 IGNORE lens state (deliverable 1)
-    /// The session's ignored tiles. id/name/hue are snapshots captured off the denormalized
-    /// `TileRect` at ignore time; `bytes` is REFRESHED each scene from the pipeline's live per-id
-    /// retained total (`refreshIgnoreAccounting`, review-0 change 2). This is the authoritative
-    /// set. The pipeline gets the id Set; the panel reads this list. Session-GLOBAL (an ignored
-    /// monster stays ignored and
-    /// accounted regardless of the current focus); cleared on a new scan.
-    private var ignored: [IgnorePanel.Entry] = []
-    /// Fired whenever the ignore set changes (ignore/restore/reset) so the Main assembly can show
-    /// or hide the (only-while-non-empty) Ignore panel and re-flow it.
-    var onIgnoreChanged: (() -> Void)?
-    /// The tile a right-click "Ignore" menu item targets (the deepest tile under the click).
-    private var contextIgnoreTarget: TileRect?
+    // MARK: TZ-10 WATCHLIST state (item 1)
+    /// The session's watchlisted tiles. id/name/relativePath/hue are snapshots captured off the
+    /// denormalized `TileRect` at add time; `bytes` is REFRESHED each scene from the pipeline's live
+    /// per-id retained total (`refreshWatchlistAccounting`). This is the authoritative set. The
+    /// pipeline gets the id Set; the panel reads this list. Session-GLOBAL (a watchlisted monster
+    /// stays excluded regardless of the current focus); cleared on a new scan.
+    private var watchlistEntries: [WatchlistPanel.Entry] = []
+    /// Fired whenever the watchlist changes (add/restore/reset) so the Main assembly can show or hide
+    /// the (only-while-non-empty) Watchlist panel and re-flow it.
+    var onWatchlistChanged: (() -> Void)?
+    /// Pushed on every watchlist-accounting refresh: the current count + the pipeline's exact excluded
+    /// UNION mass. The Main assembly feeds it into the Details dialog (TZ-10 item 5 — accounting moved
+    /// off the status bar). `(0, 0)` on restore-to-empty.
+    var onWatchlistAccounting: ((_ count: Int, _ bytes: Int64) -> Void)?
+    /// The volume ROOT path + display name for this scan, set by the Main assembly (AppDelegate). The
+    /// panel shows each entry's path relative to the volume root (item 1); Export names the volume in
+    /// its header. Default "/" (the boot volume) until the first scan wires the real values.
+    var volumeRootPath = "/"
+    var volumeName = ""
+    /// The right-click ancestor-chain menu's per-row target ids (TZ-10 item 9), indexed by the menu
+    /// item's `tag`: the tile a "Show in Finder" / "Add to Watchlist" / "Show denied items" row acts
+    /// on. Rebuilt per menu.
+    private var contextChainTiles: [TileRect] = []
+    /// The device-pixel cursor point the current context menu was raised at — the anchor for a
+    /// synthetic row's "Show denied items" disclosure popover (item 1 resolution, OPERATOR_NOTE #2).
+    private var contextMenuPoint = Point(x: 0, y: 0)
+    /// Cap on the ancestor-chain menu rows (TZ-10 item 9, "cap: named constant, default 5").
+    private static let maxChainRows = 5
 
     /// A committed on-screen scene captured as prebuilt render state. Concrete users:
     /// `displayed` (what is on screen now) and the `sceneStack` entries (the parent
@@ -161,25 +176,23 @@ final class NavigationController: CanvasInputDelegate {
     /// world. The promoted scene (force-emitted by the pipeline re-root) is recognized in
     /// `onScene` by `newRootId` and drives the inverse-of-dive camera instead of snapping.
     private var pendingPromotion: (newRootId: String, oldRootId: String, oldDisplayed: DisplaySnapshot)?
-    /// Path targeted by the right-click context menu item (deepest tile under click).
-    private var contextTargetPath: String?
-
     private static let sizeFormatter: ByteCountFormatter = {
         let f = ByteCountFormatter(); f.countStyle = .file; f.allowsNonnumericFormatting = false
         return f
     }()
 
-    init(canvas: CanvasView, bottomBar: StatusBar, ignorePanel: IgnorePanel) {
+    init(canvas: CanvasView, bottomBar: StatusBar, watchlistPanel: WatchlistPanel) {
         self.canvas = canvas
         self.bottomBar = bottomBar
-        self.ignorePanel = ignorePanel
+        self.watchlistPanel = watchlistPanel
         canvas.input = self
-        // The on-hover Ignore button excludes the actual HOVERED tile (the deepest tile under the
-        // cursor — review-1 change 1: a nested-tile hover must ignore THAT tile, not its top-level
-        // ancestor); a panel-row click restores. Both wired here (Main-assembly late binding in
-        // AppDelegate).
-        canvas.onIgnore = { [weak self] in self?.ignoreHovered() }
-        ignorePanel.onRestore = { [weak self] id in self?.restore(id) }
+        // The on-hover WATCHLIST button adds the actual HOVERED tile (the deepest tile under the
+        // cursor — a nested-tile hover must watchlist THAT tile, not its top-level ancestor); a
+        // panel-row click restores; the panel's Export button writes the plain-text file. All wired
+        // here (Main-assembly late binding in AppDelegate).
+        canvas.onWatchlist = { [weak self] in self?.addHoveredToWatchlist() }
+        watchlistPanel.onRestore = { [weak self] id in self?.restore(id) }
+        watchlistPanel.onExport = { [weak self] in self?.exportWatchlist() }
     }
 
     /// Diagnostic trace of navigation actions to stdout, gated by `TERRAZZO_TRACE`.
@@ -207,8 +220,9 @@ final class NavigationController: CanvasInputDelegate {
     /// an O(1) read the moment we push/pop the stack; it must NEVER wait for the pipeline's scene to
     /// arrive (the same disease as the old tile-label lag). Called at every dive/ascend/promote
     /// commit BEFORE `applyFocusToPipeline`, so the label is correct before any scene is even posted.
-    /// `setFocusPath` keeps the TZ-4 hover-path override intact: it records the breadcrumb but does
-    /// not repaint while a hover path is showing, so a mid-hover navigation does not stomp the hover.
+    /// `setFocusPath` paints the breadcrumb UNCONDITIONALLY: the TZ-4 hover-path REPLACEMENT was
+    /// removed (StatusBar §"no hover override anymore" — the cursor callout chip carries hover info),
+    /// so the bottom-left path always reflects the focus stack and a mid-hover navigation updates it.
     private func updateFocusPathLabel() {
         bottomBar.setFocusPath(focusStack.last ?? "")
     }
@@ -230,11 +244,11 @@ final class NavigationController: CanvasInputDelegate {
 
     func onScene(_ scene: RenderScene) {
         latestScene = scene
-        // IGNORE accounting is FOCUS-INDEPENDENT (session-global): refresh it BEFORE the focus
+        // WATCHLIST accounting is FOCUS-INDEPENDENT (session-global): refresh it BEFORE the focus
         // guards below, so a scene that will be dropped as stale-focus (dive/ascend in flight)
         // still updates the excluded figure + panel row sizes from the pipeline's live union
-        // (review-0 change 2). Cheap: a no-op when nothing is ignored.
-        refreshIgnoreAccounting(from: scene)
+        // (review-0 change 2). Cheap: a no-op when nothing is watchlistEntries.
+        refreshWatchlistAccounting(from: scene)
         if focusStack.isEmpty {
             focusStack = [scene.focusId]
             bottomBar.setFocusPath(scene.focusId)
@@ -249,7 +263,7 @@ final class NavigationController: CanvasInputDelegate {
             runPromotionCamera(scene: scene, promo: promo)
             return
         }
-        // Ignore a scene laid out for a focus we have already left (in flight when
+        // Skip a scene laid out for a focus we have already left (in flight when
         // the user dived/ascended). The matching scene follows immediately.
         guard scene.focusId == focusStack.last else { return }
         if awaitingFocusScene {
@@ -333,26 +347,25 @@ final class NavigationController: CanvasInputDelegate {
         hoverChain = HitTest.hit(tiles: displayed.tiles, at: p)
         canvas.setHighlightIndex(currentHighlightIndex())
         if let tile = hoverChain?.deepest {
-            // Callout chip anchored ON the tile near the cursor (D9); the hovered node's
-            // full path in the bottom bar (a node id IS its absolute path under the scan).
+            // Callout chip anchored ON the tile near the cursor (D9) — the hover info the operator
+            // reads. TZ-10 item 3: the bottom bar no longer mirrors the hovered path (the chip
+            // already shows it); the bottom-left stays the current enclosing (focus) folder.
             canvas.setCallout(text: calloutText(for: tile), hue: tile.hue, atPx: p)
-            bottomBar.setHoverPath(tile.nodeId)
         } else {
             canvas.clearCallout()
-            bottomBar.setHoverPath(nil)
         }
-        // TZ-5 (review-1 change 1): the on-hover Ignore button anchors on the DEEPEST tile under
-        // the cursor — the tile the user is actually pointing at — not its top-level ancestor.
-        // Shown only when that tile is ignorable: a real filesystem node (not a synthetic
-        // denied-aggregate badge), not the focus ROOT itself (`dimLevel > 0` — ignoring the focus
+        // TZ-10 item 2 (CONSISTENT AFFORDANCE, was TZ-5 review-1 change 1): the on-hover Watchlist
+        // pill anchors on the DEEPEST tile under the cursor — the tile the user is actually pointing
+        // at. Shown only when that tile is watchlistable: a real filesystem node (not a synthetic
+        // denied-aggregate badge), not the focus ROOT itself (`dimLevel > 0` — watchlisting the focus
         // would exclude nothing from the current view yet claim excluded mass, a name-honesty
-        // defect), and wide enough to carry the pill (the canvas applies the same min-width rule as
+        // defect), and wide enough to carry the pill (CanvasView applies the same min-width rule as
         // labels — the context menu covers the small ones). Highlight + dive still target the
-        // top-level tile (`topLevelUnderFocus`); only the IGNORE action follows the cursor down.
+        // top-level tile (`topLevelUnderFocus`); only the WATCHLIST action follows the cursor down.
         if let deep = hoverChain?.deepest, deep.deniedAggregateCount == 0, deep.dimLevel > 0 {
-            canvas.showIgnore(atPx: deep.rect)
+            canvas.showWatchlist(atPx: deep.rect)
         } else {
-            canvas.hideIgnore()
+            canvas.hideWatchlist()
         }
     }
 
@@ -360,8 +373,7 @@ final class NavigationController: CanvasInputDelegate {
         hoverChain = nil
         canvas.setHighlightIndex(-1)
         canvas.clearCallout()
-        canvas.hideIgnore()
-        bottomBar.setHoverPath(nil)
+        canvas.hideWatchlist()
     }
 
     func canvasDidClick(atPx p: Point) {
@@ -431,36 +443,89 @@ final class NavigationController: CanvasInputDelegate {
         }
     }
 
+    /// ANCESTOR-CHAIN CONTEXT MENU (TZ-10 items 9 + 4). The field bug: the map highlighted the
+    /// TOP child under the cursor while the old single-target menu acted on the DEEPEST tile — a
+    /// mismatch. The fix shows EVERY level explicitly: one row per ancestor from the immediate
+    /// child of the focus (dimLevel 1) down to the deepest hit tile, each row TITLED with its path
+    /// RELATIVE to the current viewport folder (item 4). The submenu depends on the row's KIND:
+    ///   • a REAL filesystem row carries "Add to Watchlist" + "Show in Finder";
+    ///   • a SYNTHETIC denied-aggregate badge row carries ONLY its own "Show denied items"
+    ///     disclosure — NEITHER watchlist NOR finder (resolution 2026-08-17 #2 item 1: a synthetic
+    ///     tile is never confused with a real folder; the ratified synthetic-tile rule). Watchlisting
+    ///     a badge is already rejected in `addToWatchlist`; the menu now agrees, and revealing a
+    ///     synthetic path in Finder never made sense.
+    /// The action always targets THAT row's tile — never a guessed one. The `HitChain` already
+    /// carries the ordered ancestor chain (TreemapCore `HitTest`), so this needs no tree traversal.
+    ///
+    /// Capped at `maxChainRows` (default 5): the visible chain rarely exceeds the depth window, but
+    /// if it does we keep the DEEPEST rows (the tile under the cursor is always present — that was
+    /// the whole point of the bug fix), ordered top→deep.
     func canvasContextMenu(atPx p: Point) -> NSMenu? {
-        guard let deepest = HitTest.hit(tiles: displayed.tiles, at: p)?.deepest else { return nil }
+        guard let chain = HitTest.hit(tiles: displayed.tiles, at: p) else { return nil }
+        var levels = chain.chain.filter { $0.dimLevel > 0 } // exclude the focus background tile
+        guard !levels.isEmpty else { return nil }           // pointer on the focus border, no child under it
+        if levels.count > Self.maxChainRows { levels = Array(levels.suffix(Self.maxChainRows)) }
+        contextChainTiles = levels
+        contextMenuPoint = p // anchor for a synthetic row's disclosure popover
+        let focus = focusStack.last ?? ""
         let menu = NSMenu()
-        // Name comes PREBUILT on the hit tile (denormalized off main at layout time) — no
-        // tree traversal on the main actor.
-        contextTargetPath = deepest.nodeId
-        let name = deepest.name.isEmpty ? (deepest.nodeId as NSString).lastPathComponent : deepest.name
-        let item = NSMenuItem(title: "Reveal “\(name)” in Finder",
-                              action: #selector(revealContextTarget), keyEquivalent: "")
-        item.target = self
-        menu.addItem(item)
-        // TZ-5: Ignore ANY real filesystem tile via the context menu — including the nested ones
-        // the hover button skips (deepest is already the hovered nested tile). TWO tiles are
-        // deliberately NOT ignorable, each modeled explicitly (review-1 change 1):
-        //   • a synthetic denied-aggregate badge — not a real folder to exclude; and
-        //   • the FOCUS ROOT itself (`dimLevel == 0`) — the projection roots AT the focus, so
-        //     excluding the focus id drops nothing from the current view, yet ignoreAccounting
-        //     would report its whole subtree as "excluded". Offering it would draw the full map
-        //     while the status bar claimed it excluded — a name-honesty defect. The focus root
-        //     becomes ignorable the moment you ascend and it is an ordinary child again.
-        if deepest.deniedAggregateCount == 0, deepest.dimLevel > 0 {
-            contextIgnoreTarget = deepest
-            let ignoreItem = NSMenuItem(title: "Ignore “\(name)”",
-                                        action: #selector(ignoreContextTarget), keyEquivalent: "")
-            ignoreItem.target = self
-            menu.addItem(ignoreItem)
-        } else {
-            contextIgnoreTarget = nil
+        for (i, tile) in levels.enumerated() {
+            let sub = NSMenu()
+            let rowTitle: String
+            if tile.deniedAggregateCount > 0 {
+                // SYNTHETIC denied-aggregate badge: its OWN action only (item 1 resolution). The
+                // synthetic id (parent + NUL suffix) has no honest relative path, so the row is
+                // titled by what it stands for, matching the click disclosure and hover chip.
+                rowTitle = "\(tile.deniedAggregateCount) denied items"
+                let disclose = NSMenuItem(title: "Show denied items",
+                                          action: #selector(discloseChainRow(_:)), keyEquivalent: "")
+                disclose.target = self; disclose.tag = i
+                sub.addItem(disclose)
+            } else {
+                let rel = RelativePath.of(tile.nodeId, under: focus) // item 4: relative to the viewport folder
+                rowTitle = rel == "." ? tileDisplayName(tile) : rel
+                let add = NSMenuItem(title: "Add to Watchlist",
+                                     action: #selector(watchlistChainRow(_:)), keyEquivalent: "")
+                add.target = self; add.tag = i
+                sub.addItem(add)
+                let reveal = NSMenuItem(title: "Show in Finder",
+                                        action: #selector(revealChainRow(_:)), keyEquivalent: "")
+                reveal.target = self; reveal.tag = i
+                sub.addItem(reveal)
+            }
+            let row = NSMenuItem(title: rowTitle, action: nil, keyEquivalent: "")
+            row.submenu = sub
+            menu.addItem(row)
         }
         return menu
+    }
+
+    /// The display name for a tile (denormalized off main at layout time; last path component fallback).
+    private func tileDisplayName(_ tile: TileRect) -> String {
+        tile.name.isEmpty ? (tile.nodeId as NSString).lastPathComponent : tile.name
+    }
+
+    /// "Add to Watchlist" on an ancestor-chain row (item 9) — targets that exact row's tile.
+    @objc private func watchlistChainRow(_ sender: NSMenuItem) {
+        guard sender.tag >= 0, sender.tag < contextChainTiles.count else { return }
+        addToWatchlist(tile: contextChainTiles[sender.tag])
+    }
+
+    /// "Show in Finder" on an ancestor-chain row (item 9) — targets that exact row's tile.
+    @objc private func revealChainRow(_ sender: NSMenuItem) {
+        guard sender.tag >= 0, sender.tag < contextChainTiles.count else { return }
+        let id = contextChainTiles[sender.tag].nodeId
+        trace("reveal(context) -> \(id)"); FinderActions.revealInFinder(path: id)
+    }
+
+    /// "Show denied items" on a SYNTHETIC denied-aggregate chain row (item 1 resolution) — discloses
+    /// that badge's collapsed denied list, exactly as clicking the badge does, anchored at the point
+    /// the menu was raised. The only action a synthetic row offers (no watchlist, no finder).
+    @objc private func discloseChainRow(_ sender: NSMenuItem) {
+        guard sender.tag >= 0, sender.tag < contextChainTiles.count else { return }
+        let tile = contextChainTiles[sender.tag]
+        guard tile.deniedAggregateCount > 0 else { return }
+        discloseDeniedAggregate(tile, atPx: contextMenuPoint)
     }
 
     // MARK: - Navigation actions
@@ -661,8 +726,7 @@ final class NavigationController: CanvasInputDelegate {
         canvas.setHighlightIndex(-1)
         canvas.setTileLabels([])
         canvas.clearCallout()
-        canvas.hideIgnore()
-        bottomBar.setHoverPath(nil)
+        canvas.hideWatchlist()
         hoverChain = nil
 
         // Remember the flight base + its LAST-frame transform so the commit can build
@@ -756,10 +820,6 @@ final class NavigationController: CanvasInputDelegate {
 
     // MARK: - Finder reveal
 
-    @objc private func revealContextTarget() {
-        if let p = contextTargetPath { trace("reveal(context) -> \(p)"); FinderActions.revealInFinder(path: p) }
-    }
-
     /// ⌘R: reveal the currently hovered tile's deepest node (VISION §Experience 5).
     @objc func revealHovered() {
         guard let tile = hoverChain?.deepest else { trace("reveal(hover) -> <no hover>"); return }
@@ -769,94 +829,114 @@ final class NavigationController: CanvasInputDelegate {
     /// ⌘↑ menu action → zoom out.
     @objc func zoomOut() { ascend() }
 
-    // MARK: - Ignore lens (TZ-5 deliverable 1)
+    // MARK: - Watchlist (TZ-10 item 1)
 
-    /// Ignore the currently-hovered tile — the DEEPEST tile under the cursor (review-1 change 1),
-    /// i.e. the one the on-hover button is anchored on. The founding gesture: retire the tile you
-    /// are pointing at so its siblings claim the freed space. `ignore(tile:)` re-checks eligibility
-    /// (real node, not the focus root) so a stale hover cannot ignore something the button hid.
-    private func ignoreHovered() {
+    /// Add the currently-hovered tile — the DEEPEST tile under the cursor — to the Watchlist, i.e.
+    /// the tile the on-hover pill is anchored on. The founding gesture: retire the tile you are
+    /// pointing at so its siblings claim the freed space. `addToWatchlist(tile:)` re-checks
+    /// eligibility (real node, not the focus root) so a stale hover cannot add something the pill hid.
+    private func addHoveredToWatchlist() {
         guard let tile = hoverChain?.deepest else { return }
-        ignore(tile: tile)
-    }
-
-    /// Ignore the right-click target (deepest tile under the click).
-    @objc private func ignoreContextTarget() {
-        if let tile = contextIgnoreTarget { ignore(tile: tile) }
+        addToWatchlist(tile: tile)
     }
 
     /// Exclude `tile`'s node from layout (its siblings renormalize; ancestors keep their areas —
-    /// the pure projection handles that). Captures the tile's DENORMALIZED name/bytes/hue for the
-    /// panel + status; NO tree traversal. A synthetic denied-aggregate badge or the focus tile
-    /// itself is not ignorable.
-    private func ignore(tile: TileRect) {
+    /// the pure projection handles that). Captures the tile's DENORMALIZED name/bytes/hue + the
+    /// volume-relative path for the panel; NO tree traversal. A synthetic denied-aggregate badge or
+    /// the focus tile itself is not watchlistable.
+    private func addToWatchlist(tile: TileRect) {
         guard tile.deniedAggregateCount == 0, tile.dimLevel > 0 else { return }
         let newId = tile.nodeId
-        guard !ignored.contains(where: { $0.id == newId }) else { return }
-        // ANTICHAIN INVARIANT (review-2 change 2, nested-ignore restore). The ignore set must never
-        // hold an ancestor AND a descendant at once: an excluded ancestor already hides the whole
-        // subtree, so a descendant row could never restore its tile (the panel would claim an
-        // affordance it cannot honor). Two guards keep it an antichain:
-        //   • if an already-ignored ANCESTOR covers this tile, it is already excluded — nothing to
-        //     add (defensive: an excluded ancestor hides the tile, so it is normally not hoverable);
-        //   • ignoring an ANCESTOR SUBSUMES any already-ignored descendants — drop their rows so each
-        //     surviving row stays an independent, restorable exclusion.
-        // Ancestry is pure path logic on the ids (ScanCore `IgnorePath`, the id-is-a-path contract).
-        guard !ignored.contains(where: { IgnorePath.isAncestor($0.id, of: newId) }) else { return }
-        ignored.removeAll { IgnorePath.isAncestor(newId, of: $0.id) }
+        guard !watchlistEntries.contains(where: { $0.id == newId }) else { return }
+        // ANTICHAIN INVARIANT (nested-watchlist restore). The watchlist must never hold an ancestor
+        // AND a descendant at once: an excluded ancestor already hides the whole subtree, so a
+        // descendant row could never restore its tile (the panel would claim an affordance it cannot
+        // honor). Two guards keep it an antichain:
+        //   • if an already-watchlisted ANCESTOR covers this tile, it is already excluded — nothing
+        //     to add (defensive: an excluded ancestor hides the tile, so it is normally not hoverable);
+        //   • watchlisting an ANCESTOR SUBSUMES any already-watchlisted descendants — drop their rows
+        //     so each surviving row stays an independent, restorable exclusion.
+        // Ancestry is pure path logic on the ids (ScanCore `WatchlistPath`, the id-is-a-path contract).
+        guard !watchlistEntries.contains(where: { WatchlistPath.isAncestor($0.id, of: newId) }) else { return }
+        watchlistEntries.removeAll { WatchlistPath.isAncestor(newId, of: $0.id) }
         let name = tile.name.isEmpty ? (newId as NSString).lastPathComponent : tile.name
-        ignored.append(IgnorePanel.Entry(id: newId, name: name,
-                                         bytes: tile.allocatedBytes, hue: tile.hue))
-        trace("ignore -> \(newId)")
-        canvas.hideIgnore()
-        applyIgnored()
+        watchlistEntries.append(WatchlistPanel.Entry(
+            id: newId, name: name,
+            relativePath: RelativePath.of(newId, under: volumeRootPath), // item 1: relative to the volume
+            bytes: tile.allocatedBytes, hue: tile.hue))
+        trace("watchlist -> \(newId)")
+        canvas.hideWatchlist()
+        applyWatchlist()
     }
 
-    /// Restore an ignored tile (one click on its Ignore-list row). Because the ignore set is an
-    /// ANTICHAIN (see `ignore(tile:)`), the restored id has no ignored ancestor still excluding it,
-    /// so removing it always brings its tile back — the row's one-click affordance is honest.
+    /// Restore a watchlisted tile (one click on its Watchlist row). Because the watchlist is an
+    /// ANTICHAIN (see `addToWatchlist(tile:)`), the restored id has no watchlisted ancestor still
+    /// excluding it, so removing it always brings its tile back — the row's one-click affordance is honest.
     private func restore(_ id: String) {
-        guard ignored.contains(where: { $0.id == id }) else { return }
-        ignored.removeAll { $0.id == id }
+        guard watchlistEntries.contains(where: { $0.id == id }) else { return }
+        watchlistEntries.removeAll { $0.id == id }
         trace("restore -> \(id)")
-        applyIgnored()
+        applyWatchlist()
     }
 
-    /// Push the ignore set to the pipeline (off main → siblings renormalize), refresh the panel,
-    /// and — on restore-to-empty only — clear the status figure. One place, so ignore/restore/reset
+    /// Push the watchlist to the pipeline (off main → siblings renormalize), refresh the panel,
+    /// and — on restore-to-empty only — clear the accounting figure. One place, so add/restore/reset
     /// stay consistent.
     ///
-    /// EXCLUDED BYTES ARE NEVER COMPUTED HERE (review-1 change 2). The status "X excluded" figure
-    /// must only ever be the pipeline actor's exact UNION (`RenderScene.ignoredBytes`), which is
-    /// streaming-current and overlap-deduplicated. The App's earlier snapshot sum
-    /// (`Σ row.bytes`) DOUBLE-COUNTED an ancestor+descendant pair and froze on a growing subtree,
-    /// so it could momentarily show a non-union total — exactly what the reviewer forbids. Instead:
-    /// `setIgnored` force-emits a scene within a frame, and `refreshIgnoreAccounting` sets the count
-    /// AND the union bytes together from that scene. The one case with no scene to refresh from is
-    /// restore-to-EMPTY (the pipeline stops accounting an empty set): clear the field to zero here.
-    /// A one-frame absence of the figure on an ignore is preferable to a wrong (non-union) number.
-    private func applyIgnored() {
-        scanController?.setIgnored(Set(ignored.map(\.id)))
-        ignorePanel.setEntries(ignored)
-        if ignored.isEmpty { bottomBar.setIgnoredAccounting(count: 0, bytes: 0) }
-        onIgnoreChanged?() // Main assembly shows/hides + re-flows the panel
+    /// EXCLUDED BYTES ARE NEVER COMPUTED HERE. The "X excluded" figure must only ever be the pipeline
+    /// actor's exact UNION (`RenderScene.watchlistBytes`), which is streaming-current and
+    /// overlap-deduplicated. The App's earlier snapshot sum (`Σ row.bytes`) DOUBLE-COUNTED an
+    /// ancestor+descendant pair and froze on a growing subtree. Instead: `setWatchlist` force-emits a
+    /// scene within a frame, and `refreshWatchlistAccounting` sets the count AND the union bytes
+    /// together from that scene. The one case with no scene to refresh from is restore-to-EMPTY (the
+    /// pipeline stops accounting an empty set): push `(0, 0)` here. The accounting now feeds the
+    /// Details dialog (TZ-10 item 5) via `onWatchlistAccounting`, not the status bar.
+    private func applyWatchlist() {
+        scanController?.setWatchlist(Set(watchlistEntries.map(\.id)))
+        watchlistPanel.setEntries(watchlistEntries)
+        if watchlistEntries.isEmpty { onWatchlistAccounting?(0, 0) }
+        onWatchlistChanged?() // Main assembly shows/hides + re-flows the panel
     }
 
-    /// Refresh the ignore accounting from a freshly-emitted scene (review-0 change 2). The pipeline
-    /// re-computes the excluded UNION mass + each ignored id's current retained total on its actor
-    /// every emit, so this is where the App's status figure and panel row sizes become
-    /// streaming-current and overlap-correct — never the stale/double-counted snapshot sums the App
-    /// used before. No-op while nothing is ignored. Only rebuilds the panel rows when a size
+    /// Refresh the watchlist accounting from a freshly-emitted scene. The pipeline re-computes the
+    /// excluded UNION mass + each watchlisted id's current retained total on its actor every emit, so
+    /// this is where the App's accounting figure and panel row sizes become streaming-current and
+    /// overlap-correct. No-op while the watchlist is empty. Only rebuilds the panel rows when a size
     /// actually changed, so a quiet streaming cadence does not churn the row views.
-    private func refreshIgnoreAccounting(from scene: RenderScene) {
-        guard !ignored.isEmpty else { return }
+    private func refreshWatchlistAccounting(from scene: RenderScene) {
+        guard !watchlistEntries.isEmpty else { return }
         var rowSizeChanged = false
-        for i in ignored.indices {
-            let live = scene.ignoredCurrentById[ignored[i].id] ?? ignored[i].bytes
-            if live != ignored[i].bytes { ignored[i].bytes = live; rowSizeChanged = true }
+        for i in watchlistEntries.indices {
+            let live = scene.watchlistCurrentById[watchlistEntries[i].id] ?? watchlistEntries[i].bytes
+            if live != watchlistEntries[i].bytes { watchlistEntries[i].bytes = live; rowSizeChanged = true }
         }
-        bottomBar.setIgnoredAccounting(count: ignored.count, bytes: scene.ignoredBytes)
-        if rowSizeChanged { ignorePanel.setEntries(ignored) }
+        onWatchlistAccounting?(watchlistEntries.count, scene.watchlistBytes)
+        if rowSizeChanged { watchlistPanel.setEntries(watchlistEntries) }
+    }
+
+    /// EXPORT the watchlist to a plain-text file (TZ-10 item 1). The FORMAT is the pure
+    /// `WatchlistExport` (testable); AppKit only presents the NSSavePanel and writes the bytes. The
+    /// header names the volume + today's date; rows are `bytes<TAB>/relative/path`, largest first.
+    private func exportWatchlist() {
+        guard !watchlistEntries.isEmpty else { return }
+        let rows = watchlistEntries.map {
+            WatchlistExport.Row(bytes: $0.bytes,
+                                relativePath: RelativePath.of($0.id, under: volumeRootPath))
+        }
+        let date = ISO8601DateFormatter.string(from: Date(), timeZone: .current,
+                                               formatOptions: [.withFullDate])
+        let volume = volumeName.isEmpty ? volumeRootPath : volumeName
+        let text = WatchlistExport.text(volume: volume, date: date, rows: rows)
+
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "terrazzo-watchlist.txt"
+        panel.allowedContentTypes = [.plainText]
+        panel.canCreateDirectories = true
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            do { try text.write(to: url, atomically: true, encoding: .utf8) }
+            catch { NSLog("Watchlist export failed: \(error)") }
+        }
     }
 
     // MARK: - Focus fallback (TZ-7 — the map never points at a ghost)
@@ -958,14 +1038,13 @@ final class NavigationController: CanvasInputDelegate {
         flightBaseQuads = []; flightBaseNodeIds = []
         canvas.setHighlightIndex(-1)
         canvas.clearCallout()
-        canvas.hideIgnore()
+        canvas.hideWatchlist()
         canvas.setTileLabels([])
-        bottomBar.setHoverPath(nil)
-        // TZ-5: a fresh scan starts with an empty ignore set (the new pipeline defaults to none);
+        // TZ-10: a fresh scan starts with an empty watchlist (the new pipeline defaults to none);
         // clear the App-side list, panel, and status figure to match.
-        ignored = []
-        applyIgnored()
-        contextIgnoreTarget = nil
+        watchlistEntries = []
+        applyWatchlist()
+        contextChainTiles = []
     }
 
     // MARK: - Hover callout / path text (TZ-4 D9)

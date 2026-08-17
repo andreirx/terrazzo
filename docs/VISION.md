@@ -5,11 +5,13 @@
 A native macOS application that shows **where your disk space actually is** —
 as a live, zoomable, nested **treemap** (Shneiderman; squarified per Bruls et
 al.): a black canvas where every folder is a rectangle sized by its disk
-footprint — sqrt-compressed by default (power-law scale-invariance;
+footprint — shown in **linear true-proportion by default** (TZ-10, ratified
+2026-08-17: the map's default must not distort real byte proportions), with
+a **sqrt-compressed mode** one toggle away (power-law scale-invariance;
 ratified 2026-08-17, superseding log — see PLAN §TZ-5) so giants cannot
-eclipse the long tail, with a linear true-proportion mode one toggle away
-(amended 2026-08-16; the active scale is always labeled and the NUMBERS
-on tiles are always real bytes) — children tiling their parent, each
+eclipse the long tail when the user chooses it. The active scale is always
+labeled and the NUMBERS on tiles are always real bytes (amended 2026-08-16)
+— children tiling their parent, each
 nesting level drawn progressively dimmer. The finviz-heatmap look, applied to your
 filesystem, from the volume root down.
 
@@ -30,21 +32,23 @@ free-space mystery**. Terrazzo renders:
   "typically hidden from users' view" is the product. (Amended 2026-08-16:
   a display checkbox "Show hidden files and folders" exists, ON by
   default — a visualization filter only; the scan always includes them,
-  and filtered-out mass is accounted in the status bar, never silently
-  dropped.)
+  and filtered-out mass is accounted in the Details dialog (TZ-10 moved
+  the full accounting off the status bar), never silently dropped.)
 - **Denied space** — directories the scan cannot enter (other users' homes,
   TCC-protected areas) render as visibly distinct tiles sized by what the
   volume accounting implies, never dropped.
-- **Unaccounted space** — a STATUS-BAR figure per volume (amended
-  2026-08-16, human field ruling: the earlier synthetic map tile rendered
-  a volume-level quantity inside a subtree map — a category error,
-  retracted): `capacity − free − scanned total`, decomposed as purgeable
-  + other-users/unknown. The number is always shown; it is never drawn
-  as a rectangle pretending to be a folder.
-- **Purgeable vs free** — the volume header shows capacity, free, and
+- **Unaccounted space** — a per-volume figure in the Details dialog
+  (amended 2026-08-16, human field ruling: the earlier synthetic map tile
+  rendered a volume-level quantity inside a subtree map — a category error,
+  retracted; TZ-10 further moved the figure off the status bar into the
+  Details dialog): `capacity − free − scanned total`, decomposed as
+  purgeable + other-users/unknown. The number is always shown; it is never
+  drawn as a rectangle pretending to be a folder.
+- **Purgeable vs free** — the Details dialog shows capacity, free, and
   purgeable (the APFS quantity that makes "available space" differ between
   contexts and users) via both `volumeAvailableCapacity` and
-  `volumeAvailableCapacityForImportantUsage`.
+  `volumeAvailableCapacityForImportantUsage`. The bottom bar keeps only the
+  founding "Free X of Y capacity" figure one glance away (TZ-10, OPERATOR_NOTE A).
 
 ## The two engines (ratified separation)
 
@@ -61,8 +65,9 @@ DTO is the single crossing point.
 
 ## Experience
 
-1. Launch → pick a volume (or default to the boot volume root). Volume
-   header: capacity / free / purgeable / unaccounted.
+1. Launch → pick a volume (or default to the boot volume root). The bottom
+   bar shows "Free X of Y capacity"; the Details dialog holds the full
+   accounting (capacity / free / purgeable / unaccounted).
 2. The canvas fills progressively as the scan streams: top-level folders as
    bright rectangles, 2nd level dimmer inside them, 3rd dimmer still —
    default **depth 5** visible/scanned (setting).

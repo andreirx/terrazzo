@@ -36,7 +36,7 @@ final class ControlBar: NSView {
     private let etaLabel = NSTextField(labelWithString: "")
 
     // TZ-5 visualization-lens controls (deliverables 2/3/4).
-    /// Scale toggle: segment 0 = Sqrt (default), 1 = Linear (deliverable 2).
+    /// Scale toggle: segment 0 = Sqrt, 1 = Linear (the ratified DEFAULT — TZ-10 item 6; deliverable 2).
     private let scaleControl = NSSegmentedControl(labels: ["Sqrt", "Linear"],
                                                   trackingMode: .selectOne, target: nil, action: nil)
     /// Show-hidden checkbox, ON by default (deliverable 3).
@@ -86,12 +86,12 @@ final class ControlBar: NSView {
         rescanButton.action = #selector(rescanClicked)
         rescanButton.toolTip = "Cancel and re-run the scan for the current volume."
 
-        // Scale toggle (deliverable 2). Segment 0 = Sqrt (the ratified default), 1 = Linear.
-        scaleControl.selectedSegment = 0
+        // Scale toggle. Segment 0 = Sqrt, 1 = Linear (the ratified DEFAULT — TZ-10 item 6).
+        scaleControl.selectedSegment = 1
         scaleControl.controlSize = .small
         scaleControl.target = self
         scaleControl.action = #selector(scaleChanged)
-        scaleControl.toolTip = "Tile area scale. Sqrt (default) compresses giant folders so the long tail is visible, while equal size ratios render as equal area ratios at every depth; Linear shows true proportions. The sizes on tiles are always real bytes in either mode."
+        scaleControl.toolTip = "Tile area scale. Linear (default) shows true proportions; Sqrt compresses giant folders so the long tail is visible, while equal size ratios render as equal area ratios at every depth. The sizes on tiles are always real bytes in either mode."
         scaleControl.setContentHuggingPriority(.defaultHigh, for: .horizontal)
 
         // Show-hidden checkbox (deliverable 3), ON by default.
@@ -99,7 +99,7 @@ final class ControlBar: NSView {
         hiddenCheck.controlSize = .small
         hiddenCheck.target = self
         hiddenCheck.action = #selector(hiddenChanged)
-        hiddenCheck.toolTip = "Show hidden files and folders (dotfiles and UF_HIDDEN items). On by default. The scan ALWAYS includes them — unchecking only filters them from the map, with the filtered size shown in the status bar."
+        hiddenCheck.toolTip = "Show hidden files and folders (dotfiles and UF_HIDDEN items). On by default. The scan ALWAYS includes them — unchecking only filters them from the map, with the filtered size shown in the Details dialog."
 
         // Depth stepper + value label (deliverable 4), default 5.
         depthStepper.minValue = Double(Self.depthRange.min)
@@ -187,17 +187,42 @@ final class ControlBar: NSView {
     /// the ETA (volume-root) and the subtree readout.
     func update(_ progress: ScanProgress) {
         sampleRate(progress)
+        // TZ-10 item 8: the bar STOPS at completion — no indeterminate bounce after "done" (the field
+        // bug: a subtree scan's barber-pole kept animating post-scan). A finished scan settles the bar
+        // to determinate-full and halts the animation; `progressIsAnimating` exposes that state for
+        // the chrome audit's state assertion.
+        guard progress.running else {
+            stopIndeterminate()
+            progressBar.doubleValue = progressBar.maxValue
+            etaLabel.stringValue = readout(for: progress) // "done"
+            return
+        }
         if let fraction = progress.fraction {
-            if progressBar.isIndeterminate { progressBar.isIndeterminate = false }
+            stopIndeterminate()
             progressBar.doubleValue = fraction
         } else {
             // Subtree scan (or no denominator yet) — show motion, not a fake 0 %.
-            if !progressBar.isIndeterminate {
+            if !progressAnimating {
                 progressBar.isIndeterminate = true
                 progressBar.startAnimation(nil)
+                progressAnimating = true
             }
         }
         etaLabel.stringValue = readout(for: progress)
+    }
+
+    /// Whether the indeterminate barber-pole is currently animating. NSProgressIndicator exposes no
+    /// public "isAnimating", so we track it — the chrome audit reads this to prove item 8 (the bar is
+    /// NOT animating once a scan reports complete).
+    private(set) var progressAnimating = false
+
+    /// Halt + clear the indeterminate animation (idempotent).
+    private func stopIndeterminate() {
+        if progressBar.isIndeterminate {
+            progressBar.stopAnimation(nil)
+            progressBar.isIndeterminate = false
+        }
+        progressAnimating = false
     }
 
     /// Measure the rolling files/sec rate into `smoothedRate` (EMA over two timed
@@ -226,11 +251,14 @@ final class ControlBar: NSView {
     /// for a subtree), so this view never re-derives the volume-root rule.
     private func readout(for progress: ScanProgress) -> String {
         guard progress.running else { return "done" }
-        // Volume-root scan: an honest ETA (nil ⇒ still estimating the rate).
+        // Volume-root scan: an honest ETA. TWO nil cases are DISTINCT (OPERATOR_NOTE 2026-08-17 B —
+        // "never render a negative or absurd duration; show — instead"):
+        //   • no rate sample yet (rate ≤ 0) ⇒ "estimating…" (we simply do not know yet);
+        //   • a rate exists but the pure `etaSeconds` declined it (remaining 0, or the extrapolation
+        //     exceeded `ScanProgress.etaCeilingSeconds` — the field "~1931379388h" absurdity) ⇒ "—".
         if progress.isVolumeRoot {
-            guard let seconds = progress.etaSeconds(filesPerSecond: smoothedRate) else {
-                return "estimating…"
-            }
+            guard smoothedRate > 0 else { return "estimating…" }
+            guard let seconds = progress.etaSeconds(filesPerSecond: smoothedRate) else { return "—" }
             return "~\(Self.formatDuration(seconds)) left"
         }
         // Subtree scan: files processed + rate, NO percentage, NO ETA.
@@ -261,6 +289,7 @@ final class ControlBar: NSView {
     /// carry a stale rate across scans.
     func resetProgressSampling() {
         lastFiles = 0; lastSampleTime = 0; smoothedRate = 0
+        stopIndeterminate() // a new scan starts from a settled bar, never a stale barber-pole (item 8)
         progressBar.doubleValue = 0
         etaLabel.stringValue = ""
     }
