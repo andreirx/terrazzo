@@ -122,17 +122,42 @@ public struct RenderScene: Equatable, Sendable {
     public let belowPixelCount: Int
     /// Whether the scan is still streaming (drives the status indicator).
     public let running: Bool
+    /// The AREA SCALE this scene was laid out with (TZ-5 deliverable 2). Echoed back so the
+    /// status bar's always-visible "Log scale"/"Linear" label reflects the ACTUAL rendered
+    /// scene, not a separate copy of the toggle state (name honesty: the label matches what
+    /// is drawn). Default `.log` — the ratified default scale.
+    public let scaleMode: AreaScale
+    /// Retained total of the nodes DROPPED for being HIDDEN in this projection (TZ-5
+    /// deliverable 3) — the "hidden filtered · X GB" status figure. 0 when show-hidden is on
+    /// (nothing filtered) or nothing hidden is in view. Excludes ignored nodes (their mass is
+    /// the App's ignored figure) — no double-count. Computed on the pipeline actor by
+    /// `ScanReducer.makeRenderTree`; the App only formats it.
+    public let hiddenFilteredBytes: Int64
     /// Entries stat'd so far (`ScanReducer.processedCount`) — the NUMERATOR of the
     /// file-count progress bar (TZ-4). O(1) off the reducer; the App divides it by the
     /// statfs used-inode denominator it read at scan start. Rides on the scene because
     /// the reducer lives on the pipeline actor; main never touches the reducer.
     public let filesProcessed: Int
+    /// The EXACT excluded UNION mass of the IGNORE set (TZ-5 deliverable 1) — the status bar's
+    /// "X GB excluded" figure. Computed on the pipeline actor by `ScanReducer.ignoreAccounting`
+    /// from CURRENT reducer state EVERY emit, so it stays honest while the scan streams (an
+    /// ignored directory that keeps growing is re-summed) and deduplicates overlap (an ignored
+    /// node under an ignored ancestor is not counted twice). Replaces the App's earlier
+    /// stale/double-counting snapshot sums (review-0 change 2). 0 when nothing is ignored.
+    public let ignoredBytes: Int64
+    /// Each ignored id's CURRENT retained subtree total (TZ-5 deliverable 1) — drives the live
+    /// per-row size in the Ignore panel, so a growing ignored directory's row size tracks the
+    /// scan rather than freezing at its size-when-ignored. Focus-independent (session-global).
+    /// Empty when nothing is ignored.
+    public let ignoredCurrentById: [String: Int64]
 
     public init(generation: Int, focusId: String, viewport: Rect,
                 tiles: [TileRect], nodeIds: [String], quads: [GPUQuad], settleFrom: [GPUQuad],
                 labels: [SceneLabel], tree: SizeTree, belowPixelCount: Int,
                 running: Bool, filesProcessed: Int = 0,
-                scannedBytes: Int64? = nil) {
+                scannedBytes: Int64? = nil,
+                scaleMode: AreaScale = .log, hiddenFilteredBytes: Int64 = 0,
+                ignoredBytes: Int64 = 0, ignoredCurrentById: [String: Int64] = [:]) {
         self.generation = generation
         self.focusId = focusId
         self.viewport = viewport
@@ -145,6 +170,10 @@ public struct RenderScene: Equatable, Sendable {
         self.belowPixelCount = belowPixelCount
         self.running = running
         self.filesProcessed = filesProcessed
+        self.scaleMode = scaleMode
+        self.hiddenFilteredBytes = hiddenFilteredBytes
+        self.ignoredBytes = ignoredBytes
+        self.ignoredCurrentById = ignoredCurrentById
         // Default to the tree root's total for the WHOLE-TREE (focus == root) case and for
         // test constructors that don't distinguish; the pipeline always passes the true
         // scan-root total explicitly under a focus-rooted (dived) projection.

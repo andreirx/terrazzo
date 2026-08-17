@@ -141,6 +141,13 @@ final class FixtureWalkTests: XCTestCase {
         XCTAssertEqual(childNamed(tree, ".hidden")?.kind, .file)
         XCTAssertEqual(childNamed(tree, "visible.txt")?.kind, .file)
 
+        // TZ-5 deliverable 3: the walker CAPTURES the hidden flag at scan time (a leading-dot
+        // name here) so the "Show hidden files" lens can filter it — while the scan still INCLUDES
+        // it (it is present above). A non-dotfile entry is not hidden.
+        XCTAssertEqual(childNamed(tree, ".hidden")?.isHidden, true, "the dotfile is flagged hidden by the walker")
+        XCTAssertEqual(childNamed(tree, "visible.txt")?.isHidden, false, "an ordinary file is not hidden")
+        XCTAssertEqual(childNamed(tree, "sub")?.isHidden, false, "an ordinary directory is not hidden")
+
         // Fully-readable bundle: opaque, no child tiles, sized.
         let foo = try XCTUnwrap(childNamed(tree, "Foo.app"))
         XCTAssertEqual(foo.kind, .bundleLeaf)
@@ -165,6 +172,45 @@ final class FixtureWalkTests: XCTestCase {
 
         let sub = try XCTUnwrap(childNamed(tree, "sub"))
         XCTAssertEqual(sub.children.map(\.name), ["inner.txt"])
+    }
+
+    // MARK: - Non-dot UF_HIDDEN regular file (review-0 change 1)
+
+    /// A REGULAR FILE with NO leading dot but the `UF_HIDDEN` chflags bit must be reported
+    /// `isHidden == true`. This is the case the earlier walker MISSED: a regular file's size is
+    /// inline in the getattrlistbulk buffer, so the reader never `lstat`s it — and the earlier
+    /// code read the hidden flag only from that (never-taken) lstat, so a non-dot UF_HIDDEN file
+    /// slipped through as visible. The fix reads `UF_HIDDEN` from `ATTR_CMN_FLAGS` in the same
+    /// bulk buffer (every object kind carries it), so this file is now correctly flagged — with
+    /// NO extra syscall on the file fast path. Built in its OWN temp tree so the shared golden
+    /// fixture's exact child lists are untouched.
+    func testNonDotUFHiddenRegularFileIsFlaggedHidden() async throws {
+        let fm = FileManager.default
+        let base = fm.temporaryDirectory
+            .appendingPathComponent("tz5-ufhidden-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: base, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: base) }
+
+        let plain = base.appendingPathComponent("plain.txt")     // ordinary regular file
+        try Data("visible".utf8).write(to: plain)
+        let marked = base.appendingPathComponent("marked.bin")   // NON-dot regular file, UF_HIDDEN
+        try Data("hidden by chflags".utf8).write(to: marked)
+        // UF_HIDDEN (0x8000) via chflags — the "hidden" attribute the Finder honors on a
+        // non-dot file. Returns 0 on success.
+        XCTAssertEqual(chflags(marked.path, UInt32(UF_HIDDEN)), 0, "chflags UF_HIDDEN must succeed")
+
+        var reducer = ScanReducer(rootId: base.path, rootName: base.lastPathComponent)
+        for await batch in FileSystemWalker.scan(root: base) { reducer.apply(batch) }
+        let tree = reducer.makeTree(depthWindow: Self.window)
+
+        XCTAssertEqual(tree.children.first { $0.name == "marked.bin" }?.isHidden, true,
+                       "a NON-dot UF_HIDDEN regular file is flagged hidden (bulk ATTR_CMN_FLAGS, no lstat)")
+        XCTAssertEqual(tree.children.first { $0.name == "plain.txt" }?.isHidden, false,
+                       "an ordinary regular file is not hidden")
+        // Still SCANNED (present with its real size) — the scan always INCLUDES hidden items;
+        // the flag only lets the visualization lens filter it.
+        let m = try XCTUnwrap(tree.children.first { $0.name == "marked.bin" }, "the hidden file is still scanned")
+        XCTAssertGreaterThan(m.allocatedBytes, 0, "its real size is measured (scan includes hidden mass)")
     }
 
     // MARK: - Bundle denial (review TZ-2 point 3)

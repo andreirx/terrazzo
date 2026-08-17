@@ -53,6 +53,14 @@ struct ScanStatus {
     /// (OPERATOR_NOTE #2 item 2): a subtree scan shows files/sec + a count, not a fraction
     /// against the volume-wide inode denominator.
     var isVolumeRoot: Bool = false
+    /// The active AREA SCALE this scene was rendered with (TZ-5 deliverable 2). Drives the
+    /// always-visible "Log scale"/"Linear" status field (the honesty guard). Echoed from the
+    /// scene, so the label matches what is actually drawn. Default `.log` (the ratified default).
+    var scaleMode: AreaScale = .log
+    /// Retained total of nodes filtered out for being HIDDEN (TZ-5 deliverable 3), from the scene.
+    /// Drives the "hidden filtered · X GB" field, shown only when non-zero (show-hidden off AND
+    /// hidden mass in view). Default 0 keeps pre-TZ-5 call sites compiling.
+    var hiddenFilteredBytes: Int64 = 0
 
     /// The file-count progress derived from this status (TZ-4). The ControlBar renders
     /// its clamped fraction + ETA (volume-root scan) or files/sec + count (subtree scan);
@@ -89,7 +97,22 @@ final class StatusBar: NSView {
     /// (the CanvasView.setTileLabels pattern). `fields(_:)` returns a variable-length
     /// subset; extra labels hide.
     private var fieldLabels: [NSTextField] = []
-    private static let maxFields = 8
+    /// Up to: Capacity/Free/Reclaimable/Available up to/Scanned/Unaccounted (6) + Ignored +
+    /// Hidden-filtered + below-pixel + Scale + scan-indicator (5) = 11 (TZ-5 added the last 3
+    /// visualization-lens fields to the TZ-4 set).
+    private static let maxFields = 11
+
+    /// IGNORE accounting (TZ-5 deliverable 1) — the count of ignored tiles + the EXCLUDED UNION
+    /// mass, pushed by NavigationController. The count is App-owned (the ignore set it holds); the
+    /// bytes are the pipeline's live `RenderScene.ignoredBytes` — the reducer's exact union of the
+    /// ignored subtrees, recomputed every emit (streaming-current, overlap-deduplicated, review-0
+    /// change 2), NOT a sum of size-at-ignore snapshots. Session-GLOBAL (an ignored monster stays
+    /// counted regardless of the current focus). Rebuilt into the field row on either update.
+    private var ignoredCount = 0
+    private var ignoredBytes: Int64 = 0
+    /// The last scene-derived status, held so an ignore-accounting change can rebuild the row
+    /// without waiting for the next scene.
+    private var lastStatus: ScanStatus?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -130,16 +153,85 @@ final class StatusBar: NSView {
 
     required init?(coder: NSCoder) { fatalError("StatusBar is code-only") }
 
+    /// A width change (live window resize) re-runs the responsive field drop against the new width,
+    /// without rebuilding the field strings (review-1 change 4).
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        if !currentFields.isEmpty { applyResponsiveVisibility() }
+    }
+
     func update(_ status: ScanStatus) {
-        let fields = Self.fields(status)
-        for (i, label) in fieldLabels.enumerated() {
-            if i < fields.count {
-                label.stringValue = fields[i].value
-                label.toolTip = fields[i].tooltip
-                label.isHidden = false
-            } else {
-                label.isHidden = true
+        lastStatus = status
+        rebuild()
+    }
+
+    /// Push the IGNORE accounting (TZ-5 deliverable 1). `bytes` is ALWAYS the pipeline's exact
+    /// excluded UNION mass (`RenderScene.ignoredBytes`), never an App-side snapshot sum
+    /// (review-1 change 2): NavigationController calls this from `refreshIgnoreAccounting` on each
+    /// scene, and once with `(0, 0)` on restore-to-empty. Streaming-current and
+    /// overlap-deduplicated by construction.
+    func setIgnoredAccounting(count: Int, bytes: Int64) {
+        ignoredCount = count
+        ignoredBytes = bytes
+        rebuild()
+    }
+
+    /// Width reserved at the LEADING edge for the focus breadcrumb + margins + the stack gap, when
+    /// computing how much room the trailing figures have. The breadcrumb head-truncates into this
+    /// floor under pressure (volume figures take priority — the compression rule below); it is a
+    /// capacity budget for the drop math, not a hard focus width.
+    private static let reservedLeadingWidth: CGFloat = 84
+
+    private func rebuild() {
+        guard let status = lastStatus else { return }
+        let fields = Self.fields(status, ignoredCount: ignoredCount, ignoredBytes: ignoredBytes)
+        // Assign content to the reused pool (extra slots blanked); the responsive pass decides which
+        // stay visible.
+        for (i, label) in fieldLabels.enumerated() where i < fields.count {
+            label.stringValue = fields[i].value
+            label.toolTip = fields[i].tooltip
+        }
+        currentFields = fields
+        applyResponsiveVisibility()
+    }
+
+    /// The fields currently assigned to the pool (index-parallel with the leading `fieldLabels`),
+    /// held so a width change (`setFrameSize`) can re-run the drop without rebuilding the strings.
+    private var currentFields: [VolumeField] = []
+
+    /// RESPONSIVE STRIP (review-1 change 4). Show as many fields as fit the strip width; when they
+    /// don't all fit, DROP the lowest-`rank` fields first (widest-first among equal rank, to free
+    /// the most space per drop), never an `essential` one — so the TZ-5 required figures (active
+    /// scale, ignored/hidden accounting, scan state) stay unclipped at every width while the verbose
+    /// volume detail yields. Deterministic (measured intrinsic widths, no reliance on NSStackView
+    /// auto-detach) so the chrome-visibility gate can prove it at 700 and 1400 px.
+    private func applyResponsiveVisibility() {
+        let fields = currentFields
+        let widths = (0..<fields.count).map { fieldLabels[$0].intrinsicContentSize.width }
+        var keep = Set(0..<fields.count)
+        func totalWidth() -> CGFloat {
+            let content = keep.reduce(CGFloat(0)) { $0 + widths[$1] }
+            return content + CGFloat(max(0, keep.count - 1)) * volumeStack.spacing
+        }
+        let available = max(0, bounds.width - Self.reservedLeadingWidth - 10) // -10 trailing margin
+        // Only drop once the view has a real width (0 before first layout → keep all; setFrameSize
+        // reruns this with the true width). Essentials are never dropped, so a width too small for
+        // even them leaves them in place (the unavoidable minimum) rather than blanking the strip.
+        if bounds.width > 1 {
+            while totalWidth() > available {
+                let victim = keep
+                    .filter { fields[$0].importance != .essential }
+                    .min { a, b in
+                        let ra = fields[a].importance.rank, rb = fields[b].importance.rank
+                        return ra != rb ? ra < rb : widths[a] > widths[b] // lowest rank, then widest
+                    }
+                guard let victim else { break } // only essentials remain
+                keep.remove(victim)
             }
+        }
+        for (i, label) in fieldLabels.enumerated() {
+            let visible = i < fields.count && keep.contains(i)
+            if label.isHidden == visible { label.isHidden = !visible } // touch only on real change
         }
     }
 
@@ -183,38 +275,83 @@ final class StatusBar: NSView {
 
     private static func b(_ v: Int64) -> String { bytes.string(fromByteCount: v) }
 
-    /// One rendered field: the on-strip text and its one-sentence hover tooltip.
-    struct VolumeField: Equatable { let value: String; let tooltip: String }
+    /// How hard a field fights to STAY VISIBLE when the strip is too narrow for all of them
+    /// (review-1 change 4). The strip carries up to 11 fields; at 700 px they cannot all fit, so
+    /// the low-value volume figures must yield while the required TZ-5 fields stay readable. The
+    /// responsive layout (`applyResponsiveVisibility`) drops the LOWEST-rank fields first until the
+    /// rest fit the strip width; `essential` is never dropped. (An earlier draft leaned on
+    /// NSStackView's own `visibilityPriority` auto-detach, but under an unsatisfiable width the
+    /// stack broke its trailing constraint and OVERFLOWED off the right edge instead of detaching —
+    /// the chrome-visibility gate caught the essentials clipped at x≈930…1415 on the 700 px strip.
+    /// So the drop decision is made HERE, deterministically, from measured field widths.)
+    enum Importance: Equatable {
+        /// TZ-5 required-always fields: active scale, ignored accounting, hidden-filtered
+        /// accounting, scan state. The slice mandates these remain visibly readable at every width.
+        case essential
+        /// Core scan figures worth keeping when there is room (Scanned total): drop only under
+        /// severe pressure.
+        case high
+        /// Ordinary informational fields (Free, below-pixel count).
+        case normal
+        /// Verbose volume-reconciliation detail (Capacity, Reclaimable, Available up to,
+        /// Unaccounted): the first to yield on a narrow window — its numbers live in the tooltips.
+        case low
+
+        /// Drop order: LOWER rank yields first. `essential` (highest) never yields.
+        var rank: Int {
+            switch self {
+            case .low: return 0
+            case .normal: return 1
+            case .high: return 2
+            case .essential: return 3
+            }
+        }
+    }
+
+    /// One rendered field: the on-strip text, its one-sentence hover tooltip, and how hard it
+    /// fights to stay visible under width pressure. `importance` defaults to `.normal` so the
+    /// existing call sites read unchanged; the required and the droppable fields set it explicitly.
+    struct VolumeField: Equatable {
+        let value: String
+        let tooltip: String
+        var importance: Importance = .normal
+    }
 
     /// Pure builder for the status fields, in the ratified order
     /// `Capacity · Free · Reclaimable · Available up to · Scanned` (+ scan
     /// indicator). Plain-language names in the UI; the API terms live in the
     /// tooltips/comments only (deliverable 5d). Testable without AppKit.
-    static func fields(_ s: ScanStatus) -> [VolumeField] {
+    static func fields(_ s: ScanStatus, ignoredCount: Int = 0, ignoredBytes: Int64 = 0) -> [VolumeField] {
         var out: [VolumeField] = []
         if let v = s.volume {
             out.append(VolumeField(
                 value: "Capacity \(b(v.capacityBytes))",
-                tooltip: "Total formatted size of this volume."))
+                tooltip: "Total formatted size of this volume.",
+                importance: .low))
             // Free = volumeAvailableCapacity (the strict free-space API).
             out.append(VolumeField(
                 value: "Free \(b(v.availableBytes))",
-                tooltip: "Unallocated space right now."))
+                tooltip: "Unallocated space right now.",
+                importance: .normal))
             // Reclaimable = purgeable (important − available).
             out.append(VolumeField(
                 value: "Reclaimable \(b(v.purgeableBytes))",
-                tooltip: "Space macOS frees automatically when needed: local Time Machine snapshots, caches, cloud-synced files."))
+                tooltip: "Space macOS frees automatically when needed: local Time Machine snapshots, caches, cloud-synced files.",
+                importance: .low))
             // Available up to = volumeAvailableCapacityForImportantUsage.
             out.append(VolumeField(
                 value: "Available up to \(b(v.availableForImportantBytes))",
-                tooltip: "Free + reclaimable: what the system would give an important write — why different tools report different free space."))
+                tooltip: "Free + reclaimable: what the system would give an important write — why different tools report different free space.",
+                importance: .low))
         } else {
             out.append(VolumeField(value: "Volume —",
-                                   tooltip: "Volume accounting is not available yet."))
+                                   tooltip: "Volume accounting is not available yet.",
+                                   importance: .normal))
         }
         out.append(VolumeField(
             value: "Scanned \(b(s.scannedBytes))",
-            tooltip: "Total size Terrazzo has measured so far."))
+            tooltip: "Total size Terrazzo has measured so far.",
+            importance: .high))
         // UNACCOUNTED (TZ-4b, HUMAN FIELD RULING #1: status-bar figure, NEVER a map tile).
         // The residual `capacity − free − scanned`, decomposed as purgeable + other/unknown
         // (space no scan from this POSIX account can see — FDA never crosses user
@@ -229,7 +366,28 @@ final class StatusBar: NSView {
                                             scanned: s.scannedBytes, purgeable: v.purgeableBytes)
             out.append(VolumeField(
                 value: "Unaccounted \(b(u.total)) (purgeable \(b(u.purgeable)) + other/unknown \(b(u.unknown)))",
-                tooltip: "Volume space Terrazzo could not measure: capacity − free − scanned. Split into reclaimable (purgeable) space and files no scan from this account can see — other users’ home folders and snapshots (Full Disk Access never crosses user boundaries). The two parts always add up to the total. Not a folder; never drawn on the map."))
+                tooltip: "Volume space Terrazzo could not measure: capacity − free − scanned. Split into reclaimable (purgeable) space and files no scan from this account can see — other users’ home folders and snapshots (Full Disk Access never crosses user boundaries). The two parts always add up to the total. Not a folder; never drawn on the map.",
+                importance: .high)) // the founding-mystery reconciliation figure (VISION) — survives
+                                    // width pressure over the incidental volume fields; yields only
+                                    // at the narrowest widths where the TZ-5 essentials must win
+        }
+        // IGNORE accounting (TZ-5 deliverable 1) — shown while any tile is ignored. The invisible-
+        // space principle applied to user-hidden mass: an ignored monster is still ACCOUNTED, never
+        // silently vanished. Session-global (the App owns the count/bytes, focus-independent).
+        if ignoredCount > 0 {
+            out.append(VolumeField(
+                value: "\(ignoredCount) ignored · \(b(ignoredBytes)) excluded",
+                tooltip: "Tiles you excluded from the map this session (their siblings filled the freed space). Click a row in the Ignore list to restore one. The scan still measured them — nothing was deleted or rescanned.",
+                importance: .essential)) // TZ-5 required-visible at every width
+        }
+        // HIDDEN-FILTERED accounting (TZ-5 deliverable 3) — shown only when show-hidden is OFF and
+        // hidden mass is actually in view. Never double-counts ignored mass (ignored subtrees are
+        // accounted above and are not descended into for this figure).
+        if s.hiddenFilteredBytes > 0 {
+            out.append(VolumeField(
+                value: "hidden filtered · \(b(s.hiddenFilteredBytes))",
+                tooltip: "Dotfiles and hidden (UF_HIDDEN) items are hidden from the map because “Show hidden files” is off. The scan still includes them; this is the size filtered from view. Turn the checkbox back on to see them.",
+                importance: .essential)) // TZ-5 required-visible when show-hidden is off
         }
         // Sub-pixel cull count — shown only when non-zero (no "0 tiles" clutter on a
         // small map). PLAN §"Rendering scale": culled tiles are REPORTED, never silently
@@ -237,12 +395,27 @@ final class StatusBar: NSView {
         if s.belowPixelCount > 0 {
             out.append(VolumeField(
                 value: "\(s.belowPixelCount) tiles below pixel size",
-                tooltip: "Tiles too small to draw (< ~2 px) at this zoom, so they are not shown. Zoom in to see them; nothing is silently dropped."))
+                tooltip: "Tiles too small to draw (< ~2 px) at this zoom, so they are not shown. Zoom in to see them; nothing is silently dropped.",
+                importance: .normal))
+        }
+        // ACTIVE SCALE — ALWAYS shown (TZ-5 deliverable 2 honesty guard, VISION: "the active
+        // scale is always labeled"). Echoed from the scene so it matches what is drawn; the
+        // numbers on tiles/hover are always REAL bytes in either mode.
+        switch s.scaleMode {
+        case .log:
+            out.append(VolumeField(value: "Log scale",
+                tooltip: "Tile areas are log-compressed so giant folders don’t eclipse the long tail. The sizes shown on tiles and in hover are always the real bytes; only the areas are compressed. Switch to Linear in the toolbar for true proportions.",
+                importance: .essential)) // TZ-5 deliverable 2 honesty guard: the active scale is ALWAYS shown
+        case .linear:
+            out.append(VolumeField(value: "Linear",
+                tooltip: "Tile areas are true-proportional to bytes — the huge folders look huge. Switch to Log scale in the toolbar to expose the long tail.",
+                importance: .essential))
         }
         out.append(VolumeField(
             value: s.running ? "● scanning…" : "✓ scan complete",
             tooltip: s.running ? "A scan is in progress; sizes are still growing."
-                               : "The scan has finished; sizes are final for this run."))
+                               : "The scan has finished; sizes are final for this run.",
+            importance: .essential)) // the running/complete state must never be clipped off
         return out
     }
 }

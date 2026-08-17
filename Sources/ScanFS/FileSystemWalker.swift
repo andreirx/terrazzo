@@ -692,37 +692,37 @@ public enum FileSystemWalker {
 
             // GRAFT REFERENCE (invariant 5): the already-scanned child — a stub only.
             if let excluding, cid == excluding {
-                out.stubs.append(ChildStub(id: cid, name: name, kind: .dir))
+                out.stubs.append(ChildStub(id: cid, name: name, kind: .dir, isHidden: child.isHidden))
                 continue
             }
 
             switch child.kind {
             case .symlink:
                 // Never followed: a leaf sized by the link itself.
-                out.stubs.append(ChildStub(id: cid, name: name, kind: .file))
+                out.stubs.append(ChildStub(id: cid, name: name, kind: .file, isHidden: child.isHidden))
                 out.sizeEvents.append(.sizeUpdated(nodeId: cid, allocated: child.allocated, logical: child.logical))
 
             case .dir:
                 if let boundaryDevice, child.device != boundaryDevice {
                     // One device (invariant 4): a cross-device dir is a boundary stub —
                     // shown + sized + completed, but NEVER entered.
-                    out.stubs.append(ChildStub(id: cid, name: name, kind: .dir))
+                    out.stubs.append(ChildStub(id: cid, name: name, kind: .dir, isHidden: child.isHidden))
                     out.sizeEvents.append(.sizeUpdated(nodeId: cid, allocated: child.allocated, logical: child.logical))
                     out.sizeEvents.append(.subtreeCompleted(nodeId: cid))
                 } else if policy.isBundleLeaf(name: name) {
                     // Opaque leaf. Its stub appears NOW (rendered pending); its recursive
                     // sizing is DEFERRED to `sizeBundle`. No size event here — the bundle
                     // carries exactly one, delivered later.
-                    out.stubs.append(ChildStub(id: cid, name: name, kind: .bundleLeaf))
+                    out.stubs.append(ChildStub(id: cid, name: name, kind: .bundleLeaf, isHidden: child.isHidden))
                     out.bundlesToSize.append((childPath, cid))
                 } else {
-                    out.stubs.append(ChildStub(id: cid, name: name, kind: .dir))
+                    out.stubs.append(ChildStub(id: cid, name: name, kind: .dir, isHidden: child.isHidden))
                     out.sizeEvents.append(.sizeUpdated(nodeId: cid, allocated: child.allocated, logical: child.logical))
                     out.dirsToRecurse.append((childPath, cid))
                 }
 
             case .file:
-                out.stubs.append(ChildStub(id: cid, name: name, kind: .file))
+                out.stubs.append(ChildStub(id: cid, name: name, kind: .file, isHidden: child.isHidden))
                 out.sizeEvents.append(.sizeUpdated(nodeId: cid, allocated: child.allocated, logical: child.logical))
             }
         }

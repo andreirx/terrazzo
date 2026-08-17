@@ -86,9 +86,26 @@ final class NavigationController: CanvasInputDelegate {
 
     private let canvas: CanvasView
     private let bottomBar: StatusBar
+    /// The side-panel Ignore list (TZ-5 deliverable 1) — filled here, positioned by
+    /// ChromeContainer. Injected by the Main assembly.
+    private let ignorePanel: IgnorePanel
     /// Set once, right after construction (the Main-assembly late binding that breaks
     /// the ScanController↔NavigationController construction cycle). Owned by AppDelegate.
     weak var scanController: ScanController?
+
+    // MARK: TZ-5 IGNORE lens state (deliverable 1)
+    /// The session's ignored tiles. id/name/hue are snapshots captured off the denormalized
+    /// `TileRect` at ignore time; `bytes` is REFRESHED each scene from the pipeline's live per-id
+    /// retained total (`refreshIgnoreAccounting`, review-0 change 2). This is the authoritative
+    /// set. The pipeline gets the id Set; the panel reads this list. Session-GLOBAL (an ignored
+    /// monster stays ignored and
+    /// accounted regardless of the current focus); cleared on a new scan.
+    private var ignored: [IgnorePanel.Entry] = []
+    /// Fired whenever the ignore set changes (ignore/restore/reset) so the Main assembly can show
+    /// or hide the (only-while-non-empty) Ignore panel and re-flow it.
+    var onIgnoreChanged: (() -> Void)?
+    /// The tile a right-click "Ignore" menu item targets (the deepest tile under the click).
+    private var contextIgnoreTarget: TileRect?
 
     /// A committed on-screen scene captured as prebuilt render state. Concrete users:
     /// `displayed` (what is on screen now) and the `sceneStack` entries (the parent
@@ -152,10 +169,17 @@ final class NavigationController: CanvasInputDelegate {
         return f
     }()
 
-    init(canvas: CanvasView, bottomBar: StatusBar) {
+    init(canvas: CanvasView, bottomBar: StatusBar, ignorePanel: IgnorePanel) {
         self.canvas = canvas
         self.bottomBar = bottomBar
+        self.ignorePanel = ignorePanel
         canvas.input = self
+        // The on-hover Ignore button excludes the actual HOVERED tile (the deepest tile under the
+        // cursor — review-1 change 1: a nested-tile hover must ignore THAT tile, not its top-level
+        // ancestor); a panel-row click restores. Both wired here (Main-assembly late binding in
+        // AppDelegate).
+        canvas.onIgnore = { [weak self] in self?.ignoreHovered() }
+        ignorePanel.onRestore = { [weak self] id in self?.restore(id) }
     }
 
     /// Diagnostic trace of navigation actions to stdout, gated by `TERRAZZO_TRACE`.
@@ -188,6 +212,11 @@ final class NavigationController: CanvasInputDelegate {
 
     func onScene(_ scene: RenderScene) {
         latestScene = scene
+        // IGNORE accounting is FOCUS-INDEPENDENT (session-global): refresh it BEFORE the focus
+        // guards below, so a scene that will be dropped as stale-focus (dive/ascend in flight)
+        // still updates the excluded figure + panel row sizes from the pipeline's live union
+        // (review-0 change 2). Cheap: a no-op when nothing is ignored.
+        refreshIgnoreAccounting(from: scene)
         if focusStack.isEmpty {
             focusStack = [scene.focusId]
             bottomBar.setFocusPath(scene.focusId)
@@ -294,12 +323,26 @@ final class NavigationController: CanvasInputDelegate {
             canvas.clearCallout()
             bottomBar.setHoverPath(nil)
         }
+        // TZ-5 (review-1 change 1): the on-hover Ignore button anchors on the DEEPEST tile under
+        // the cursor — the tile the user is actually pointing at — not its top-level ancestor.
+        // Shown only when that tile is ignorable: a real filesystem node (not a synthetic
+        // denied-aggregate badge), not the focus ROOT itself (`dimLevel > 0` — ignoring the focus
+        // would exclude nothing from the current view yet claim excluded mass, a name-honesty
+        // defect), and wide enough to carry the pill (the canvas applies the same min-width rule as
+        // labels — the context menu covers the small ones). Highlight + dive still target the
+        // top-level tile (`topLevelUnderFocus`); only the IGNORE action follows the cursor down.
+        if let deep = hoverChain?.deepest, deep.deniedAggregateCount == 0, deep.dimLevel > 0 {
+            canvas.showIgnore(atPx: deep.rect)
+        } else {
+            canvas.hideIgnore()
+        }
     }
 
     func canvasDidExit() {
         hoverChain = nil
         canvas.setHighlightIndex(-1)
         canvas.clearCallout()
+        canvas.hideIgnore()
         bottomBar.setHoverPath(nil)
     }
 
@@ -376,11 +419,29 @@ final class NavigationController: CanvasInputDelegate {
         // Name comes PREBUILT on the hit tile (denormalized off main at layout time) — no
         // tree traversal on the main actor.
         contextTargetPath = deepest.nodeId
-        let name = deepest.name.isEmpty ? deepest.nodeId : deepest.name
+        let name = deepest.name.isEmpty ? (deepest.nodeId as NSString).lastPathComponent : deepest.name
         let item = NSMenuItem(title: "Reveal “\(name)” in Finder",
                               action: #selector(revealContextTarget), keyEquivalent: "")
         item.target = self
         menu.addItem(item)
+        // TZ-5: Ignore ANY real filesystem tile via the context menu — including the nested ones
+        // the hover button skips (deepest is already the hovered nested tile). TWO tiles are
+        // deliberately NOT ignorable, each modeled explicitly (review-1 change 1):
+        //   • a synthetic denied-aggregate badge — not a real folder to exclude; and
+        //   • the FOCUS ROOT itself (`dimLevel == 0`) — the projection roots AT the focus, so
+        //     excluding the focus id drops nothing from the current view, yet ignoreAccounting
+        //     would report its whole subtree as "excluded". Offering it would draw the full map
+        //     while the status bar claimed it excluded — a name-honesty defect. The focus root
+        //     becomes ignorable the moment you ascend and it is an ordinary child again.
+        if deepest.deniedAggregateCount == 0, deepest.dimLevel > 0 {
+            contextIgnoreTarget = deepest
+            let ignoreItem = NSMenuItem(title: "Ignore “\(name)”",
+                                        action: #selector(ignoreContextTarget), keyEquivalent: "")
+            ignoreItem.target = self
+            menu.addItem(ignoreItem)
+        } else {
+            contextIgnoreTarget = nil
+        }
         return menu
     }
 
@@ -558,6 +619,7 @@ final class NavigationController: CanvasInputDelegate {
         canvas.setHighlightIndex(-1)
         canvas.setTileLabels([])
         canvas.clearCallout()
+        canvas.hideIgnore()
         bottomBar.setHoverPath(nil)
         hoverChain = nil
 
@@ -645,6 +707,96 @@ final class NavigationController: CanvasInputDelegate {
     /// ⌘↑ menu action → zoom out.
     @objc func zoomOut() { ascend() }
 
+    // MARK: - Ignore lens (TZ-5 deliverable 1)
+
+    /// Ignore the currently-hovered tile — the DEEPEST tile under the cursor (review-1 change 1),
+    /// i.e. the one the on-hover button is anchored on. The founding gesture: retire the tile you
+    /// are pointing at so its siblings claim the freed space. `ignore(tile:)` re-checks eligibility
+    /// (real node, not the focus root) so a stale hover cannot ignore something the button hid.
+    private func ignoreHovered() {
+        guard let tile = hoverChain?.deepest else { return }
+        ignore(tile: tile)
+    }
+
+    /// Ignore the right-click target (deepest tile under the click).
+    @objc private func ignoreContextTarget() {
+        if let tile = contextIgnoreTarget { ignore(tile: tile) }
+    }
+
+    /// Exclude `tile`'s node from layout (its siblings renormalize; ancestors keep their areas —
+    /// the pure projection handles that). Captures the tile's DENORMALIZED name/bytes/hue for the
+    /// panel + status; NO tree traversal. A synthetic denied-aggregate badge or the focus tile
+    /// itself is not ignorable.
+    private func ignore(tile: TileRect) {
+        guard tile.deniedAggregateCount == 0, tile.dimLevel > 0 else { return }
+        let newId = tile.nodeId
+        guard !ignored.contains(where: { $0.id == newId }) else { return }
+        // ANTICHAIN INVARIANT (review-2 change 2, nested-ignore restore). The ignore set must never
+        // hold an ancestor AND a descendant at once: an excluded ancestor already hides the whole
+        // subtree, so a descendant row could never restore its tile (the panel would claim an
+        // affordance it cannot honor). Two guards keep it an antichain:
+        //   • if an already-ignored ANCESTOR covers this tile, it is already excluded — nothing to
+        //     add (defensive: an excluded ancestor hides the tile, so it is normally not hoverable);
+        //   • ignoring an ANCESTOR SUBSUMES any already-ignored descendants — drop their rows so each
+        //     surviving row stays an independent, restorable exclusion.
+        // Ancestry is pure path logic on the ids (ScanCore `IgnorePath`, the id-is-a-path contract).
+        guard !ignored.contains(where: { IgnorePath.isAncestor($0.id, of: newId) }) else { return }
+        ignored.removeAll { IgnorePath.isAncestor(newId, of: $0.id) }
+        let name = tile.name.isEmpty ? (newId as NSString).lastPathComponent : tile.name
+        ignored.append(IgnorePanel.Entry(id: newId, name: name,
+                                         bytes: tile.allocatedBytes, hue: tile.hue))
+        trace("ignore -> \(newId)")
+        canvas.hideIgnore()
+        applyIgnored()
+    }
+
+    /// Restore an ignored tile (one click on its Ignore-list row). Because the ignore set is an
+    /// ANTICHAIN (see `ignore(tile:)`), the restored id has no ignored ancestor still excluding it,
+    /// so removing it always brings its tile back — the row's one-click affordance is honest.
+    private func restore(_ id: String) {
+        guard ignored.contains(where: { $0.id == id }) else { return }
+        ignored.removeAll { $0.id == id }
+        trace("restore -> \(id)")
+        applyIgnored()
+    }
+
+    /// Push the ignore set to the pipeline (off main → siblings renormalize), refresh the panel,
+    /// and — on restore-to-empty only — clear the status figure. One place, so ignore/restore/reset
+    /// stay consistent.
+    ///
+    /// EXCLUDED BYTES ARE NEVER COMPUTED HERE (review-1 change 2). The status "X excluded" figure
+    /// must only ever be the pipeline actor's exact UNION (`RenderScene.ignoredBytes`), which is
+    /// streaming-current and overlap-deduplicated. The App's earlier snapshot sum
+    /// (`Σ row.bytes`) DOUBLE-COUNTED an ancestor+descendant pair and froze on a growing subtree,
+    /// so it could momentarily show a non-union total — exactly what the reviewer forbids. Instead:
+    /// `setIgnored` force-emits a scene within a frame, and `refreshIgnoreAccounting` sets the count
+    /// AND the union bytes together from that scene. The one case with no scene to refresh from is
+    /// restore-to-EMPTY (the pipeline stops accounting an empty set): clear the field to zero here.
+    /// A one-frame absence of the figure on an ignore is preferable to a wrong (non-union) number.
+    private func applyIgnored() {
+        scanController?.setIgnored(Set(ignored.map(\.id)))
+        ignorePanel.setEntries(ignored)
+        if ignored.isEmpty { bottomBar.setIgnoredAccounting(count: 0, bytes: 0) }
+        onIgnoreChanged?() // Main assembly shows/hides + re-flows the panel
+    }
+
+    /// Refresh the ignore accounting from a freshly-emitted scene (review-0 change 2). The pipeline
+    /// re-computes the excluded UNION mass + each ignored id's current retained total on its actor
+    /// every emit, so this is where the App's status figure and panel row sizes become
+    /// streaming-current and overlap-correct — never the stale/double-counted snapshot sums the App
+    /// used before. No-op while nothing is ignored. Only rebuilds the panel rows when a size
+    /// actually changed, so a quiet streaming cadence does not churn the row views.
+    private func refreshIgnoreAccounting(from scene: RenderScene) {
+        guard !ignored.isEmpty else { return }
+        var rowSizeChanged = false
+        for i in ignored.indices {
+            let live = scene.ignoredCurrentById[ignored[i].id] ?? ignored[i].bytes
+            if live != ignored[i].bytes { ignored[i].bytes = live; rowSizeChanged = true }
+        }
+        bottomBar.setIgnoredAccounting(count: ignored.count, bytes: scene.ignoredBytes)
+        if rowSizeChanged { ignorePanel.setEntries(ignored) }
+    }
+
     // MARK: - New-scan reset (rescan / volume switch, TZ-4)
 
     /// Reset all navigation state for a fresh scan (Rescan button / VolumePicker). The
@@ -664,8 +816,14 @@ final class NavigationController: CanvasInputDelegate {
         flightBaseQuads = []; flightBaseNodeIds = []
         canvas.setHighlightIndex(-1)
         canvas.clearCallout()
+        canvas.hideIgnore()
         canvas.setTileLabels([])
         bottomBar.setHoverPath(nil)
+        // TZ-5: a fresh scan starts with an empty ignore set (the new pipeline defaults to none);
+        // clear the App-side list, panel, and status figure to match.
+        ignored = []
+        applyIgnored()
+        contextIgnoreTarget = nil
     }
 
     // MARK: - Hover callout / path text (TZ-4 D9)

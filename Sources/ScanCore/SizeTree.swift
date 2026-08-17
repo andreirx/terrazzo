@@ -98,6 +98,17 @@ public struct SizeTree: Codable, Equatable, Sendable, Identifiable {
     /// not-yet-expanded `pending`).
     public let children: [SizeTree]
     public let scanState: ScanState
+    /// Whether the walker judged this node HIDDEN at scan time (TZ-5 deliverable 3;
+    /// PLAN "requires an `isHidden` flag on SizeTree nodes captured by the walker").
+    /// The RULE (see `DirectoryReader`/`FileSystemWalker`): a leading-dot name OR the
+    /// `UF_HIDDEN` file flag. The scan ALWAYS includes hidden items (a fixed walker
+    /// invariant — surfacing hidden paths IS the product, VISION); this flag is a pure
+    /// VISUALIZATION lens input: the "Show hidden files" filter (on by default) uses it
+    /// to exclude dotfiles/UF_HIDDEN nodes from LAYOUT only, with status-bar accounting —
+    /// the scan tree is never changed. Additive DTO field (the one permitted scan-side
+    /// touch this slice makes); defaults `false` so pre-TZ-5 fixtures and call sites are
+    /// source- and JSON-compatible (see `init(from:)`).
+    public let isHidden: Bool
 
     public init(
         id: String,
@@ -106,7 +117,8 @@ public struct SizeTree: Codable, Equatable, Sendable, Identifiable {
         allocatedBytes: Int64,
         logicalBytes: Int64,
         children: [SizeTree] = [],
-        scanState: ScanState = .complete
+        scanState: ScanState = .complete,
+        isHidden: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -115,6 +127,29 @@ public struct SizeTree: Codable, Equatable, Sendable, Identifiable {
         self.logicalBytes = logicalBytes
         self.children = children
         self.scanState = scanState
+        self.isHidden = isHidden
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, kind, allocatedBytes, logicalBytes, children, scanState, isHidden
+    }
+
+    /// Custom decoder so `isHidden` (added in TZ-5) is BACKWARD-COMPATIBLE with the
+    /// pre-TZ-5 `fixture-tree.json` (which has no `isHidden` key) and any other legacy
+    /// JSON: a missing key defaults to `false` rather than throwing. `children`/`scanState`
+    /// are decoded leniently too (they already carry defaults in the memberwise init), so a
+    /// leaf fixture node may omit them. `encode(to:)` stays synthesized (it writes every
+    /// key, including `isHidden`).
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.name = try c.decode(String.self, forKey: .name)
+        self.kind = try c.decode(NodeKind.self, forKey: .kind)
+        self.allocatedBytes = try c.decode(Int64.self, forKey: .allocatedBytes)
+        self.logicalBytes = try c.decode(Int64.self, forKey: .logicalBytes)
+        self.children = try c.decodeIfPresent([SizeTree].self, forKey: .children) ?? []
+        self.scanState = try c.decodeIfPresent(ScanState.self, forKey: .scanState) ?? .complete
+        self.isHidden = try c.decodeIfPresent(Bool.self, forKey: .isHidden) ?? false
     }
 }
 
@@ -146,5 +181,38 @@ public extension SizeTree {
             if let found = child.node(withId: id) { return found }
         }
         return nil
+    }
+}
+
+/// Path-ancestry over node ids, used by the IGNORE lens to keep its set an ANTICHAIN.
+///
+/// WHY IT EXISTS (TZ-5 review-2, nested-ignore restore). The ignore set excludes each id's
+/// WHOLE subtree from layout (`ScanReducer.makeRenderTree(excluding:)`). If both an ancestor
+/// and one of its descendants were listed at once, the descendant's Ignore-panel row could
+/// never restore its tile — its ancestor still excludes the whole subtree — so a one-click
+/// "restore" would silently do nothing, a name-honesty defect. The App therefore keeps its
+/// ignore list an antichain (no id is an ancestor of another): ignoring an ancestor DROPS any
+/// already-listed descendants (subsumed), so every remaining row is an independent, restorable
+/// exclusion.
+///
+/// It relies ONLY on the documented `SizeTree.id` contract — a node id is an absolute path and
+/// a descendant's id is `ancestor + "/" + name` (`FileSystemWalker.joinId`). So ancestry is
+/// pure string logic with NO reducer state: it holds even before a node's stub has arrived, and
+/// it lives here (ScanCore, which owns the id contract) rather than in the App so `swift test`
+/// can pin it (the App layer is not an SPM target).
+///
+/// ABSTRACTION LEDGER: a namespace of pure static funcs (not a type — no state). Concrete
+/// users: `NavigationController.ignore(tile:)` (production) + `ScanReducerTests` (the regression
+/// test). Axis: none — fixed path-string relation. Rejected simpler alternative: inline the
+/// prefix check in the App — but the App is SPM-invisible, so the rule could not be unit-tested,
+/// which the reviewer requires.
+public enum IgnorePath {
+    /// Is `descendant` strictly inside the directory `ancestor`? Boundary-checked on the path
+    /// separator so `/Users` is NOT reported an ancestor of `/UsersFoo`, and an id is never its
+    /// own ancestor. Handles a root whose id already ends in "/" (the volume root, `"/"`).
+    public static func isAncestor(_ ancestor: String, of descendant: String) -> Bool {
+        guard descendant != ancestor else { return false }
+        let prefix = ancestor.hasSuffix("/") ? ancestor : ancestor + "/"
+        return descendant.hasPrefix(prefix)
     }
 }

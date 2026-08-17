@@ -110,6 +110,23 @@ final class CanvasView: NSView {
     private let calloutChip = CalloutChip()
     private var tileLabelViews: [NSTextField] = []
     private var currentTileLabels: [TileLabel] = []
+
+    /// The on-hover IGNORE button (TZ-5 deliverable 1) — a small pill anchored at the TOP-RIGHT
+    /// corner of the hovered top-level tile (labels sit top-LEFT, so no overlap). Shown by
+    /// `showIgnore(atPx:)` only for a tile wide enough to carry it (the SAME `minLabelWidthPx`
+    /// rule as labels — the packet's "sufficiently large tiles"); the context menu covers the
+    /// small ones. As a canvas SUBVIEW inside `bounds`, it consumes its own click (no dive) and
+    /// does NOT trigger `mouseExited` on the canvas, so hover stays live while the cursor is on it.
+    private let ignoreButton: NSButton = {
+        let b = NSButton(title: "Ignore", target: nil, action: nil)
+        b.bezelStyle = .rounded
+        b.controlSize = .mini
+        b.isHidden = true
+        b.toolTip = "Exclude this tile from the map so its siblings fill the space. It stays in the Ignore list (click there to restore). Nothing is deleted."
+        return b
+    }()
+    /// Bound by NavigationController — ignores the currently-hovered top-level tile.
+    var onIgnore: (() -> Void)?
     /// The denied-overflow disclosure POPOVER (TZ-4b OPERATOR_NOTE #3.2, review-4 change 3 —
     /// the ratified "click shows the list (popover)", replacing the earlier NSMenu). One
     /// reused instance: `.transient` so a click elsewhere dismisses it; its content view
@@ -139,7 +156,12 @@ final class CanvasView: NSView {
         layerContentsRedrawPolicy = .duringViewResize
         addSubview(calloutChip)
         calloutChip.isHidden = true
+        ignoreButton.target = self
+        ignoreButton.action = #selector(ignoreClicked)
+        addSubview(ignoreButton)
     }
+
+    @objc private func ignoreClicked() { onIgnore?() }
 
     required init?(coder: NSCoder) { fatalError("CanvasView is code-only (no storyboard)") }
 
@@ -280,6 +302,34 @@ final class CanvasView: NSView {
     /// Hide the hover callout chip.
     func clearCallout() { calloutChip.isHidden = true }
 
+    /// Show the on-hover IGNORE button anchored at the top-right of `tileRect` (DEVICE PIXELS),
+    /// but ONLY when the tile is at least `minLabelWidthPx` wide — the SAME "sufficiently large"
+    /// rule labels use (small tiles are ignored via the context menu instead). Returns whether
+    /// the button is shown, so NavigationController can wire its `onIgnore` only when it is.
+    @discardableResult
+    func showIgnore(atPx tileRect: Rect) -> Bool {
+        guard tileRect.width >= Self.minLabelWidthPx else { ignoreButton.isHidden = true; return false }
+        let scale = Double(window?.backingScaleFactor ?? 2.0)
+        ignoreButton.sizeToFit()
+        let size = ignoreButton.frame.size
+        let bw = Double(size.width), bh = Double(size.height)
+        let pad = 4.0
+        // Tile top-right in top-left-origin POINTS; clamp inside the tile so the pill never
+        // spills past the tile edge (labels own the top-LEFT, so the top-RIGHT is free).
+        let rightPt = (tileRect.x + tileRect.width) / scale
+        let topPt = tileRect.y / scale
+        let xPt = max(tileRect.x / scale + pad, rightPt - bw - pad)
+        let yTopPt = topPt + pad
+        // NSView is y-up — convert the top-left y to a frame origin.
+        let frameY = Double(bounds.height) - yTopPt - bh
+        ignoreButton.frame = NSRect(x: xPt, y: frameY, width: bw, height: bh)
+        ignoreButton.isHidden = false
+        return true
+    }
+
+    /// Hide the on-hover ignore button (hover-out, dive, animation).
+    func hideIgnore() { ignoreButton.isHidden = true }
+
     /// Disclose the collapsed denied list of a clicked denied-overflow AGGREGATE badge (TZ-4b
     /// OPERATOR_NOTE #3.2, review-4 change 3). The ratified affordance is a POPOVER anchored at the
     /// cursor listing the denied item names + the aggregate's implied (lower-bound) size — so every
@@ -303,8 +353,10 @@ final class CanvasView: NSView {
     /// denied item names (bounded to 40 with a "… N more" tail). A plain vertical stack in a view
     /// controller — presentation only; the CONTENT (names + implied size) is resolved by the pure,
     /// unit-tested `TreemapScene.deniedInventory`, so this method carries no untested logic.
-    private static func makeDeniedListVC(title: String, impliedText: String,
-                                         items: [String]) -> NSViewController {
+    /// Internal (not private) so the headless chrome audit (scripts/chrome_host.swift, review-0
+    /// change 5) can build and inspect the popover content OFFSCREEN without showing the popover.
+    static func makeDeniedListVC(title: String, impliedText: String,
+                                 items: [String]) -> NSViewController {
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading

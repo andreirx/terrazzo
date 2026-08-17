@@ -74,6 +74,15 @@ enum DirectoryReader {
         let allocated: Int64
         /// Apparent bytes (`st_size`) == `measure().logical`.
         let logical: Int64
+        /// Whether this entry is HIDDEN (TZ-5 deliverable 3). The rule (name-honest,
+        /// documented): a LEADING-DOT name (all dotfiles, everywhere) OR the `UF_HIDDEN`
+        /// file flag. `UF_HIDDEN` is read from `ATTR_CMN_FLAGS` in the SAME bulk
+        /// `getattrlistbulk` buffer the enumeration already returns — for EVERY object kind
+        /// (regular files included), at zero extra syscall. So the marquee hidden DIRECTORIES
+        /// (`~/Library`, `/private`, which are UF_HIDDEN, not dotfiles) AND a non-dot
+        /// UF_HIDDEN regular file are both covered (review-0 change 1 closed the earlier
+        /// file-fast-path gap by adding the common FLAGS attribute to the bulk parse).
+        let isHidden: Bool
     }
 
     /// The outcome of enumerating one directory — a SUM TYPE because the three cases are
@@ -135,6 +144,20 @@ enum DirectoryReader {
     private static let VDIR: UInt32 = 2
     private static let VLNK: UInt32 = 5
 
+    /// `UF_HIDDEN` (chflags "hidden") bit — 0x00008000 in <sys/stat.h>, stable ABI. Named
+    /// as a plain `UInt32` (matching `stat.st_flags`) to avoid the Int32/UInt32 ambiguity of
+    /// the imported `UF_HIDDEN` macro at the bitwise `&` site.
+    private static let hiddenFlag: UInt32 = 0x0000_8000
+
+    /// The TZ-5 hidden rule for one entry: leading-dot name OR the `UF_HIDDEN` flag from the
+    /// bulk `ATTR_CMN_FLAGS` word. `flags == nil` only if the FS omitted the attribute for an
+    /// entry (not expected on APFS/HFS+) ⇒ dot-only for that entry.
+    private static func computeHidden(name: String, flags: UInt32?) -> Bool {
+        if name.hasPrefix(".") { return true }
+        if let flags, (flags & hiddenFlag) != 0 { return true }
+        return false
+    }
+
     /// `lstat` with optional timing (see `ReaderProfile`). Zero overhead when `profile`
     /// is nil (one optional test); attributed to the ATTRIBUTES phase when profiling.
     private static func timedLstat(_ path: String, _ st: inout stat, _ profile: ReaderProfile?) -> Int32 {
@@ -162,13 +185,20 @@ enum DirectoryReader {
         defer { close(fd) }
 
         // Attribute set (bit order within a group; RETURNED_ATTRS is always returned
-        // first regardless of its bit): common {RETURNED, NAME, OBJTYPE}, file
+        // first regardless of its bit): common {RETURNED, NAME, OBJTYPE, FLAGS}, file
         // {ALLOCSIZE, DATALENGTH}. Directories/symlinks carry no file attrs — the
         // per-entry RETURNED_ATTRS mask tells us which fields are actually present.
+        // ATTR_CMN_FLAGS (the `st_flags` chflags word) is a COMMON attribute returned
+        // for EVERY object kind directly in the bulk buffer — including regular files —
+        // so the UF_HIDDEN test now covers files with NO extra syscall (review-0 change 1:
+        // it closes the "non-dot UF_HIDDEN regular file" gap without an lstat on the hot
+        // file fast path). Its bit (0x40000) sorts AFTER OBJTYPE (0x8) and BEFORE any file
+        // attr, so it is parsed between OBJTYPE and ALLOCSIZE below.
         func ag<T: BinaryInteger>(_ x: T) -> UInt32 { UInt32(truncatingIfNeeded: x) }
         var al = attrlist()
         al.bitmapcount = u_short(ATTR_BIT_MAP_COUNT)
         al.commonattr = ag(ATTR_CMN_RETURNED_ATTRS) | ag(ATTR_CMN_NAME) | ag(ATTR_CMN_OBJTYPE)
+            | ag(ATTR_CMN_FLAGS)
         al.fileattr = ag(ATTR_FILE_ALLOCSIZE) | ag(ATTR_FILE_DATALENGTH)
 
         let bufSize = 256 * 1024
@@ -207,6 +237,8 @@ enum DirectoryReader {
 
                 var name = ""
                 var objtype: UInt32 = 0
+                var fileFlags: UInt32 = 0
+                var hasFlags = false
                 var allocSize: Int64 = 0
                 var dataLength: Int64 = 0
                 var hasFileSize = false
@@ -223,6 +255,14 @@ enum DirectoryReader {
                     objtype = entry.loadUnaligned(fromByteOffset: off, as: UInt32.self)
                     off += MemoryLayout<fsobj_type_t>.size
                 }
+                if (returned.commonattr & ag(ATTR_CMN_FLAGS)) != 0 {
+                    // The chflags word (`stat.st_flags`, a uint32) — carries UF_HIDDEN. Present
+                    // for every object kind, so this is the ONE hidden-flag source for files,
+                    // dirs, and symlinks alike (no per-kind lstat needed for the hidden test).
+                    fileFlags = entry.loadUnaligned(fromByteOffset: off, as: UInt32.self)
+                    off += MemoryLayout<UInt32>.size
+                    hasFlags = true
+                }
                 if (returned.fileattr & ag(ATTR_FILE_ALLOCSIZE)) != 0 {
                     allocSize = entry.loadUnaligned(fromByteOffset: off, as: Int64.self)
                     off += MemoryLayout<off_t>.size
@@ -234,6 +274,12 @@ enum DirectoryReader {
                 }
 
                 if !name.isEmpty && name != "." && name != ".." {
+                    // The hidden test uses the BULK `st_flags` (UF_HIDDEN) — returned inline for
+                    // every object kind — OR the leading-dot name rule. One source of hidden truth
+                    // for files, dirs, and symlinks (review-0 change 1: no non-dot UF_HIDDEN file
+                    // slips through, and no extra syscall on the file fast path). `hasFlags` is
+                    // false only if the FS omitted the attribute for an entry — then dot-only.
+                    let isHidden = computeHidden(name: name, flags: hasFlags ? fileFlags : nil)
                     let child: Child
                     switch objtype {
                     case VDIR:
@@ -243,9 +289,11 @@ enum DirectoryReader {
                         var st = stat()
                         if timedLstat(dirPath + "/" + name, &st, profile) == 0 {
                             child = Child(name: name, kind: .dir, device: st.st_dev,
-                                          allocated: Int64(st.st_blocks) * 512, logical: Int64(st.st_size))
+                                          allocated: Int64(st.st_blocks) * 512, logical: Int64(st.st_size),
+                                          isHidden: isHidden)
                         } else {
-                            child = Child(name: name, kind: .dir, device: 0, allocated: 0, logical: 0)
+                            child = Child(name: name, kind: .dir, device: 0, allocated: 0, logical: 0,
+                                          isHidden: isHidden)
                         }
                     case VLNK:
                         // A symlink is sized by the LINK, target never resolved (measure uses
@@ -253,23 +301,28 @@ enum DirectoryReader {
                         var st = stat()
                         if timedLstat(dirPath + "/" + name, &st, profile) == 0 {
                             child = Child(name: name, kind: .symlink, device: 0,
-                                          allocated: Int64(st.st_blocks) * 512, logical: Int64(st.st_size))
+                                          allocated: Int64(st.st_blocks) * 512, logical: Int64(st.st_size),
+                                          isHidden: isHidden)
                         } else {
-                            child = Child(name: name, kind: .symlink, device: 0, allocated: 0, logical: 0)
+                            child = Child(name: name, kind: .symlink, device: 0, allocated: 0, logical: 0,
+                                          isHidden: isHidden)
                         }
                     default:
                         // Regular file (VREG) or a rare special node: a leaf. A regular file's
-                        // size is inline in the bulk buffer (no extra syscall). A special node
-                        // carries no file attrs; fall back to one lstat (st_blocks — the same
-                        // measure() fallback for a non-symlink whose allocated size is unknown).
+                        // size is inline in the bulk buffer (no extra syscall); its UF_HIDDEN flag
+                        // now comes from the same bulk buffer (ATTR_CMN_FLAGS). A special node
+                        // carries no file attrs; fall back to one lstat for its size (st_blocks —
+                        // the same measure() fallback).
                         if hasFileSize {
                             child = Child(name: name, kind: .file, device: 0,
-                                          allocated: allocSize, logical: dataLength)
+                                          allocated: allocSize, logical: dataLength,
+                                          isHidden: isHidden)
                         } else {
                             var st = stat()
                             _ = timedLstat(dirPath + "/" + name, &st, profile)
                             child = Child(name: name, kind: .file, device: 0,
-                                          allocated: Int64(st.st_blocks) * 512, logical: Int64(st.st_size))
+                                          allocated: Int64(st.st_blocks) * 512, logical: Int64(st.st_size),
+                                          isHidden: isHidden)
                         }
                     }
                     out.append(child)

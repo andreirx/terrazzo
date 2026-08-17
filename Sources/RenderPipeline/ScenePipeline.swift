@@ -62,9 +62,34 @@ public actor ScenePipeline {
     /// rate; the O(n) work `tick()` triggers runs here, off main.
     public static let cadenceSeconds: TimeInterval = 1.0
 
-    /// Nesting levels rendered below the focus. Matches the scene default so the
-    /// projected tree always carries enough detail to fill the render window.
-    private static let renderWindow = TreemapScene.defaultDepthWindow
+    /// Nesting levels rendered below the focus. The DEFAULT matches the scene default so the
+    /// projected tree carries enough detail to fill the render window; TZ-5 makes it USER-SETTABLE
+    /// (the control-bar depth stepper → `setDepthWindow`). It is a pure RENDER window over the
+    /// fully-retained node map — the reducer keeps every node regardless (sizes true, decision 4),
+    /// so raising it re-projects deeper with NO rescan. Used identically by `makeRenderTree` (which
+    /// subtrees to materialize) and `TreemapScene.layout` (the dim ladder), so the two always agree.
+    private static let defaultRenderWindow = TreemapScene.defaultDepthWindow
+    private var renderWindow = ScenePipeline.defaultRenderWindow
+
+    // MARK: - TZ-5 visualization lenses (session-only inputs; scan tree untouched)
+    //
+    // All four are PURE inputs to the projection/layout the App posts via the setters below;
+    // each `set*` force-emits so the change is reflected without waiting a cadence. They live on
+    // the actor (not the App) so the node-count-scaling re-projection they trigger stays off main
+    // (the ratified threading law). The scan reducer is never mutated — these only change WHICH
+    // retained nodes are projected and with WHAT area weighting.
+
+    /// The IGNORE set: node ids excluded from layout so their SIBLINGS renormalize into the freed
+    /// area (ancestors keep their areas). The App owns the authoritative set + the panel/accounting;
+    /// this is the copy the projection filters on. Ids are absolute paths, so an ignored node stays
+    /// excluded wherever it appears under the current focus.
+    private var ignoredIds: Set<String> = []
+    /// Show-hidden lens (deliverable 3): `true` (default) shows hidden nodes; `false` filters
+    /// dotfile/UF_HIDDEN nodes from layout, their mass reported as `hiddenFilteredBytes`.
+    private var includeHidden = true
+    /// Area scale (deliverable 2): `.log` is the ratified DEFAULT (VISION: "logarithmically
+    /// compressed by default"). The App's toggle flips it via `setScale`.
+    private var scale: AreaScale = .log
 
     /// Sub-pixel cull threshold (device-px area). A tile smaller than ~2×2 device px
     /// carries no readable pixels, and the tail of a deep tree is almost all such
@@ -316,6 +341,39 @@ public actor ScenePipeline {
         emit(force: true)
     }
 
+    // MARK: - TZ-5 lens setters (each re-projects immediately, off main)
+
+    /// Post the IGNORE set (deliverable 1). A no-op emit is skipped when the set is unchanged so a
+    /// redundant push (e.g. on a new-scan reset) does not churn a scene.
+    public func setIgnored(_ ids: Set<String>) {
+        guard ids != ignoredIds else { return }
+        ignoredIds = ids
+        emit(force: true)
+    }
+
+    /// Post the show-hidden lens (deliverable 3).
+    public func setIncludeHidden(_ include: Bool) {
+        guard include != includeHidden else { return }
+        includeHidden = include
+        emit(force: true)
+    }
+
+    /// Post the area scale (deliverable 2).
+    public func setScale(_ s: AreaScale) {
+        guard s != scale else { return }
+        scale = s
+        emit(force: true)
+    }
+
+    /// Post the depth window (deliverable 4). Clamped to ≥ 1 (the focus plus at least one level);
+    /// a non-positive window would render only the focus background — never useful.
+    public func setDepthWindow(_ n: Int) {
+        let w = max(1, n)
+        guard w != renderWindow else { return }
+        renderWindow = w
+        emit(force: true)
+    }
+
     // MARK: - Scene construction (the node-count-scaling work, off main)
 
     private func emit(force: Bool) {
@@ -345,11 +403,26 @@ public actor ScenePipeline {
         // the visible set. The pruned subtrees are exactly those the cull below would drop, so
         // the rendered scene is unchanged, and `prunedBelowArea` is folded into `belowPixelCount`
         // so the drop is never SILENT (invisible-space contract).
-        let (tree, prunedBelowArea) = reducer.makeRenderTree(
-            focusId: focusId, depthWindow: Self.renderWindow,
-            minRenderArea: Self.minRenderAreaPx, viewportArea: vp.area)
+        // TZ-5 LENSES applied HERE (off main): the ignore set + show-hidden filter drop nodes so
+        // siblings renormalize (makeRenderTree). COHERENCE OF SCALE IS ENFORCED HERE, at the one
+        // module that imports both cores (review-1 change 3): this composition layer hands the
+        // reducer projection `scale.weight` (a bare `(bytes) -> weight` function — ScanCore stays
+        // ignorant of linear vs log) AND hands `TreemapScene.layout` the same `scale` enum below,
+        // so the pruned set and the Squarify partition agree by construction (a pruned tail tile is
+        // one the same-weighted layout would also cull — never a grown-but-empty tile). The
+        // `AreaScale` policy lives in TreemapCore; the pipeline is where it meets the scan side.
+        let (tree, prunedBelowArea, hiddenFilteredBytes) = reducer.makeRenderTree(
+            focusId: focusId, depthWindow: renderWindow,
+            minRenderArea: Self.minRenderAreaPx, viewportArea: vp.area,
+            excluding: ignoredIds, includeHidden: includeHidden, weight: scale.weight)
+        // IGNORE accounting (review-0 change 2): the EXACT excluded UNION mass + each ignored id's
+        // current retained total, from CURRENT reducer state — recomputed every emit so the
+        // status figure and the panel rows stay honest while the scan streams and never
+        // double-count overlapping ancestor/descendant ignores. O(ignored × chain-depth), on the
+        // actor. Empty/zero when nothing is ignored (the common case — no allocation cost).
+        let ignoreAcct = reducer.ignoreAccounting(ignoredIds)
         let laidOut = TreemapScene.layout(tree: tree, focusId: focusId,
-                                          depthWindow: Self.renderWindow, viewport: vp)
+                                          depthWindow: renderWindow, viewport: vp, scale: scale)
         guard !laidOut.isEmpty else { return } // focus not present yet — keep last scene
 
         // Cull sub-pixel tiles (off main). Keep ONLY the focus (dimLevel 0)
@@ -415,7 +488,9 @@ public actor ScenePipeline {
             filesProcessed: reducer.processedCount,
             // Scan-root total (cheap Int64 sum), NOT the focus tree's root — see
             // `RenderScene.scannedBytes` / `ScanReducer.rootAllocatedBytes`.
-            scannedBytes: reducer.rootAllocatedBytes))
+            scannedBytes: reducer.rootAllocatedBytes,
+            scaleMode: scale, hiddenFilteredBytes: hiddenFilteredBytes,
+            ignoredBytes: ignoreAcct.total, ignoredCurrentById: ignoreAcct.currentById))
     }
 
     /// Compose a label (name + human size) for each top-level (dimLevel 1) tile.

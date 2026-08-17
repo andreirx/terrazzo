@@ -42,12 +42,13 @@ private let viewportB = (w: 1300, h: 520)
 struct VerifyHost {
     static func main() {
         let args = CommandLine.arguments
-        guard args.count == 7 else {
-            FileHandle.standardError.write(Data("usage: \(args.first ?? "verify_host") <shaders.metal> <fixture.json> <out1.png> <out2.png> <focus-root.png> <focus-child.png>\n".utf8))
+        guard args.count == 10 else {
+            FileHandle.standardError.write(Data("usage: \(args.first ?? "verify_host") <shaders.metal> <fixture.json> <out1.png> <out2.png> <focus-root.png> <focus-child.png> <scale-linear.png> <scale-log.png> <scale-log-ignore.png>\n".utf8))
             exit(2)
         }
         let shaderPath = args[1], fixturePath = args[2], out1 = args[3], out2 = args[4]
         let focusRootOut = args[5], focusChildOut = args[6]
+        let scaleLinearOut = args[7], scaleLogOut = args[8], scaleLogIgnoreOut = args[9]
 
         guard let device = MTLCreateSystemDefaultDevice() else { die("no Metal device") }
 
@@ -90,18 +91,48 @@ struct VerifyHost {
         renderFrame(device: device, renderer: renderer, tree: tree, focusId: focusChild.id,
                     px: viewportA.w, py: viewportA.h, out: focusChildOut)
 
+        // TZ-5 scale + ignore frames (packet acceptance + review-0 change 4b): the SAME fixture
+        // scene under (a) linear, (b) log, and (c) log with the LARGEST top-level tile IGNORED —
+        // all three must differ. These now go through the REAL CHANGED PATH: a `ScanReducer`
+        // rebuilt from the fixture tree, then `makeRenderTree(excluding:weight:)` — the same
+        // area-bounded projection + prune the pipeline runs — instead of hand-filtering a
+        // `SizeTree` and laying it out directly (the reviewer's note: verify_host "manually
+        // removes a child" and its cull metric "bypasses the pipeline's projection-prune"). The
+        // reported cull count is now `prunedBelowArea (projection) + final pixel cull` — the exact
+        // `RenderScene.belowPixelCount` accounting. The rigorous deterministic quantification is
+        // TZ-14 (ScenePipelineTests.testPipelineLinearVsLogCullCountsAndIgnoreAccounting).
+        let reducer = buildReducer(from: tree)
+        let largest = tree.children.max { $0.allocatedBytes < $1.allocatedBytes }
+        let cullLinear = renderProjectedFrame(device: device, renderer: renderer, reducer: reducer,
+                                              focusId: tree.id, excluding: [], scale: .linear,
+                                              px: viewportA.w, py: viewportA.h, out: scaleLinearOut)
+        let cullLog = renderProjectedFrame(device: device, renderer: renderer, reducer: reducer,
+                                           focusId: tree.id, excluding: [], scale: .log,
+                                           px: viewportA.w, py: viewportA.h, out: scaleLogOut)
+        _ = renderProjectedFrame(device: device, renderer: renderer, reducer: reducer,
+                                 focusId: tree.id, excluding: Set([largest?.id].compactMap { $0 }),
+                                 scale: .log, px: viewportA.w, py: viewportA.h, out: scaleLogIgnoreOut)
+
+        print("VERIFY_HOST CULL (fixture @ \(viewportA.w)x\(viewportA.h), via ScanReducer.makeRenderTree): "
+              + "linear=\(cullLinear) log=\(cullLog) below-pixel tiles (projection-prune + final cull)"
+              + " (log ≤ linear — log exposes starved siblings; largest ignored = \(largest?.name ?? "<none>"))")
         print("VERIFY_HOST OK: wrote \(out1) (\(viewportA.w)x\(viewportA.h)) and \(out2) (\(viewportB.w)x\(viewportB.h)); "
-              + "focus frames \(focusRootOut) (root) and \(focusChildOut) (child \(focusChild.id))")
+              + "focus frames \(focusRootOut) (root) and \(focusChildOut) (child \(focusChild.id)); "
+              + "scale frames \(scaleLinearOut) (linear), \(scaleLogOut) (log), \(scaleLogIgnoreOut) (log+ignore)")
     }
 
-    /// Build the scene at the given pixel viewport (optionally focused on
-    /// `focusId`), render through the real QuadRenderer into an offscreen texture,
-    /// assert non-blank, write PNG.
+    /// Build the scene at the given pixel viewport (optionally focused on `focusId`, under the
+    /// given area `scale`), render through the real QuadRenderer into an offscreen texture, assert
+    /// non-blank, write PNG. Returns the below-pixel-culled tile count (area < 4 px², non-focus) —
+    /// the "same scene under log vs linear" evidence the scale frames report.
+    @discardableResult
     static func renderFrame(device: MTLDevice, renderer: QuadRenderer, tree: SizeTree,
-                            focusId: String? = nil, px: Int, py: Int, out: String) {
+                            focusId: String? = nil, px: Int, py: Int, out: String,
+                            scale: AreaScale = .linear) -> Int {
         let viewport = Rect(x: 0, y: 0, width: Double(px), height: Double(py))
-        let tiles = TreemapScene.layout(tree: tree, focusId: focusId, viewport: viewport)
+        let tiles = TreemapScene.layout(tree: tree, focusId: focusId, viewport: viewport, scale: scale)
         guard !tiles.isEmpty else { die("scene produced no tiles at \(px)x\(py) (focus \(focusId ?? "root"))") }
+        let belowPixel = tiles.filter { $0.dimLevel > 0 && $0.rect.area < 4.0 }.count
 
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm, width: px, height: py, mipmapped: false)
@@ -129,7 +160,89 @@ struct VerifyHost {
         if lit == 0 { die("frame \(out) is blank — the treemap did not render") }
 
         writePNG(pixels: &pixels, width: px, height: py, bytesPerRow: bytesPerRow, path: out)
-        print("  frame \(out): \(tiles.count) tiles, \(lit) lit pixels")
+        print("  frame \(out): \(tiles.count) tiles, \(lit) lit pixels, scale=\(scale.rawValue), below-pixel=\(belowPixel)")
+        return belowPixel
+    }
+
+    /// Rebuild a `ScanReducer` from a decoded fixture `SizeTree` by replaying the events the walker
+    /// would have emitted (review-0 change 4b). A node's OWN size is its recursive `allocatedBytes`
+    /// minus its children's recursive totals (the reducer accumulates own sizes up the tree, so
+    /// this inversion reproduces the exact totals). Denied nodes are discovered as dirs then
+    /// `accessDenied` (how the reducer derives `.denied`); bundle leaves keep their kind. This lets
+    /// the scale/ignore frames go through the REAL `makeRenderTree` projection rather than a
+    /// hand-filtered tree.
+    static func buildReducer(from root: SizeTree) -> ScanReducer {
+        var reducer = ScanReducer(rootId: root.id, rootName: root.name)
+        var events: [ScanEvent] = []
+        func emit(_ node: SizeTree) {
+            let childAlloc = node.children.reduce(Int64(0)) { $0 + $1.allocatedBytes }
+            let childLog = node.children.reduce(Int64(0)) { $0 + $1.logicalBytes }
+            let ownAlloc = max(0, node.allocatedBytes - childAlloc)
+            let ownLog = max(0, node.logicalBytes - childLog)
+            events.append(.sizeUpdated(nodeId: node.id, allocated: ownAlloc, logical: ownLog))
+            if node.kind == .denied {
+                events.append(.accessDenied(nodeId: node.id))
+                return // a denied node exposes no children
+            }
+            if !node.children.isEmpty {
+                let stubs = node.children.map { child -> ChildStub in
+                    // A denied child is discovered as a dir first (the walker's order); every other
+                    // kind carries through. `.pending`/`.synthetic` never appear in a real scan tree.
+                    let stubKind: NodeKind = (child.kind == .denied) ? .dir : child.kind
+                    return ChildStub(id: child.id, name: child.name, kind: stubKind, isHidden: child.isHidden)
+                }
+                events.append(.childrenDiscovered(parentId: node.id, children: stubs))
+                for c in node.children { emit(c) }
+            }
+        }
+        emit(root)
+        reducer.apply(events)
+        return reducer
+    }
+
+    /// Render a frame through the REAL `makeRenderTree` area-bounded projection (review-0 change
+    /// 4b), returning the pipeline's `belowPixelCount` accounting: `prunedBelowArea` (subtrees the
+    /// projection never materialized) + the final sub-pixel pixel cull on the laid-out tiles.
+    /// `minRenderArea` (4 px²) mirrors `ScenePipeline.minRenderAreaPx`; RenderPipeline's actor is
+    /// not linked here (only its `GPUQuad` value type is), so the constant is stated locally.
+    @discardableResult
+    static func renderProjectedFrame(device: MTLDevice, renderer: QuadRenderer, reducer: ScanReducer,
+                                     focusId: String, excluding: Set<String>, scale: AreaScale,
+                                     px: Int, py: Int, out: String) -> Int {
+        let viewport = Rect(x: 0, y: 0, width: Double(px), height: Double(py))
+        let (projected, prunedBelowArea, _) = reducer.makeRenderTree(
+            focusId: focusId, depthWindow: 5, minRenderArea: 4.0, viewportArea: viewport.area,
+            excluding: excluding, weight: scale.weight) // AreaScale (TreemapCore) → bare weight seam
+        let tiles = TreemapScene.layout(tree: projected, focusId: focusId, viewport: viewport, scale: scale)
+        guard !tiles.isEmpty else { die("projected scene produced no tiles at \(px)x\(py) (scale \(scale.rawValue))") }
+        // Final pixel cull, exactly as the pipeline: drop non-focus tiles below the threshold.
+        let kept = tiles.filter { $0.dimLevel == 0 || $0.rect.area >= 4.0 }
+        let belowPixel = prunedBelowArea + (tiles.count - kept.count)
+
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: px, height: py, mipmapped: false)
+        desc.usage = [.renderTarget, .shaderRead]
+        desc.storageMode = .shared
+        guard let target = device.makeTexture(descriptor: desc) else { die("makeTexture failed") }
+        renderer.renderSynchronously(tiles: kept, into: target)
+
+        let bytesPerRow = px * 4
+        var pixels = [UInt8](repeating: 0, count: bytesPerRow * py)
+        pixels.withUnsafeMutableBytes { raw in
+            target.getBytes(raw.baseAddress!, bytesPerRow: bytesPerRow,
+                            from: MTLRegionMake2D(0, 0, px, py), mipmapLevel: 0)
+        }
+        var lit = 0, i = 0
+        while i < pixels.count {
+            if Int(pixels[i]) + Int(pixels[i + 1]) + Int(pixels[i + 2]) > 24 { lit += 1 }
+            i += 4
+        }
+        if lit == 0 { die("projected frame \(out) is blank — the treemap did not render") }
+        writePNG(pixels: &pixels, width: px, height: py, bytesPerRow: bytesPerRow, path: out)
+        print("  projected frame \(out): \(kept.count) tiles, \(lit) lit pixels, scale=\(scale.rawValue), "
+              + "below-pixel=\(belowPixel) (pruned \(prunedBelowArea) + culled \(tiles.count - kept.count)), "
+              + "excluding=\(excluding.count)")
+        return belowPixel
     }
 
     static func writePNG(pixels: inout [UInt8], width: Int, height: Int,

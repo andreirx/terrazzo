@@ -35,8 +35,27 @@ final class ControlBar: NSView {
     private let progressBar = NSProgressIndicator()
     private let etaLabel = NSTextField(labelWithString: "")
 
+    // TZ-5 visualization-lens controls (deliverables 2/3/4).
+    /// Scale toggle: segment 0 = Log (default), 1 = Linear (deliverable 2).
+    private let scaleControl = NSSegmentedControl(labels: ["Log", "Linear"],
+                                                  trackingMode: .selectOne, target: nil, action: nil)
+    /// Show-hidden checkbox, ON by default (deliverable 3).
+    private let hiddenCheck = NSButton(checkboxWithTitle: "Hidden", target: nil, action: nil)
+    /// Depth stepper + its value label (deliverable 4), default 5.
+    private let depthStepper = NSStepper()
+    private let depthLabel = NSTextField(labelWithString: "Depth 5")
+
     /// Bound by the Main assembly (AppDelegate). Rescan re-runs the current volume.
     var onRescan: (() -> Void)?
+    /// TZ-5 lens callbacks (Main-assembly bound → ScanController → pipeline).
+    var onScaleChange: ((AreaScale) -> Void)?
+    var onHiddenChange: ((Bool) -> Void)?
+    var onDepthChange: ((Int) -> Void)?
+
+    /// Depth range for the stepper. Floor 1 (focus + one level); ceiling 12 is generous —
+    /// deeper than any readable nesting on screen, and the reducer retains every node so a
+    /// high value just re-projects deeper with no rescan.
+    private static let depthRange = (min: 1, max: 12)
 
     // Rolling files/sec estimate: keep the last timed sample and smooth with an EMA so a
     // single slow/fast batch does not make the ETA jump. Presentation-only state.
@@ -45,65 +64,116 @@ final class ControlBar: NSView {
     private var smoothedRate: Double = 0
     private static let etaSmoothing = 0.3 // EMA weight on the newest sample
 
+    /// App-palette text colour for chrome labels on the dark bar (TZ-5 deliverable 5 durable
+    /// rule: NEVER an unstyled NSTextField default — that renders near-black on the dark bar).
+    private static let chromeText = NSColor(calibratedWhite: 0.82, alpha: 1)
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.backgroundColor = CGColor(gray: 0.11, alpha: 1)
 
-        rescanButton.translatesAutoresizingMaskIntoConstraints = false
+        // NSStackView (not the TZ-4 manual constraints) — EARNED by TZ-5: the bar now carries
+        // EIGHT controls (volume/rescan/scale/hidden/depth/progress/eta) that must lay out
+        // legibly at two window sizes (acceptance). A stack expresses the flexible-progress-bar-
+        // between-fixed-controls layout directly via hugging priorities; hand constraints for
+        // eight items across two sizes is the fragile alternative this replaces.
+        let volLabel = Self.chromeLabel("Volume", white: 0.70, weight: .semibold)
+
         rescanButton.bezelStyle = .rounded
         rescanButton.controlSize = .small
         rescanButton.target = self
         rescanButton.action = #selector(rescanClicked)
         rescanButton.toolTip = "Cancel and re-run the scan for the current volume."
 
-        progressBar.translatesAutoresizingMaskIntoConstraints = false
+        // Scale toggle (deliverable 2). Segment 0 = Log (the ratified default), 1 = Linear.
+        scaleControl.selectedSegment = 0
+        scaleControl.controlSize = .small
+        scaleControl.target = self
+        scaleControl.action = #selector(scaleChanged)
+        scaleControl.toolTip = "Tile area scale. Log (default) compresses giant folders so the long tail is visible; Linear shows true proportions. The sizes on tiles are always real bytes in either mode."
+        scaleControl.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+
+        // Show-hidden checkbox (deliverable 3), ON by default.
+        hiddenCheck.state = .on
+        hiddenCheck.controlSize = .small
+        hiddenCheck.target = self
+        hiddenCheck.action = #selector(hiddenChanged)
+        hiddenCheck.toolTip = "Show hidden files and folders (dotfiles and UF_HIDDEN items). On by default. The scan ALWAYS includes them — unchecking only filters them from the map, with the filtered size shown in the status bar."
+
+        // Depth stepper + value label (deliverable 4), default 5.
+        depthStepper.minValue = Double(Self.depthRange.min)
+        depthStepper.maxValue = Double(Self.depthRange.max)
+        depthStepper.increment = 1
+        depthStepper.integerValue = 5
+        depthStepper.valueWraps = false
+        depthStepper.controlSize = .small
+        depthStepper.target = self
+        depthStepper.action = #selector(depthChanged)
+        depthStepper.toolTip = "How many nesting levels to draw below the current folder (default 5). No rescan — every size is already known; this only changes how deep the map is drawn."
+        depthLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        depthLabel.textColor = Self.chromeText
+        depthLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+
         progressBar.isIndeterminate = false
         progressBar.minValue = 0
         progressBar.maxValue = 1
         progressBar.doubleValue = 0
         progressBar.controlSize = .small
         progressBar.toolTip = "Scan progress by file count (estimate): files stat'd ÷ the volume's used inodes. May finish below 100 % because it counts files no scan from this account can reach."
+        // The stretchy filler: lowest hugging + compression resistance, so it soaks up spare
+        // width at a wide window and shrinks first at a narrow one (the two-size requirement).
+        progressBar.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        progressBar.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        etaLabel.translatesAutoresizingMaskIntoConstraints = false
         etaLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        etaLabel.textColor = NSColor(calibratedWhite: 0.82, alpha: 1)
+        etaLabel.textColor = Self.chromeText
         etaLabel.stringValue = ""
+        etaLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
 
-        let volLabel = NSTextField(labelWithString: "Volume")
-        volLabel.translatesAutoresizingMaskIntoConstraints = false
-        volLabel.font = .systemFont(ofSize: 11, weight: .semibold)
-        volLabel.textColor = NSColor(calibratedWhite: 0.70, alpha: 1)
-
-        addSubview(volLabel)
-        addSubview(volumePicker)
-        addSubview(rescanButton)
-        addSubview(progressBar)
-        addSubview(etaLabel)
-
+        let stack = NSStackView(views: [
+            volLabel, volumePicker, rescanButton,
+            scaleControl, hiddenCheck, depthLabel, depthStepper,
+            progressBar, etaLabel,
+        ])
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 8
+        stack.distribution = .fill
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
         NSLayoutConstraint.activate([
-            volLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            volLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
-
-            volumePicker.leadingAnchor.constraint(equalTo: volLabel.trailingAnchor, constant: 8),
-            volumePicker.centerYAnchor.constraint(equalTo: centerYAnchor),
-
-            rescanButton.leadingAnchor.constraint(equalTo: volumePicker.trailingAnchor, constant: 10),
-            rescanButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-
-            progressBar.leadingAnchor.constraint(greaterThanOrEqualTo: rescanButton.trailingAnchor, constant: 16),
-            progressBar.centerYAnchor.constraint(equalTo: centerYAnchor),
-            progressBar.widthAnchor.constraint(equalToConstant: 220),
-
-            etaLabel.leadingAnchor.constraint(equalTo: progressBar.trailingAnchor, constant: 10),
-            etaLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            etaLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }
 
     required init?(coder: NSCoder) { fatalError("ControlBar is code-only") }
 
+    /// A styled chrome label — app-palette text, never an unstyled default (deliverable 5).
+    private static func chromeLabel(_ text: String, white: CGFloat, weight: NSFont.Weight) -> NSTextField {
+        let f = NSTextField(labelWithString: text)
+        f.font = .systemFont(ofSize: 11, weight: weight)
+        f.textColor = NSColor(calibratedWhite: white, alpha: 1)
+        return f
+    }
+
     @objc private func rescanClicked() { onRescan?() }
+
+    @objc private func scaleChanged() {
+        onScaleChange?(scaleControl.selectedSegment == 1 ? .linear : .log)
+    }
+
+    @objc private func hiddenChanged() {
+        onHiddenChange?(hiddenCheck.state == .on)
+    }
+
+    @objc private func depthChanged() {
+        let n = depthStepper.integerValue
+        depthLabel.stringValue = "Depth \(n)"
+        onDepthChange?(n)
+    }
 
     /// Update the progress bar + readout from a scan-progress snapshot (TZ-4 / TZ-4b).
     ///

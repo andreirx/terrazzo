@@ -229,13 +229,20 @@ public enum TreemapScene {
     ///   - viewport: the rectangle the focus node fills (pixel space in the App;
     ///     any units in tests).
     ///   - borderInset: per-level inset (default `defaultBorderInset`).
+    ///   - scale: per-sibling-set layout-weight transform (TZ-5 deliverable 2). `.linear`
+    ///     (default) tiles by true bytes; `.log` compresses the range so giants cannot
+    ///     eclipse the tail. Monotone, so tiling exactness and sibling ordering are
+    ///     UNCHANGED — only the areas compress (the numbers on tiles are always real bytes).
+    ///     The composition layer passes the SAME scale to `ScanReducer.makeRenderTree`, so
+    ///     the materialized subtrees match this partition (see `AreaScale`).
     /// - Returns: pre-order tile list; `[]` if `focusId` is not found.
     public static func layout(
         tree: SizeTree,
         focusId: String? = nil,
         depthWindow: Int = defaultDepthWindow,
         viewport: Rect,
-        borderInset: Double = defaultBorderInset
+        borderInset: Double = defaultBorderInset,
+        scale: AreaScale = .linear
     ) -> [TileRect] {
         let focus: SizeTree
         if let focusId {
@@ -246,7 +253,7 @@ public enum TreemapScene {
         }
         var tiles: [TileRect] = []
         place(node: focus, rect: viewport, level: 0, inheritedHue: 0,
-              depthWindow: depthWindow, borderInset: borderInset, into: &tiles)
+              depthWindow: depthWindow, borderInset: borderInset, scale: scale, into: &tiles)
         return tiles
     }
 
@@ -260,7 +267,7 @@ public enum TreemapScene {
     /// assignment a pure property of the layout, not a second tree walk.
     private static func place(
         node: SizeTree, rect: Rect, level: Int, inheritedHue: Double,
-        depthWindow: Int, borderInset: Double, into tiles: inout [TileRect]
+        depthWindow: Int, borderInset: Double, scale: AreaScale, into tiles: inout [TileRect]
     ) {
         let tileHue = level <= 1 ? TileColor.hue(for: node.name) : inheritedHue
         tiles.append(TileRect(rect: rect, dimLevel: level, nodeId: node.id,
@@ -272,13 +279,13 @@ public enum TreemapScene {
         let inner = rect.inset(by: borderInset)
         guard inner.area > 0 else { return } // no room to nest — stop honestly
 
-        let (placements, weights) = badgePlan(children: node.children, innerArea: inner.area)
+        let (placements, weights) = badgePlan(children: node.children, innerArea: inner.area, scale: scale)
         let childRects = Squarify.layout(weights: weights, in: inner)
         for (placement, childRect) in zip(placements, childRects) {
             switch placement {
             case let .child(child):
                 place(node: child, rect: childRect, level: level + 1, inheritedHue: tileHue,
-                      depthWindow: depthWindow, borderInset: borderInset, into: &tiles)
+                      depthWindow: depthWindow, borderInset: borderInset, scale: scale, into: &tiles)
             case let .aggregate(count, allocated, logical):
                 // The synthesized denied-overflow badge: one leaf tile standing in for `count`
                 // denied siblings. `.denied` kind + a distinct hatched render (QuadBuilder
@@ -325,9 +332,13 @@ public enum TreemapScene {
     /// there because there is no capacity for even one badge. Otherwise `m ≤ maxFloored ≤
     /// 0.5·innerArea/A`, so `denom = innerArea − m·A > 0` and the readable-badge count (floored +
     /// the one aggregate) is viewport-bounded, not child-count-bounded (finding 3c).
-    private static func badgePlan(children: [SizeTree], innerArea: Double)
+    private static func badgePlan(children: [SizeTree], innerArea: Double, scale: AreaScale)
         -> (placements: [Placement], weights: [Double]) {
-        let raw = children.map { max(0, Double($0.allocatedBytes)) }
+        // TZ-5: the per-sibling-set weight transform (linear bytes vs log(1+bytes)). Applied
+        // HERE, at the single point Squarify weights are formed, so the scale governs the exact
+        // partition. Everything downstream (badge floor, aggregate overflow, tiling exactness)
+        // is weight-agnostic — it operates on areas and these weights, so it is unchanged.
+        let raw = children.map { scale.weight($0.allocatedBytes) }
         func passthrough() -> ([Placement], [Double]) { (children.map(Placement.child), raw) }
         guard innerArea > 0 else { return passthrough() }
         let rawTotal = max(1, raw.reduce(0, +))

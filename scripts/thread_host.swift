@@ -105,7 +105,8 @@ final class ThreadHarness {
         // NOTHING is added to a window; nothing is shown or activated (conduct rule).
         self.canvas = CanvasView(frame: NSRect(x: 0, y: 0, width: 1400, height: 900))
         self.statusBar = StatusBar(frame: NSRect(x: 0, y: 0, width: 1400, height: StatusBar.height))
-        self.navigation = NavigationController(canvas: canvas, bottomBar: statusBar)
+        // TZ-5: NavigationController now takes the Ignore panel (off-window; nothing is shown).
+        self.navigation = NavigationController(canvas: canvas, bottomBar: statusBar, ignorePanel: IgnorePanel())
     }
 
     private func elapsedSeconds() -> Double {

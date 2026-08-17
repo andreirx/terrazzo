@@ -72,6 +72,17 @@ final class ScanController {
     private let hitch = HitchMonitor()
     private var running = false
 
+    // MARK: - TZ-5 lens state (persists across a rescan; re-applied to each new pipeline)
+    //
+    // The scale/hidden/depth lens choices are the App's source of truth (updated by the
+    // control-bar callbacks) and are RE-APPLIED to every freshly-built pipeline in `scan`, so a
+    // user's choice survives a rescan/volume switch (the new pipeline defaults would otherwise
+    // reset them). The IGNORE set is owned by NavigationController (it drives the panel + status)
+    // and cleared on a new scan (a fresh pipeline starts with none), so it is NOT stored here.
+    private(set) var currentScale: AreaScale = .log
+    private(set) var currentIncludeHidden = true
+    private(set) var currentDepthWindow = ScanPolicy.default.depthDetailWindow
+
     init(root: URL, policy: ScanPolicy,
          onScene: @escaping (RenderScene) -> Void,
          onStatus: @escaping (ScanStatus) -> Void) {
@@ -118,6 +129,14 @@ final class ScanController {
 
         let pipe = ScenePipeline(rootId: root.path, rootName: root.lastPathComponent)
         pipeline = pipe
+        // TZ-5: re-apply the current lens choices so a rescan/volume-switch keeps the user's
+        // scale/hidden/depth (a new pipeline defaults to log/shown/5). The ignore set is not
+        // re-applied — a new scan starts with none (NavigationController.resetForNewScan clears it).
+        Task {
+            await pipe.setScale(currentScale)
+            await pipe.setIncludeHidden(currentIncludeHidden)
+            await pipe.setDepthWindow(currentDepthWindow)
+        }
 
         // NOTE (TZ-4b, HUMAN FIELD RULING #1): the pipeline is no longer told the volume
         // accounting — the synthetic UNACCOUNTED tile it fed was retracted. The
@@ -150,7 +169,9 @@ final class ScanController {
                                          running: scene.running,
                                          filesProcessed: scene.filesProcessed,
                                          totalInodes: self.totalInodes,
-                                         isVolumeRoot: self.isVolumeRoot))
+                                         isVolumeRoot: self.isVolumeRoot,
+                                         scaleMode: scene.scaleMode,
+                                         hiddenFilteredBytes: scene.hiddenFilteredBytes))
                 if !scene.running && self.running {
                     self.running = false
                     self.stopCadence()
@@ -286,6 +307,35 @@ final class ScanController {
     func setViewport(_ vp: Rect) {
         guard let pipe = pipeline else { return }
         Task { await pipe.setViewport(vp) }
+    }
+
+    // MARK: - TZ-5 lens controls (control bar → pipeline; off main)
+
+    /// Set the area scale (control-bar toggle, deliverable 2). Stores the choice (so a rescan
+    /// keeps it) and posts it to the live pipeline, which re-projects immediately off main.
+    func setScale(_ s: AreaScale) {
+        currentScale = s
+        if let pipe = pipeline { Task { await pipe.setScale(s) } }
+    }
+
+    /// Set the show-hidden lens (control-bar checkbox, deliverable 3).
+    func setIncludeHidden(_ include: Bool) {
+        currentIncludeHidden = include
+        if let pipe = pipeline { Task { await pipe.setIncludeHidden(include) } }
+    }
+
+    /// Set the render depth window (control-bar stepper, deliverable 4). No rescan — the reducer
+    /// retains every node, so the pipeline re-projects deeper/shallower over retained state.
+    func setDepthWindow(_ n: Int) {
+        currentDepthWindow = max(1, n)
+        if let pipe = pipeline { Task { await pipe.setDepthWindow(currentDepthWindow) } }
+    }
+
+    /// Post the IGNORE set (deliverable 1). NavigationController owns the authoritative set; this
+    /// forwards it to the pipeline so the ignored nodes are excluded from layout (siblings
+    /// renormalize) off main. Not stored here — a new scan starts with an empty ignore set.
+    func setIgnored(_ ids: Set<String>) {
+        if let pipe = pipeline { Task { await pipe.setIgnored(ids) } }
     }
 
     /// Coarse phase label for the hitch monitor (what main is doing).

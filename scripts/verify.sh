@@ -38,12 +38,15 @@ OUT1="build/verify-1.png"
 OUT2="build/verify-2.png"
 FOCUS_ROOT="build/verify-focus-root.png"
 FOCUS_CHILD="build/verify-focus-child.png"
+SCALE_LINEAR="build/verify-scale-linear.png"
+SCALE_LOG="build/verify-scale-log.png"
+SCALE_LOG_IGNORE="build/verify-scale-log-ignore.png"
 SCAN_OUT1="build/verify-scan-1.png"
 SCAN_OUT2="build/verify-scan-2.png"
 SCAN_PROMOTED="build/verify-scan-promoted.png"
 
 mkdir -p build
-rm -f "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD" "$SCAN_OUT1" "$SCAN_OUT2" "$SCAN_PROMOTED"
+rm -f "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD" "$SCALE_LINEAR" "$SCALE_LOG" "$SCALE_LOG_IGNORE" "$SCAN_OUT1" "$SCAN_OUT2" "$SCAN_PROMOTED"
 
 echo "==> (2a) Build the app bundle (also needed for structure assertions)"
 scripts/build.sh
@@ -62,11 +65,12 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swiftc \
 	-framework ImageIO \
 	-target arm64-apple-macos14
 
-echo "==> (1b) Render two viewport frames + two focus frames (root vs first child)"
-"$HOST_BIN" "$SHADER" "$FIXTURE" "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD"
+echo "==> (1b) Render two viewport frames + two focus frames + three TZ-5 scale/ignore frames"
+"$HOST_BIN" "$SHADER" "$FIXTURE" "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD" \
+	"$SCALE_LINEAR" "$SCALE_LOG" "$SCALE_LOG_IGNORE"
 
-echo "==> (1c) Assert all four frames were written and are non-empty"
-for f in "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD"; do
+echo "==> (1c) Assert all seven frames were written and are non-empty"
+for f in "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD" "$SCALE_LINEAR" "$SCALE_LOG" "$SCALE_LOG_IGNORE"; do
 	if [[ ! -s "$f" ]]; then
 		echo "VERIFY FAILED: a frame is missing/empty ($f)" >&2
 		exit 1
@@ -82,6 +86,22 @@ fi
 echo "==> (1e) Assert focus=root and focus=child differ (navigation changes the map)"
 if cmp -s "$FOCUS_ROOT" "$FOCUS_CHILD"; then
 	echo "VERIFY FAILED: $FOCUS_ROOT and $FOCUS_CHILD are byte-identical — focus did not change what is drawn" >&2
+	exit 1
+fi
+
+echo "==> (1f) TZ-5: assert linear / log / log+ignore frames all DIFFER (scale toggle + ignore change the map)"
+if cmp -s "$SCALE_LINEAR" "$SCALE_LOG"; then
+	echo "VERIFY FAILED: $SCALE_LINEAR and $SCALE_LOG are byte-identical — the log scale did not change the layout" >&2
+	exit 1
+fi
+if cmp -s "$SCALE_LOG" "$SCALE_LOG_IGNORE"; then
+	echo "VERIFY FAILED: $SCALE_LOG and $SCALE_LOG_IGNORE are byte-identical — ignoring the largest tile did not change the layout" >&2
+	exit 1
+fi
+# review-0 change 4a: assert the THIRD pair too, so ALL THREE frames are proven distinct
+# (linear ≠ log ≠ log+ignore ≠ linear) rather than only the two adjacent pairs.
+if cmp -s "$SCALE_LINEAR" "$SCALE_LOG_IGNORE"; then
+	echo "VERIFY FAILED: $SCALE_LINEAR and $SCALE_LOG_IGNORE are byte-identical — the three scale/ignore frames are not all distinct" >&2
 	exit 1
 fi
 

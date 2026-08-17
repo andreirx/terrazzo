@@ -51,11 +51,19 @@ public struct ChildStub: Equatable, Sendable {
     public let id: String
     public let name: String
     public let kind: NodeKind
+    /// Whether the walker judged this child HIDDEN at enumeration (leading-dot name OR
+    /// `UF_HIDDEN`; see `SizeTree.isHidden`). Carried on the STUB — the same single
+    /// write-once channel as `name`/`kind` — so it folds order-independently like the
+    /// rest of the reducer (a size event that created a bare record before its stub just
+    /// gets `isHidden` filled when the stub arrives). Additive (default `false`) so every
+    /// existing `ChildStub(id:name:kind:)` call site (tests, harnesses) compiles unchanged.
+    public let isHidden: Bool
 
-    public init(id: String, name: String, kind: NodeKind) {
+    public init(id: String, name: String, kind: NodeKind, isHidden: Bool = false) {
         self.id = id
         self.name = name
         self.kind = kind
+        self.isHidden = isHidden
     }
 }
 
@@ -84,6 +92,15 @@ public enum ScanEvent: Equatable, Sendable {
 /// the walker, and is dissolved into ordered event delivery before it reaches
 /// here (ratified decision 5).
 public struct ScanReducer {
+    /// The DEFAULT area-weight transform for the projection: linear (weight == bytes,
+    /// clamped ≥ 0). ScanCore stays independent of visualization POLICY — it takes a bare
+    /// `(bytes) -> weight` function and never learns whether the caller means linear or log
+    /// (that named enum, `AreaScale`, lives in TreemapCore; review-1 change 3). The
+    /// composition layer passes the SAME transform the treemap's Squarify uses, so the
+    /// pruned set matches the rendered partition; when no transform is supplied (the reducer's
+    /// own tests, the full non-area-bounded path) this identity-on-non-negative default applies.
+    public static let linearWeight: (Int64) -> Double = { Double(max(0, $0)) }
+
     /// A node under construction. Fields are filled as facts arrive, in any
     /// order. `kind`/`scanState` are DERIVED (see `outputKind`/`outputState`),
     /// never stored, so they cannot depend on write order.
@@ -120,6 +137,11 @@ public struct ScanReducer {
         var discoveredChildren = false
         var denied = false
         var completed = false
+        /// Walker's hidden judgment (leading-dot OR UF_HIDDEN), written ONCE from the
+        /// child's stub — a write-once field like `name`/`stubKind`, so it is
+        /// order-independent (the reducer's defining property). The visualization
+        /// "Show hidden" filter reads it during projection; `false` until the stub arrives.
+        var isHidden = false
     }
 
     private var nodes: [String: Node]
@@ -226,6 +248,7 @@ public struct ScanReducer {
                 var child = nodes[stub.id] ?? Node(name: stub.name)
                 child.name = stub.name
                 child.stubKind = stub.kind
+                child.isHidden = stub.isHidden // write-once from the stub (order-independent)
                 nodes[stub.id] = child
             }
             var parent = nodes[parentId] ?? Node(name: "")
@@ -316,11 +339,31 @@ public struct ScanReducer {
     ///   - focusId: the node to root the projection at. `nil` ⇒ the scan root (the
     ///     original whole-tree behavior; used by the root view and the reducer's own tests).
     ///   - depthWindow: max retained child depth (the focus is depth 0).
+    ///   - excluding: node ids to EXCLUDE from the projection (the IGNORE lens, TZ-5): an
+    ///     excluded child is dropped from its parent's child list so its SIBLINGS renormalize
+    ///     into the freed area, while every ANCESTOR keeps its area (an ancestor's own weight
+    ///     among ITS siblings is untouched — only the excluded node's direct siblings share out
+    ///     its space). A pure projection parameter, NEUTRAL to the reducer (it never learns
+    ///     WHY a node is excluded); the pipeline owns the ignore-lens meaning. Default `[]`.
+    ///   - includeHidden: when `false`, HIDDEN nodes (`Node.isHidden`) are excluded from the
+    ///     projection too (the "Show hidden files" lens, TZ-5). Default `true` (scan always
+    ///     includes hidden; the DEFAULT view shows them).
+    ///   - weight: the per-node area-weight transform `(bytes) -> weight` (TZ-5). Applied to the
+    ///     area-bounded split so the projection materializes exactly the subtrees the
+    ///     SAME-weighted Squarify will render. ScanCore is neutral to WHICH scale it is (linear
+    ///     or log) — the composition layer supplies `AreaScale.weight` (TreemapCore). Ignored on
+    ///     the full (`minRenderArea == 0`) path. Defaults to linear (`linearWeight`).
     public func makeTree(focusId: String? = nil,
-                         depthWindow: Int = ScanPolicy.default.depthDetailWindow) -> SizeTree {
+                         depthWindow: Int = ScanPolicy.default.depthDetailWindow,
+                         excluding: Set<String> = [],
+                         includeHidden: Bool = true,
+                         weight: (Int64) -> Double = ScanReducer.linearWeight) -> SizeTree {
         var pruned = 0
+        var hidden: Int64 = 0
         return build(id: focusId ?? rootId, depth: 0, depthWindow: depthWindow,
-                     area: 0, minRenderArea: 0, prunedBelowArea: &pruned)
+                     area: 0, minRenderArea: 0, excluding: excluding,
+                     includeHidden: includeHidden, weight: weight,
+                     prunedBelowArea: &pruned, hiddenFilteredBytes: &hidden)
     }
 
     /// AREA-BOUNDED focus-rooted projection for the RENDER path (TZ-4b cycle-6 resolution).
@@ -339,17 +382,36 @@ public struct ScanReducer {
     /// invisible-space / no-silent-truncation contract). It is a FLOOR on the true dropped node
     /// count: a pruned subtree is counted ONCE at its root, not per hidden descendant (the old
     /// layout cull likewise took a culled parent's children with it).
+    ///
+    /// TZ-5 LENSES ride along as pure projection parameters (see `makeTree`): `excluding`
+    /// (the ignore set) and `includeHidden` drop nodes so siblings renormalize; `weight`
+    /// weights the area split so log/linear pruning matches the layer's Squarify (the
+    /// composition layer passes the same transform to both). It ALSO
+    /// returns `hiddenFilteredBytes` — the summed retained total of the nodes dropped for
+    /// being HIDDEN (not for being ignored: ignored subtrees are accounted by the App from
+    /// the ignored tile's bytes, and are never descended, so their hidden descendants are
+    /// subsumed there — the no-double-count rule the composition requires). This keeps the
+    /// filtered-hidden MASS reportable in the status bar (never a silent drop — the
+    /// invisible-space principle applied to user-hidden mass).
     public func makeRenderTree(focusId: String, depthWindow: Int,
-                               minRenderArea: Double, viewportArea: Double)
-        -> (tree: SizeTree, prunedBelowArea: Int) {
+                               minRenderArea: Double, viewportArea: Double,
+                               excluding: Set<String> = [],
+                               includeHidden: Bool = true,
+                               weight: (Int64) -> Double = ScanReducer.linearWeight)
+        -> (tree: SizeTree, prunedBelowArea: Int, hiddenFilteredBytes: Int64) {
         var pruned = 0
+        var hidden: Int64 = 0
         let t = build(id: focusId, depth: 0, depthWindow: depthWindow,
-                      area: viewportArea, minRenderArea: minRenderArea, prunedBelowArea: &pruned)
-        return (t, pruned)
+                      area: viewportArea, minRenderArea: minRenderArea, excluding: excluding,
+                      includeHidden: includeHidden, weight: weight,
+                      prunedBelowArea: &pruned, hiddenFilteredBytes: &hidden)
+        return (t, pruned, hidden)
     }
 
     private func build(id: String, depth: Int, depthWindow: Int,
-                       area: Double, minRenderArea: Double, prunedBelowArea: inout Int) -> SizeTree {
+                       area: Double, minRenderArea: Double,
+                       excluding: Set<String>, includeHidden: Bool, weight: (Int64) -> Double,
+                       prunedBelowArea: inout Int, hiddenFilteredBytes: inout Int64) -> SizeTree {
         let node = nodes[id] ?? Node(name: id)
         let kind = outputKind(node)
 
@@ -378,12 +440,28 @@ public struct ScanReducer {
                 // weights and drop the sub-pixel subtrees, THEN sort only the survivors (whose
                 // count is viewport-bounded: a rect of area `area` holds at most `area/minArea`
                 // children ≥ minArea).
+                // TZ-5 LENSES first (one O(children) pass): SKIP ignored + hidden-filtered
+                // children BEFORE weighting, so `totalW` excludes them and the survivors
+                // RENORMALIZE into the freed area (the ratified ignore behavior). Hidden mass
+                // is accounted HERE, exactly once; ignored children are skipped WITHOUT hidden
+                // accounting (the App owns their mass) — the no-double-count rule. Weights use
+                // the injected `weight` transform so a log/linear projection prunes exactly what
+                // the same-weighted Squarify will render (the composition layer passes both).
                 var totalW = 0.0
-                for cid in node.childIds { totalW += Double(max(0, nodes[cid]?.subtreeAllocated ?? 0)) }
+                for cid in node.childIds {
+                    if excluding.contains(cid) { continue }
+                    if !includeHidden, nodes[cid]?.isHidden == true {
+                        hiddenFilteredBytes += nodes[cid]?.subtreeAllocated ?? 0
+                        continue
+                    }
+                    totalW += weight(nodes[cid]?.subtreeAllocated ?? 0)
+                }
                 var kept: [(id: String, area: Double)] = []
                 for cid in node.childIds {
+                    if excluding.contains(cid) { continue }                       // ignored
+                    if !includeHidden, nodes[cid]?.isHidden == true { continue }   // counted above
                     let child = nodes[cid]
-                    let w = Double(max(0, child?.subtreeAllocated ?? 0))
+                    let w = weight(child?.subtreeAllocated ?? 0)
                     let childArea = totalW > 0 ? area * w / totalW : 0
                     if !(child?.denied ?? false) && childArea < minRenderArea {
                         prunedBelowArea += 1 // count the dropped subtree (a floor — see makeRenderTree)
@@ -398,18 +476,33 @@ public struct ScanReducer {
                 }
                 retained = kept.map {
                     build(id: $0.id, depth: depth + 1, depthWindow: depthWindow,
-                          area: $0.area, minRenderArea: minRenderArea, prunedBelowArea: &prunedBelowArea)
+                          area: $0.area, minRenderArea: minRenderArea, excluding: excluding,
+                          includeHidden: includeHidden, weight: weight,
+                          prunedBelowArea: &prunedBelowArea, hiddenFilteredBytes: &hiddenFilteredBytes)
                 }
             } else {
                 // Full projection: sort children canonically so enumeration order never leaks in.
-                let sortedChildIds = node.childIds.sorted { a, b in
+                // The same TZ-5 lenses apply (ignored + hidden filtered), so a full-projection
+                // consumer (e.g. a non-area-bounded view) sees the identical excluded set.
+                var kids: [String] = []
+                for cid in node.childIds {
+                    if excluding.contains(cid) { continue }
+                    if !includeHidden, nodes[cid]?.isHidden == true {
+                        hiddenFilteredBytes += nodes[cid]?.subtreeAllocated ?? 0
+                        continue
+                    }
+                    kids.append(cid)
+                }
+                let sortedChildIds = kids.sorted { a, b in
                     let na = nodes[a]?.name ?? a
                     let nb = nodes[b]?.name ?? b
                     return na == nb ? a < b : na < nb
                 }
                 retained = sortedChildIds.map {
                     build(id: $0, depth: depth + 1, depthWindow: depthWindow,
-                          area: 0, minRenderArea: 0, prunedBelowArea: &prunedBelowArea)
+                          area: 0, minRenderArea: 0, excluding: excluding,
+                          includeHidden: includeHidden, weight: weight,
+                          prunedBelowArea: &prunedBelowArea, hiddenFilteredBytes: &hiddenFilteredBytes)
                 }
             }
         } else {
@@ -423,7 +516,8 @@ public struct ScanReducer {
             allocatedBytes: node.subtreeAllocated,
             logicalBytes: node.subtreeLogical,
             children: retained,
-            scanState: outputState(node, kind: kind)
+            scanState: outputState(node, kind: kind),
+            isHidden: node.isHidden
         )
     }
 
@@ -453,6 +547,44 @@ public struct ScanReducer {
     /// path returned an empty layout there and the pipeline kept the last good scene. This
     /// preserves that streaming behavior (never flash a bare fill for an unknown focus).
     public func contains(_ id: String) -> Bool { nodes[id] != nil }
+
+    /// The EXACT excluded-mass accounting for the IGNORE lens (TZ-5 deliverable 1), computed
+    /// from CURRENT reducer state — the single explicit rule the App renders (review-0 change 2,
+    /// replacing the App's stale/double-counting snapshot sums). Two properties the snapshot sums
+    /// could not give:
+    ///
+    ///   - STREAMING-CORRECT. An ignored directory is EXCLUDED from every later scene, so a
+    ///     snapshot taken at ignore time froze its size. Here `subtreeAllocated` is the node's
+    ///     current retained total (maintained incrementally by the fold), so re-calling this each
+    ///     emit re-sums the growing subtree — the figure tracks the scan instead of lying low.
+    ///   - OVERLAP-DEDUPLICATED (the UNION rule). If both an ancestor and one of its descendants
+    ///     are ignored, their masses OVERLAP; summing both snapshots double-counts. The total here
+    ///     adds `subtreeAllocated` only for ignored "ROOTS" — an ignored node with NO ignored
+    ///     ancestor — so a descendant under an already-ignored ancestor contributes nothing extra
+    ///     (its mass is already inside the ancestor's subtree total). This is the "one explicit
+    ///     union/accounting rule from current reducer state" the review requires.
+    ///
+    /// `currentById` carries each ignored id's current retained total (for the panel rows), so a
+    /// row's size is live too (0 for an id ignored before its stub arrived — retained as nil).
+    /// Pure over the accumulated state; the pipeline calls it on its actor once per emit —
+    /// O(ignored × ancestor-chain-depth), never node-count. A tuple, not a new type: one caller.
+    public func ignoreAccounting(_ ids: Set<String>) -> (total: Int64, currentById: [String: Int64]) {
+        var currentById = [String: Int64](minimumCapacity: ids.count)
+        var total: Int64 = 0
+        for id in ids {
+            currentById[id] = nodes[id]?.subtreeAllocated ?? 0
+            // Walk the retained parent chain; if any ancestor is ALSO ignored, this node's mass is
+            // already subsumed by that ancestor's subtree total — do not add it again (union dedup).
+            var subsumed = false
+            var pid = nodes[id]?.parentId
+            while let p = pid {
+                if ids.contains(p) { subsumed = true; break }
+                pid = nodes[p]?.parentId
+            }
+            if !subsumed { total += nodes[id]?.subtreeAllocated ?? 0 }
+        }
+        return (total, currentById)
+    }
 
     /// Kind is DERIVED, order-independent: denial wins (we could not enter, so it
     /// is not an ordinary dir), else the stub's kind, else `.pending` for a node

@@ -30,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusBar: StatusBar!
     private var controlBar: ControlBar!
     private var banner: FDABanner!
+    private var ignorePanel: IgnorePanel!
     private var container: ChromeContainer!
     private var navigation: NavigationController!
     private var controller: ScanController!
@@ -44,6 +45,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         window.title = "Terrazzo"
         window.backgroundColor = .black
+        // TZ-5 deliverable 5 (chrome color audit, DURABLE RULE). Force the window to the DARK
+        // appearance so every AppKit control and semantic colour (labelColor, secondaryLabelColor,
+        // standard buttons/steppers/segmented controls/popovers) resolves to its LIGHT-on-dark
+        // variant. This is the root fix for the "near-black text on the dark bar" defect: on the
+        // default (light) appearance an unstyled NSTextField's labelColor is near-black, invisible
+        // on our custom dark chrome. Under .darkAqua the app-palette explicit colours still apply,
+        // AND any semantic-coloured control is correct by construction — no per-control hardcoding.
+        window.appearance = NSAppearance(named: .darkAqua)
         window.setFrameAutosaveName("TerrazzoMainWindow")
         window.center()
 
@@ -56,20 +65,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         banner = FDABanner(frame: NSRect(x: 0, y: 0, width: frame.width, height: FDABanner.height))
         statusBar = StatusBar(frame: NSRect(x: 0, y: 0, width: frame.width, height: StatusBar.height))
         canvas = CanvasView(frame: NSRect(x: 0, y: 0, width: frame.width, height: frame.height))
-        container = ChromeContainer(controlBar: controlBar, banner: banner, canvas: canvas, statusBar: statusBar)
+        ignorePanel = IgnorePanel()
+        container = ChromeContainer(controlBar: controlBar, banner: banner, canvas: canvas,
+                                    statusBar: statusBar, ignorePanel: ignorePanel)
         container.frame = frame
         container.autoresizingMask = [.width, .height]
         window.contentView = container
 
-        // Navigation owns focus/camera/hover; wired to canvas + status bar.
-        navigation = NavigationController(canvas: canvas, bottomBar: statusBar)
+        // Navigation owns focus/camera/hover; wired to canvas + status bar + the Ignore panel.
+        navigation = NavigationController(canvas: canvas, bottomBar: statusBar, ignorePanel: ignorePanel)
         canvas.escapeHandler = { [weak navigation] in navigation?.ascend() } // Esc → zoom out
+        // Show/hide the (only-while-non-empty) Ignore panel as the set changes.
+        navigation.onIgnoreChanged = { [weak self] in
+            guard let self else { return }
+            self.container.showsIgnorePanel = !self.ignorePanel.isEmpty
+        }
 
         // TZ-4 chrome actions (Main-assembly wiring): rescan (toolbar + FDA banner) and
         // volume selection both funnel to the scan helpers below.
         controlBar.onRescan = { [weak self] in self?.rescanCurrentVolume() }
         banner.onRescan = { [weak self] in self?.rescanCurrentVolume() }
         controlBar.volumePicker.onSelect = { [weak self] descriptor in self?.scanVolume(descriptor.url) }
+        // TZ-5 lens controls → ScanController → the background pipeline (off main).
+        controlBar.onScaleChange = { [weak self] scale in self?.controller.setScale(scale) }
+        controlBar.onHiddenChange = { [weak self] include in self?.controller.setIncludeHidden(include) }
+        controlBar.onDepthChange = { [weak self] depth in self?.controller.setDepthWindow(depth) }
 
         // Menu is built AFTER `navigation` exists: buildMenu() bakes `navigation`
         // as the explicit target of the ⌘R / ⌘↑ items at install time, so it must
@@ -220,6 +240,10 @@ final class ChromeContainer: NSView {
     private let banner: FDABanner
     private let canvas: CanvasView
     private let statusBar: StatusBar
+    /// The Ignore list (TZ-5 deliverable 1) — FLOATS at the top-right of the canvas region, over
+    /// the map (not re-flowing it), shown only while non-empty. Positioned here, filled by
+    /// NavigationController.
+    private let ignorePanel: IgnorePanel
 
     /// Whether the FDA banner is shown (D5). Toggling re-flows the canvas.
     var showsBanner = false {
@@ -230,18 +254,32 @@ final class ChromeContainer: NSView {
         }
     }
 
-    init(controlBar: ControlBar, banner: FDABanner, canvas: CanvasView, statusBar: StatusBar) {
+    /// Whether the Ignore panel is shown (TZ-5) — set by AppDelegate from the panel's non-empty
+    /// state. It FLOATS over the canvas, so toggling repositions it without re-flowing the map.
+    var showsIgnorePanel = false {
+        didSet {
+            guard showsIgnorePanel != oldValue else { return }
+            ignorePanel.isHidden = !showsIgnorePanel
+            relayout()
+        }
+    }
+
+    init(controlBar: ControlBar, banner: FDABanner, canvas: CanvasView, statusBar: StatusBar,
+         ignorePanel: IgnorePanel) {
         self.controlBar = controlBar
         self.banner = banner
         self.canvas = canvas
         self.statusBar = statusBar
+        self.ignorePanel = ignorePanel
         super.init(frame: .zero)
         wantsLayer = true
         banner.isHidden = true
+        ignorePanel.isHidden = true
         addSubview(controlBar)
         addSubview(banner)
         addSubview(canvas)
         addSubview(statusBar)
+        addSubview(ignorePanel) // on top of the canvas
     }
 
     required init?(coder: NSCoder) { fatalError("ChromeContainer is code-only") }
@@ -271,5 +309,15 @@ final class ChromeContainer: NSView {
         let canvasHeight = max(0, h - top - statusH)
         canvas.frame = NSRect(x: 0, y: top, width: w, height: canvasHeight)
         statusBar.frame = NSRect(x: 0, y: h - statusH, width: w, height: statusH)
+
+        // Float the Ignore panel at the TOP-RIGHT of the canvas region, sized to its content
+        // (clamped to the canvas height), so it covers as little of the map as possible.
+        if showsIgnorePanel {
+            let margin: CGFloat = 10
+            let pw = IgnorePanel.width
+            let ph = min(ignorePanel.contentHeight(), max(0, canvasHeight - 2 * margin))
+            // isFlipped == true here (top-left origin), so y grows downward from the canvas top.
+            ignorePanel.frame = NSRect(x: w - pw - margin, y: top + margin, width: pw, height: ph)
+        }
     }
 }
