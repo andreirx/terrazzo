@@ -319,6 +319,21 @@ updates live without rescan. Manual Rescan (TZ-4) remains the
 full-truth fallback. ALL revalidation is async events — never blocks
 navigation (the law).
 
+### TZ-8 — Glass-pane depth tint (human design 2026-08-17)
+The focus level's hue acts as a TRANSLUCENT PANE (~50% alpha at rest,
+named constant) over its descendants, whose OWN hues partially show
+through even before diving. Diving DISSOLVES the target subtree's pane
+in sync with the camera flight (alpha 0.5 → 0 over the flight's t);
+ascending re-condenses it (0 → 0.5). The discrete re-tint swap is
+replaced by this continuous emergence — depth becomes material.
+Mechanism (fits the law by construction): GPUQuad carries TWO colors
+(own hue, inherited pane hue) precomputed on the pipeline actor; the
+fragment shader blends by ONE uniform driven by the camera flight t —
+O(1) per frame on main. Tests: blend endpoints equal today's two color
+states (rest == paned, dived == own — no drift from the ratified hue
+identities); dissolve monotone in t; ascend is the exact reverse; the
+dim ladder composes with the pane (multiplicative, order stated).
+
 ## Slice → relay mapping
 
 Same operator loop as glyph-saver: bootstrap
