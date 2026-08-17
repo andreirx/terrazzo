@@ -2,25 +2,39 @@
 //  ScanEvents.swift — the streaming scan event model + the pure reducer.
 //  Module maturity: PROTOTYPE (slice TZ-2 — contracts still moving)
 //
-//  TZ-9 (THE MEMORY LAW) — LEAN NODE STORE, Phase A. The field report named three ways the
+//  TZ-9 (THE MEMORY LAW) — LEAN NODE STORE, Phase A + B. The field report named three ways the
 //  pre-TZ-9 `[String: Node]` retained every node's absolute path — as the dict KEY, inside its
-//  parent's CHILD SET, and as each child's `parentId` — i.e. the same path stored THREE times
-//  (~264 B of path strings/node, the bulk of the pre-TZ-9 ~624 B/node measured on the home scan,
-//  growing O(depth)). This
-//  slice removes TWO of those three copies with an index-addressed store:
-//    • `store: [Node]`   — one contiguous slot per node; each node retains its OPAQUE id string
-//                          exactly ONCE (`Node.id`).
+//  parent's CHILD SET, and as each child's `parentId` (~264 B of path strings/node, the bulk of
+//  the pre-TZ-9 ~624 B/node measured on the home scan, growing O(depth)). Phase A removed two of
+//  the three copies with an index-addressed store:
+//    • `store: [Node]`   — one contiguous slot per node.
 //    • `index: [PathKey: Int32]` — id → slot, keyed by a 128-bit HASH of the id (16 bytes), NOT
-//                          the id string — so the map holds NO path copy (kills copy #1).
+//                          the id string — so the map holds NO path copy.
 //    • parent / children are SLOT INDICES (`Int32`), not strings — so no parent or child holds
-//                          another node's path (kills copies #2 and #3).
+//                          another node's path.
+//  Phase B removes the LAST retained copy (`Node.id` — the ~200 B/node whale of the Phase A
+//  measurement): a node retains NO id string at all. Its id is DERIVED on demand by walking
+//  `parent` links and joining `name`s (`joinId` — the walker's ratified id contract: the root's
+//  id is `rootId`, a descendant's id is `parentId + "/" + name`; see `FileSystemWalker.joinId`
+//  and the `SizeTree.id` contract). The ONLY id strings the store retains are `rootId` (one per
+//  reducer) and the `retainedIds` side map, which holds an id for EXACTLY the slots whose id is
+//  NOT derivable:
+//    (a) a slot not yet LINKED to its parent (created by a size/denied/completed/mtime event
+//        arriving before its discovery stub) — TRANSIENT: the entry drops the moment the stub
+//        links it and the path contract holds, so a production scan's steady-state entry count
+//        is ZERO (the drain is pinned by test);
+//    (b) a linked slot whose id VIOLATES the path contract — SYNTHETIC ids (the verify harness
+//        replays the fixture tree, ids like "n028:System", through this reducer:
+//        `scripts/verify_host.swift buildReducer(from:)`) — retained for the node's lifetime,
+//        so opaque ids still round-trip VERBATIM. Only contract-violating callers pay this
+//        memory; the walker never does. (This SETTLES the Phase B synthetic-id question: the
+//        fixture gate is REAL — verify_host feeds synthetic ids through the reducer — and the
+//        documented side map is the behavior-preserving resolution.)
 //  The public API is UNCHANGED: events carry path-string ids; makeTree/graft/prune/diff produce
-//  byte-identical trees (the 211 tests are the ratchet). Ids stay OPAQUE — echoed back verbatim
-//  from `Node.id`, never reconstructed — so a caller whose ids are NOT `parent + "/" + name`
-//  (the shared verify/TreemapCore fixture uses synthetic ids like "n028:System") is unaffected.
-//  See `PathKey` for the collision argument, and the build report for why the LAST id copy is
-//  kept here (dropping it to reach ≤100 B/node — Phase B — needs the `id == parent+"/"+name`
-//  contract, which the walker honors but that fixture does not).
+//  byte-identical trees (the pre-Phase-B 214-test suite + the fixture goldens are the ratchet;
+//  DerivedIdTests adds the Phase B pins — the drain to zero retained ids, and synthetic-id
+//  round-trip). See `PathKey` for the collision argument (an exact parent-chain compare,
+//  `slotMatches`).
 //
 //  This is the concurrency boundary (ratified decision 5). The walker in ScanFS
 //  runs ONE worker per top-level folder; every worker emits SUBTREE-TAGGED
@@ -174,36 +188,47 @@ public struct RevalidationDiff: Equatable, Sendable {
 /// WHY A HASH, NOT THE PATH: the pre-TZ-9 `[String: Node]` retained the full path string as the
 /// dict key; at ~40–80 bytes each (plus String/heap overhead) that was one of the three retained
 /// path copies the field report named. Keying by a fixed 16-byte hash retains no path in the map at
-/// all — the id→slot map costs the same whether ids are 8 or 200 chars long. (The node still keeps
-/// its own id once, in `Node.id`, so ids stay opaque and are echoed back verbatim — see the file
-/// header for why that LAST copy is retained rather than derived.)
+/// all — the id→slot map costs the same whether ids are 8 or 200 chars long. (Since Phase B the
+/// node keeps NO id copy either — ids derive from the parent chain, or live in the `retainedIds`
+/// side map when not derivable; see the file header.)
 ///
-/// COLLISION RESOLUTION IS EXACT (review-0 change 1) — the hash is a fast FIRST-LEVEL discriminator,
-/// NOT the correctness argument. The map (`index`) holds one slot per key; a second DISTINCT id that
-/// hashes to the same key goes into the `collisions` side table; and EVERY lookup (`slot(of:)` /
-/// `ensureSlot`) confirms `store[slot].id == id` against the ONE opaque id the node already retains
-/// (`Node.id`). So two distinct ids can never resolve to the same node — correctness rests on the
-/// retained-id compare, exactly as the pre-TZ-9 `[String: Node]` store's key compare did, NOT on the
-/// hash being collision-free. The packet's suggested "parent-chain verification" was rejected as
-/// UNSOUND here — verified from the code, not the name:
-///   1. LATE NAMING — a node may be created by a `sizeUpdated` BEFORE its `childrenDiscovered` stub
-///      (the size-before-stub test), so its `name` is transiently `""`.
-///   2. OPAQUE / DISPLAY-NAME IDS — a node's id need not be `parent + "/" + name` (the scan root's
-///      `name` is a display name; the verify fixture's ids are synthetic), so a name-based path
-///      reconstruction cannot even produce the id to verify against.
-/// The retained-id compare has neither problem: it is the id itself, present from `ensureSlot`.
+/// COLLISION RESOLUTION IS EXACT (review-0 change 1; mechanism updated in Phase B) — the hash is a
+/// fast FIRST-LEVEL discriminator, NOT the correctness argument. The map (`index`) holds one slot
+/// per key; a second DISTINCT id that hashes to the same key goes into the `collisions` side table;
+/// and EVERY lookup (`slot(of:)` / `ensureSlot`) confirms the candidate slot against the QUERIED id
+/// via `slotMatches` — a byte-exact PARENT-CHAIN comparison: strip the slot's `name` off the id's
+/// tail, then the `joinId` separator, ascend, and compare the remaining prefix against the first
+/// ancestor whose id IS a string in hand (`rootId`, or a `retainedIds` entry). No probabilistic
+/// acceptance: two distinct ids can never resolve to the same node. Phase A documented parent-chain
+/// verification as UNSOUND for two reasons; the Phase B store resolves both STRUCTURALLY:
+///   1. LATE NAMING — a node created by `sizeUpdated` before its `childrenDiscovered` stub has no
+///      name/parent yet. Phase B keeps such a slot's id STRING in `retainedIds` until the stub
+///      links it; `slotMatches` compares against that string directly (no chain walk involved).
+///   2. OPAQUE / DISPLAY-NAME IDS — the scan root's `name` is a display name (its id is compared
+///      against the retained `rootId`, never name-derived), and a contract-violating synthetic id
+///      keeps its `retainedIds` entry permanently — again a direct string compare.
+/// EQUALITY GRANULARITY (review-1 change 1 — ONE relation): id identity is UTF-8 BYTE equality,
+/// applied consistently everywhere an id is hashed, verified, or decided — `PathKey` hashes bytes;
+/// `slotMatches` compares bytes (the chain walk, and the root/retained direct compares via
+/// `sameIdBytes`); and DERIVABILITY (drop vs retain an id string at child-linking and `reRoot`) is
+/// decided by the same `sameIdBytes`. Swift's canonical-equivalence `String ==` is deliberately
+/// NOT used for ids: it calls a decomposed and a precomposed spelling "equal", which would drop
+/// the retained verbatim string while byte-wise lookup and projection disagree — two distinct
+/// byte ids collapsing or going unfindable (the review-1 blocking defect; pinned by the
+/// canonical-equivalence regressions in DerivedIdTests). Byte identity is also the de-facto
+/// walker identity: every production id derives from one enumeration byte source.
 ///
 /// WHY 128 BITS ANYWAY: keeping the hash wide (two independent 64-bit passes) is what keeps the
 /// `collisions` side table EMPTY in practice — across even a 60M-node forest the expected number of
 /// colliding pairs is ≈ n²/2·2⁻¹²⁸ ≈ 1e-23 — so the exact-resolution machinery pays ~zero memory and
 /// the verify compare almost always succeeds on the first slot. That is a MEMORY/throughput argument,
-/// not a correctness one: even if a collision did occur, the side table + id compare keep the two
+/// not a correctness one: even if a collision did occur, the side table + exact compare keep the two
 /// nodes distinct. Keys are compared on the FULL 128 bits (Swift synthesizes `==` over both halves).
 ///
 /// ABSTRACTION LEDGER — PathKey: a value type wrapping the map key. Concrete users: `ScanReducer.index`
 /// + `collisions`. Axis: memory (drop the map's retained path copy — THE MEMORY LAW). Rejected simpler
-/// alternative: key by the `String` id (the pre-TZ-9 design — one of the three path copies this slice
-/// removes); and, separately, name-based parent-chain verification (unsound, see above).
+/// alternative: key by the `String` id (the pre-TZ-9 design — one of the three path copies TZ-9
+/// removed).
 fileprivate struct PathKey: Hashable {
     let a: UInt64
     let b: UInt64
@@ -268,19 +293,20 @@ public struct ScanReducer {
     /// A node under construction in the LEAN STORE (TZ-9). The DERIVED semantics are unchanged from
     /// the pre-TZ-9 record — `kind`/`scanState` are computed (`outputKind`/`outputState`), never
     /// stored, so they cannot depend on write order — the change is ADDRESSING: a node is a SLOT in
-    /// `store`, referenced by `Int32` index, never by a retained path String except its OWN id.
-    ///   • `id` is this node's opaque id, retained EXACTLY ONCE (echoed back verbatim in `SizeTree`,
-    ///     so ids stay opaque — a caller's synthetic ids survive a round trip). The pre-TZ-9 store
-    ///     held this same string THREE times (map key + parent's child-set + `parentId`); the other
-    ///     two are gone (hash key + `Int32` links).
+    /// `store`, referenced by `Int32` index, and since Phase B retains NO path string at all.
+    ///   • The node's id is NOT stored (Phase B — the ~200 B/node whale). It is DERIVED on demand:
+    ///     `rootId` for the root slot, else `joinId(parentId, name)` up the `parent` chain — or read
+    ///     from the `retainedIds` side map for the (unlinked / contract-violating) slots whose id
+    ///     cannot be derived. Ids still round-trip verbatim through `SizeTree` (see the file header).
     ///   • `name` is the display name (usually ≤ 15 UTF-8 bytes → inline via Swift's small-string
-    ///     optimization, no heap).
+    ///     optimization, no heap). For every LINKED contract-following node it is byte-identical to
+    ///     the id's last path component — that is what makes derivation exact.
     ///   • `childIndices` are child SLOTS, not path strings — empty for leaves (Swift's shared
     ///     empty-array singleton, so a file node pays ZERO heap here, the common case).
     ///   • `parent` is the parent SLOT (`noIndex` for the root / a not-yet-linked node); it carries
-    ///     exactly the write-once single-parent role the old `parentId` string did.
+    ///     exactly the write-once single-parent role the old `parentId` string did — and since
+    ///     Phase B it is also the id-derivation chain.
     private struct Node {
-        var id: String = ""
         var name: String
         var ownAllocated: Int64 = 0
         var ownLogical: Int64 = 0
@@ -324,27 +350,53 @@ public struct ScanReducer {
     /// of THE MEMORY LAW.
     private var store: [Node]
     /// id → slot, keyed by a 128-bit path HASH (`PathKey`), NOT the path string. The memory win is
-    /// that the MAP KEY retains no path copy (16 fixed bytes regardless of id length) — the reducer
-    /// still keeps ONE opaque id per node, in `Node.id`, so ids round-trip verbatim (see the header).
+    /// that the MAP KEY retains no path copy (16 fixed bytes regardless of id length) — and since
+    /// Phase B the reducer keeps NO per-node id string at all: ids DERIVE from the parent chain
+    /// (`slotMatches` verifies, `childId` emits), with `retainedIds` covering exactly the
+    /// non-derivable slots, so ids still round-trip verbatim (see the file header).
     /// This map holds exactly ONE slot per key: the FIRST id that claimed it. A second DISTINCT id
     /// that hashes to the same key (a 128-bit collision — see `PathKey`) does not overwrite it; it is
-    /// recorded in `collisions` instead, and every lookup VERIFIES `store[slot].id == id`, so two
-    /// distinct ids can never resolve to one node. Exact resolution, not probabilistic.
+    /// recorded in `collisions` instead, and every lookup VERIFIES the candidate via `slotMatches`
+    /// (exact parent-chain compare), so two distinct ids can never resolve to one node. Exact
+    /// resolution, not probabilistic.
     private var index: [PathKey: Int32]
     /// Collision side table: for a `PathKey` shared by two or more retained ids, the EXTRA slots
     /// beyond the one in `index`. Absent (and the enclosing dictionary empty) in the overwhelming
     /// normal case — a real FNV-128 collision is not an operational event (see `PathKey`) — so it
     /// costs ZERO retained bytes per node under THE MEMORY LAW; it exists only so that IF two distinct
-    /// ids ever share a key, they are still kept apart EXACTLY (validated against the retained
-    /// `Node.id`), never merged. Cleared as slots are freed (`removeSubtree`) so it cannot leak.
+    /// ids ever share a key, they are still kept apart EXACTLY (verified by `slotMatches`' byte-exact
+    /// parent-chain compare — Phase B; no per-node id is retained), never merged. Cleared as slots
+    /// are freed (`removeSubtree`) so it cannot leak.
     ///
     /// ABSTRACTION LEDGER — collisions: a side table of same-key slots. Concrete users: `slot(of:)` +
     /// `ensureSlot` (readers/writer) and `removeSubtree` (cleanup). Axis: exact hash-collision
     /// resolution (the frozen public API guarantees distinct ids stay distinct; a 128-bit hash alone
     /// cannot). Rejected simpler alternative: none — a bare `[PathKey: Int32]` silently merges two
-    /// distinct filesystem nodes on any collision (the review-0 finding); parent-chain (name-based)
-    /// verification is unsound here (late naming + opaque ids, see `PathKey`).
+    /// distinct filesystem nodes on any collision (the review-0 finding).
     private var collisions: [PathKey: [Int32]] = [:]
+
+    /// Phase B (THE MEMORY LAW) — id strings retained for EXACTLY the slots whose id cannot be
+    /// DERIVED from the parent chain. INVARIANT, maintained at every mutation point: for every live
+    /// slot `s`, `id(s) == (s == rootIndex ? rootId : retainedIds[s] ?? joinId(id(parent(s)), name(s)))`,
+    /// and an entry exists IFF the `retainedIds[s]` arm is the one that applies — i.e.
+    ///   (a) `s` is UNLINKED (`parent == noIndex`, not the root): stamped by `allocateSlot`, dropped
+    ///       by the linking `childrenDiscovered`/`reRoot` once the derived id matches — so during a
+    ///       real scan entries live only between a node's first out-of-order event and its stub
+    ///       (steady state ZERO — the walker stubs every node before sizing it); or
+    ///   (b) `s` is linked but its id VIOLATES the path contract (`id != joinId(parentId, name)`) —
+    ///       the synthetic-id case (verify harness fixture replay); kept for the node's lifetime so
+    ///       opaque ids round-trip verbatim. Only such callers pay the memory.
+    /// Cleared by `removeSubtree` so a prune returns the footprint (the law's rescan half).
+    ///
+    /// ABSTRACTION LEDGER — retainedIds: a slot → id-string side map for NON-DERIVABLE ids only.
+    /// Concrete users: `slotMatches`/`childId` (readers), `allocateSlot` (writer),
+    /// `apply(.childrenDiscovered)` + `reRoot` (resolution: drop when the contract holds),
+    /// `removeSubtree` (cleanup), and the `retainedIdCount` test seam. Axis: memory (THE MEMORY LAW
+    /// Phase B — replace the ~200 B/node retained path with on-demand derivation; retain a string
+    /// only where derivation is impossible). Rejected simpler alternatives: keep `Node.id` (Phase A —
+    /// the whale this slice removes); or forbid non-contract ids (breaks the frozen opaque-id API and
+    /// the verify harness's fixture replay — the settled synthetic-id question, see the file header).
+    private var retainedIds: [Int32: String] = [:]
     /// Recycled slot indices from pruned subtrees, reused by the next `ensureSlot` before growing
     /// `store` (bounds live-churn memory; the initial scan never prunes, so it stays empty then).
     ///
@@ -451,8 +503,10 @@ public struct ScanReducer {
     private init(rootId: String, rootName: String, testHasher: ((String) -> PathKey)?) {
         self.testHasher = testHasher
         self.rootId = rootId
-        var root = Node(name: rootName, stubKind: .dir)
-        root.id = rootId
+        // The root slot retains NO id string (Phase B): its id IS `rootId`, the derivation base
+        // case (`rootIndex` is special-cased in `slotMatches`/`childId`, so the root's display
+        // name never participates in derivation).
+        let root = Node(name: rootName, stubKind: .dir)
         self.store = [root]
         // Seed the root's key through the SAME hash the fold will use (test or production), else a
         // forced-collision test would key the root differently from every folded id.
@@ -462,37 +516,139 @@ public struct ScanReducer {
 
     // MARK: - Lean-store primitives (TZ-9)
 
-    /// The slot for `id`, or `nil` if the reducer has never recorded it. EXACT (review-0 change 1):
-    /// the 128-bit hash picks a candidate, then the retained `Node.id` is compared so a hash collision
-    /// resolves to the RIGHT node (or `nil`), never to a distinct id's node. The id compare is the same
-    /// work the pre-TZ-9 `[String: Node]` did on every lookup, so the hot path is unchanged in cost.
+    /// The slot for `id`, or `nil` if the reducer has never recorded it. EXACT (review-0 change 1;
+    /// Phase B mechanism): the 128-bit hash picks a candidate, then `slotMatches` compares the
+    /// QUERIED id against the slot's DERIVED id (parent-chain walk — or its retained string where
+    /// derivation is impossible), so a hash collision resolves to the RIGHT node (or `nil`), never
+    /// to a distinct id's node. The compare consumes the same O(|id|) bytes the pre-TZ-9 String
+    /// key-compare did, so the hot path's asymptotic cost is unchanged.
     private func slot(of id: String) -> Int32? {
         let k = key(id)
         guard let first = index[k] else { return nil }
-        if store[Int(first)].id == id { return first }
+        if slotMatches(first, id) { return first }
         // Hash collision (astronomically rare — see `PathKey`): scan the side-table slots for this key.
         if let bucket = collisions[k] {
-            for s in bucket where store[Int(s)].id == id { return s }
+            for s in bucket where slotMatches(s, id) { return s }
         }
         return nil
     }
 
+    /// Whether slot `s`'s id equals `id`, byte-for-byte — THE exact-verification primitive behind
+    /// every lookup (Phase B, replacing the Phase A `store[s].id == id` compare). Three cases,
+    /// mirroring the `retainedIds` invariant:
+    ///   • the root slot: compare against `rootId` (the derivation base case — the root's `name`
+    ///     is a display name and never participates);
+    ///   • a slot with a `retainedIds` entry (unlinked, or contract-violating): compare against
+    ///     that retained string;
+    ///   • a linked derivable slot: REVERSE-WALK the parent chain, consuming `id` from the tail —
+    ///     strip the node's `name` bytes, then the `joinId` separator, ascend, and finish by
+    ///     comparing the remaining prefix against the first ancestor whose id IS a string in hand
+    ///     (`rootId` or a retained entry). No id string is ever materialized: O(|id|) byte
+    ///     compares + O(depth) link hops, the same total work as the old full-string `==`.
+    private func slotMatches(_ s: Int32, _ id: String) -> Bool {
+        if s == rootIndex { return Self.sameIdBytes(id, rootId) }
+        if let kept = retainedIds[s] { return Self.sameIdBytes(kept, id) }
+        let bytes = id.utf8
+        var end = bytes.endIndex
+        var cur = s
+        while true {
+            let node = store[Int(cur)]
+            // Strip `node.name` off the id's tail (byte-wise, reverse).
+            let name = node.name.utf8
+            var ni = name.endIndex
+            while ni > name.startIndex {
+                guard end > bytes.startIndex else { return false }
+                ni = name.index(before: ni)
+                end = bytes.index(before: end)
+                if bytes[end] != name[ni] { return false }
+            }
+            let parent = node.parent
+            // An unlinked non-root slot always has a `retainedIds` entry (the invariant), so
+            // reaching `noIndex` here means `s`'s chain is not rooted — no derivable id to match.
+            guard parent != ScanReducer.noIndex else { return false }
+            // Strip the `joinId` separator — present unless the parent's id itself ends in "/"
+            // (the volume-root "/" case; decidable locally, see `parentIdEndsInSlash`).
+            if !parentIdEndsInSlash(parent) {
+                guard end > bytes.startIndex else { return false }
+                end = bytes.index(before: end)
+                guard bytes[end] == UInt8(ascii: "/") else { return false }
+            }
+            if parent == rootIndex {
+                return bytes[bytes.startIndex..<end].elementsEqual(rootId.utf8)
+            }
+            if let kept = retainedIds[parent] {
+                return bytes[bytes.startIndex..<end].elementsEqual(kept.utf8)
+            }
+            cur = parent
+        }
+    }
+
+    /// Does the id of linked slot `p` end in "/"? Needed by `slotMatches` to know whether `joinId`
+    /// inserted a separator below `p`. Decidable LOCALLY, without deriving the id: the root's id is
+    /// `rootId` (in hand); a retained id is in hand; and a DERIVED id `joinId(parentId, name)` ends
+    /// in "/" iff `name` is empty or itself ends in "/" (`joinId` places `name` last either way).
+    private func parentIdEndsInSlash(_ p: Int32) -> Bool {
+        let slash = UInt8(ascii: "/")
+        if p == rootIndex { return rootId.utf8.last == slash }
+        if let kept = retainedIds[p] { return kept.utf8.last == slash }
+        let last = store[Int(p)].name.utf8.last
+        return last == nil || last == slash
+    }
+
+    /// Join a parent id and a child name into the child's id — the SAME one-line rule as
+    /// `FileSystemWalker.joinId` (the id contract's single composition rule; duplicated verbatim
+    /// because ScanCore must not import ScanFS — the dependency points the other way — and a
+    /// shared one-liner does not earn a module). Handles a parent id of "/" without producing
+    /// "//name". Cited both ways (see FileSystemWalker.joinId).
+    private static func joinId(_ parent: String, _ name: String) -> String {
+        parent.hasSuffix("/") ? parent + name : parent + "/" + name
+    }
+
+    /// THE id-equality relation (review-1 change 1): UTF-8 BYTE equality — the same granularity
+    /// `PathKey` hashes and the `slotMatches` chain walk compares. Every site that verifies an id
+    /// against a string in hand or DECIDES derivability (drop vs retain) routes through this ONE
+    /// function: the root/retained arms of `slotMatches`, the child-linking resolution, `reRoot`'s
+    /// derivability decision, and `reRoot`'s already-there guard. Swift's `String ==` (canonical
+    /// equivalence) is prohibited for ids — it would call byte-distinct spellings equal and
+    /// desynchronize derivability from byte-wise lookup/projection (the review-1 blocking defect).
+    /// O(1) length short-circuit (`utf8.count` is stored for native strings) + O(min |bytes|) compare
+    /// — the same asymptotic cost as the `==` it replaces.
+    private static func sameIdBytes(_ a: String, _ b: String) -> Bool {
+        a.utf8.count == b.utf8.count && a.utf8.elementsEqual(b.utf8)
+    }
+
+    /// The id of child slot `c` whose PARENT's id is `parentId` — the boundary-emission derivation
+    /// (Phase B): the retained string when derivation is impossible, else one `joinId` (O(1) join,
+    /// no chain walk — the caller already holds the parent's id, so a projection derives each id
+    /// exactly once, top-down). The `rootIndex` guard covers the exotic-but-reachable state where
+    /// the CURRENT root is linked as someone's child (a pre-promotion `childrenDiscovered` naming
+    /// the root — the `reRoot` merge case): its id is `rootId` regardless of the chain.
+    private func childId(_ c: Int32, parentId: String) -> String {
+        if c == rootIndex { return rootId }
+        return retainedIds[c] ?? Self.joinId(parentId, store[Int(c)].name)
+    }
+
+    /// TEST SEAM (TZ-9 Phase B) — the count of retained (non-derivable) id strings. The memory
+    /// claim "contract-following ids retain no string" is unobservable through the public API;
+    /// tests read this to pin that entries DRAIN to zero after a contract-following fold and that
+    /// synthetic ids are retained (not corrupted). Read-only; reachable only via `@testable import`.
+    internal var retainedIdCount: Int { retainedIds.count }
+
     /// The slot for `id`, creating it from `make()` (recycling a freed slot if one is available,
     /// else appending) when absent. The single allocation point — every `apply` arm that folds a
-    /// fact about a node routes through here, exactly as the old `nodes[id] ?? Node(…)` did. The
-    /// created node's `id` is stamped here (so every slot echoes its opaque id verbatim), the one
-    /// place it is retained. Collision-EXACT: an existing slot is returned only when its retained
-    /// `Node.id` matches; a genuine 128-bit collision with a DIFFERENT id allocates a fresh slot and
-    /// records it in the `collisions` side table so both ids stay distinct.
+    /// fact about a node routes through here, exactly as the old `nodes[id] ?? Node(…)` did.
+    /// Collision-EXACT: an existing slot is returned only when `slotMatches` confirms the queried
+    /// id; a genuine 128-bit collision with a DIFFERENT id allocates a fresh slot and records it in
+    /// the `collisions` side table so both ids stay distinct.
     private mutating func ensureSlot(_ id: String, _ make: () -> Node) -> Int32 {
         let k = key(id)
         if let first = index[k] {
-            if store[Int(first)].id == id { return first }
+            if slotMatches(first, id) { return first }
             if let bucket = collisions[k] {
-                for s in bucket where store[Int(s)].id == id { return s }
+                for s in bucket where slotMatches(s, id) { return s }
             }
             // Distinct id sharing this key: new slot, recorded in the side table (never overwrites
-            // `index[k]`, so the first id keeps its slot). Verified by `Node.id` on every lookup.
+            // `index[k]`, so the first id keeps its slot). Verified by `slotMatches` on every lookup.
             let i = allocateSlot(id, make)
             collisions[k, default: []].append(i)
             return i
@@ -502,17 +658,22 @@ public struct ScanReducer {
         return i
     }
 
-    /// Stamp a fresh `Node` for `id` into a recycled or newly-appended slot and return its index. The
+    /// Place a fresh `Node` for `id` into a recycled or newly-appended slot and return its index. The
     /// slot's key registration (`index` vs `collisions`) is the caller's (`ensureSlot`) decision.
+    /// A fresh slot is UNLINKED, so its id is not yet derivable: the string goes into `retainedIds`
+    /// (the invariant's case (a)) until the linking edge resolves it — the one place an id string
+    /// enters the store.
     private mutating func allocateSlot(_ id: String, _ make: () -> Node) -> Int32 {
-        var node = make()
-        node.id = id
+        let node = make()
+        let i: Int32
         if let reused = freeList.popLast() {
             store[Int(reused)] = node
-            return reused
+            i = reused
+        } else {
+            i = Int32(store.count)
+            store.append(node)
         }
-        let i = Int32(store.count)
-        store.append(node)
+        retainedIds[i] = id
         return i
     }
 
@@ -538,8 +699,12 @@ public struct ScanReducer {
     /// discovered as an ancestor stub); we merge onto it rather than overwrite, so no
     /// prior state under that id is lost.
     public mutating func reRoot(to newRootId: String, newRootName: String) {
-        guard newRootId != rootId else { return } // already there — nothing to promote
+        // Already there — nothing to promote. BYTE-exact (review-1 change 1, `sameIdBytes`): a
+        // canonically-equivalent but byte-distinct id is a DIFFERENT id under the store's one
+        // equality relation, so it gets a real promotion (a distinct node), never a silent no-op.
+        guard !Self.sameIdBytes(newRootId, rootId) else { return }
         let oldIdx = rootIndex
+        let oldRootId = rootId
         let newIdx = ensureSlot(newRootId) { Node(name: newRootName, stubKind: .dir) }
         store[Int(newIdx)].name = newRootName
         store[Int(newIdx)].stubKind = .dir
@@ -558,6 +723,19 @@ public struct ScanReducer {
         }
         rootId = newRootId
         rootIndex = newIdx
+        // Phase B id bookkeeping. The NEW root's id is now the derivation base case (`rootId`), so
+        // any retained string it carried (it was created unlinked, or pre-existed as an ancestor
+        // stub) is dropped. The OLD root loses its base-case status: its id is derivable iff the
+        // path contract holds across the graft — BYTE-exact (`sameIdBytes`, review-1 change 1):
+        // `oldRootId` must equal `joinId(newRootId, oldName)` byte-for-byte (always true in
+        // production, where names are `lastPathComponent`s of the same byte source); otherwise the
+        // string is retained (invariant case (b)) so the grafted subtree's ids stay verbatim.
+        retainedIds.removeValue(forKey: newIdx)
+        if Self.sameIdBytes(oldRootId, Self.joinId(newRootId, store[Int(oldIdx)].name)) {
+            retainedIds.removeValue(forKey: oldIdx)
+        } else {
+            retainedIds[oldIdx] = oldRootId
+        }
     }
 
     // MARK: - Fold
@@ -602,10 +780,25 @@ public struct ScanReducer {
             // `parent != pi` is the exact test the old `Set.insert().inserted` gave. The child slots
             // are the ones just returned by `ensureSlot` (collision-exact), not a re-lookup.
             var newlyLinked: [Int32] = []
-            for ci in childSlots {
+            for (offset, ci) in childSlots.enumerated() {
                 if store[Int(ci)].parent != pi {
                     store[Int(pi)].childIndices.append(ci)
                     store[Int(ci)].parent = pi
+                    // Phase B: the edge exists now, so RESOLVE the child's retained id (THE MEMORY
+                    // LAW). Derivable — the walker's path contract holds BYTE-for-byte
+                    // (`sameIdBytes`, review-1 change 1: canonical `==` would wrongly drop the
+                    // verbatim string for a byte-distinct spelling, leaving the id unfindable by
+                    // the byte-wise chain compare) — ⇒ drop the string (the production outcome;
+                    // ids derive on demand from here on). Contract-violating (synthetic/opaque/
+                    // byte-distinct) ⇒ keep the string (invariant case (b)) so the id still
+                    // round-trips verbatim. `children[offset]` is the stub that produced `ci`
+                    // (childSlots is built in `children` order), so id and name are the stub's own.
+                    let stub = children[offset]
+                    if Self.sameIdBytes(stub.id, Self.joinId(parentId, stub.name)) {
+                        retainedIds.removeValue(forKey: ci)
+                    } else {
+                        retainedIds[ci] = stub.id
+                    }
                     newlyLinked.append(ci)
                 }
             }
@@ -717,26 +910,28 @@ public struct ScanReducer {
         // Delete the subtree node-by-node, backing out each node's own contribution to the
         // scan-root accumulators (so "Scanned" and the processed count track the LIVE tree, the
         // documented invariant of both — they are Σ/count over *retained* nodes).
-        removeSubtree(ci)
+        removeSubtree(ci, id: childId)
     }
 
-    /// DFS-delete the subtree rooted at slot `s` from the store, decrementing `rootAllocatedBytes`/
-    /// `processedCount` by each removed node's own contribution (only where it was counted). Drops
-    /// each node's map key (by its retained `id`) and recycles its slot onto `freeList` so the store
-    /// does not leak dead slots under live churn (THE MEMORY LAW).
-    private mutating func removeSubtree(_ s: Int32) {
+    /// DFS-delete the subtree rooted at slot `s` (whose id is `id` — Phase B: ids are DERIVED
+    /// top-down as the DFS descends via `childId`, since no slot retains its own id string) from the
+    /// store, decrementing `rootAllocatedBytes`/`processedCount` by each removed node's own
+    /// contribution (only where it was counted). Drops each node's map key and its `retainedIds`
+    /// entry, and recycles its slot onto `freeList` so the store does not leak dead slots under
+    /// live churn (THE MEMORY LAW).
+    private mutating func removeSubtree(_ s: Int32, id: String) {
         let node = store[Int(s)]
         if node.hasSize {
             processedCount -= 1
             rootAllocatedBytes -= node.ownAllocated
         }
         let children = node.childIndices
-        // Free this slot: drop its map key and reset the record (releasing id + child array) so the
-        // recycled slot carries no stale state; then make it available for reuse. Collision-aware:
+        // Free this slot: drop its map key and reset the record (releasing name + child array) so
+        // the recycled slot carries no stale state; then make it available for reuse. Collision-aware:
         // if `s` was this key's PRIMARY (`index`), promote a side-table entry into its place (so the
         // remaining colliding id stays reachable), else drop the primary key; if `s` was a side-table
         // entry, just remove it from the bucket. Empty buckets are dropped so `collisions` cannot leak.
-        let k = key(node.id)
+        let k = key(id)
         if index[k] == s {
             if var bucket = collisions[k], !bucket.isEmpty {
                 index[k] = bucket.removeLast()
@@ -748,9 +943,12 @@ public struct ScanReducer {
             bucket.removeAll { $0 == s }
             if bucket.isEmpty { collisions.removeValue(forKey: k) } else { collisions[k] = bucket }
         }
+        retainedIds.removeValue(forKey: s)
         store[Int(s)] = Node(name: "")
         freeList.append(s)
-        for c in children { removeSubtree(c) }
+        // Children's ids derive from THIS node's id (`childId` reads the child's name/retained
+        // entry, both still intact — only slot `s` was reset above).
+        for c in children { removeSubtree(c, id: childId(c, parentId: id)) }
     }
 
     // MARK: - Projection
@@ -872,8 +1070,9 @@ public struct ScanReducer {
         // the node's totals come from its RETAINED subtree total — read in O(1), never recomputed —
         // so `build` visits only nodes strictly inside the window (the ratified focus-rooted bound).
         // Each child slot is already in hand (no id→node dict lookup as the old path did), and its
-        // opaque id is read straight from `store[c].id` — so ids round-trip verbatim (the scan-rate
-        // law is respected: index reads, not hashing, on the hot projection path).
+        // id is DERIVED top-down (Phase B): the parent's id is the `id` parameter already in hand,
+        // so each child costs ONE `joinId` string join (or a `retainedIds` read for synthetic ids)
+        // — no chain walk, no hashing, on the projection path. Ids round-trip verbatim either way.
         let retained: [SizeTree]
         if depth < depthWindow {
             if minRenderArea > 0 && area > 0 {
@@ -902,9 +1101,13 @@ public struct ScanReducer {
                 // accounting (the App owns their mass) — the no-double-count rule. Weights use
                 // the injected `weight` transform so a sqrt/linear projection prunes exactly what
                 // the same-weighted Squarify will render (the composition layer passes both).
+                // Phase B: the ignore test needs child IDS; deriving one per child would tax the
+                // high-fanout weighting pass for a lens that is usually OFF, so the derivation is
+                // gated on `excluding` being non-empty (the common empty set costs zero joins here).
+                let hasExclusions = !excluding.isEmpty
                 var totalW = 0.0
                 for c in node.childIndices {
-                    if excluding.contains(store[Int(c)].id) { continue }
+                    if hasExclusions, excluding.contains(childId(c, parentId: id)) { continue }
                     if !includeHidden, store[Int(c)].isHidden {
                         hiddenFilteredBytes += store[Int(c)].subtreeAllocated
                         continue
@@ -913,14 +1116,15 @@ public struct ScanReducer {
                 }
                 var kept: [(slot: Int32, id: String, area: Double)] = []
                 for c in node.childIndices {
-                    if excluding.contains(store[Int(c)].id) { continue }           // ignored
+                    let cid = childId(c, parentId: id) // derived once; used by the lens test + the kept tuple
+                    if hasExclusions, excluding.contains(cid) { continue }         // ignored
                     if !includeHidden, store[Int(c)].isHidden { continue }         // counted above
                     let w = weight(store[Int(c)].subtreeAllocated)
                     let childArea = totalW > 0 ? area * w / totalW : 0
                     if !store[Int(c)].denied && childArea < minRenderArea {
                         prunedBelowArea += 1 // count the dropped subtree (a floor — see makeRenderTree)
                     } else {
-                        kept.append((c, store[Int(c)].id, childArea))
+                        kept.append((c, cid, childArea))
                     }
                 }
                 kept.sort { a, b in
@@ -938,22 +1142,25 @@ public struct ScanReducer {
                 // Full projection: sort children canonically so enumeration order never leaks in.
                 // The same TZ-5 lenses apply (ignored + hidden filtered), so a full-projection
                 // consumer (e.g. a non-area-bounded view) sees the identical excluded set.
-                var kids: [Int32] = []
+                // Phase B: each child's id is derived once here (one `joinId` off the in-hand
+                // parent id) and carried through the sort + recursion.
+                var kids: [(slot: Int32, id: String)] = []
                 for c in node.childIndices {
-                    if excluding.contains(store[Int(c)].id) { continue }
+                    let cid = childId(c, parentId: id)
+                    if excluding.contains(cid) { continue }
                     if !includeHidden, store[Int(c)].isHidden {
                         hiddenFilteredBytes += store[Int(c)].subtreeAllocated
                         continue
                     }
-                    kids.append(c)
+                    kids.append((c, cid))
                 }
                 kids.sort { a, b in
-                    let na = store[Int(a)].name
-                    let nb = store[Int(b)].name
-                    return na == nb ? store[Int(a)].id < store[Int(b)].id : na < nb
+                    let na = store[Int(a.slot)].name
+                    let nb = store[Int(b.slot)].name
+                    return na == nb ? a.id < b.id : na < nb
                 }
                 retained = kids.map {
-                    build(id: store[Int($0)].id, slot: $0, depth: depth + 1, depthWindow: depthWindow,
+                    build(id: $0.id, slot: $0.slot, depth: depth + 1, depthWindow: depthWindow,
                           area: 0, minRenderArea: 0, excluding: excluding,
                           includeHidden: includeHidden, weight: weight,
                           prunedBelowArea: &prunedBelowArea, hiddenFilteredBytes: &hiddenFilteredBytes)
@@ -1045,12 +1252,14 @@ public struct ScanReducer {
     public func retainedDirIds(under id: String) -> [String] {
         guard let root = slot(of: id) else { return [] }
         var out: [String] = []
-        var stack: [Int32] = [root]
-        while let cur = stack.popLast() {
+        // Phase B: ids are derived top-down as the DFS descends — each stack entry carries its
+        // already-derived id, so each node costs one `joinId` (still "O(subtree) in strings only").
+        var stack: [(slot: Int32, id: String)] = [(root, id)]
+        while let (cur, cid) = stack.popLast() {
             let n = store[Int(cur)]
             let k = outputKind(n)
-            if k == .dir || k == .bundleLeaf { out.append(n.id) }
-            stack.append(contentsOf: n.childIndices)
+            if k == .dir || k == .bundleLeaf { out.append(cid) }
+            for c in n.childIndices { stack.append((c, childId(c, parentId: cid))) }
         }
         return out
     }
@@ -1106,8 +1315,9 @@ public struct ScanReducer {
             changed = true
         }
 
-        // The retained children's opaque ids, read straight from each child slot (echoed verbatim).
-        let known: Set<String> = Set((node?.childIndices ?? []).map { store[Int($0)].id })
+        // The retained children's opaque ids — derived off the in-hand `dirId` (Phase B), or read
+        // from `retainedIds` where non-derivable; verbatim either way.
+        let known: Set<String> = Set((node?.childIndices ?? []).map { childId($0, parentId: dirId) })
         let freshIds = Set(fresh.map(\.id))
 
         // Removals (only on a COMPLETE read — see `complete` doc).

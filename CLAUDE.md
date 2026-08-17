@@ -35,12 +35,18 @@
    machine): Retained memory per scanned node ≤ ~100 B amortized; a rescan
    returns footprint to baseline. Anything that scales worse is a defect.
    STATUS (honest, 2026-08-17): the law is the TARGET, not yet the
-   achieved state. Phase A shipped and measured: 534 B/node (was 624);
-   rescan leak gate green. Phase B (derive Node.id from parent-chain
-   names — the ~200 B/node whale) is OPEN: three builder cycles failed
-   to land it (strain recorded for the human). Until it lands, the
-   giant-volume consent screen is the field protection. Claiming the
-   law as achieved would be the appearance of a guarantee without the
+   achieved state. Phase A shipped: 534.3 B/node (was 624). Phase B
+   (derive Node.id from parent-chain names — the ~200 B/node whale)
+   LANDED (byte-exact id relation, review-1): measured 238.2 B/node
+   on the 2.83M-node home scan (footprint.sh, delta 642.4 MiB peak);
+   rescan leak gate PASS (3 rescans, trend +1.7%, criterion ≤5%
+   growth); scan rate 171,300 files/s (−4.3% vs the 179k reference,
+   gate ≤10%; measured under a concurrent OS StorageManagement
+   full-disk sweep — best contended run reported). Still
+   ~2.4× above ~100 B — remaining mass: ~72 B Node slot, ~48 B
+   id-hash index entry, name/child-array heap. The giant-volume
+   consent screen REMAINS the field protection. Claiming the law as
+   achieved would be the appearance of a guarantee without the
    guarantee — prohibited.
 
 ## Build & gates (imported lessons — do not relearn)
