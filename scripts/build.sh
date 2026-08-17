@@ -14,6 +14,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/xcode_env.sh"
+resolve_developer_dir
 
 APP="build/Terrazzo.app"
 MACOS="$APP/Contents/MacOS"
@@ -24,7 +26,7 @@ rm -rf "$APP"
 mkdir -p "$MACOS" "$RES"
 
 echo "==> Compile Sources/App + Sources/TreemapCore + Sources/ScanCore + Sources/ScanFS + Sources/RenderPipeline -> $MACOS/Terrazzo"
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swiftc \
+swiftc \
 	-O \
 	-o "$MACOS/Terrazzo" \
 	Sources/App/*.swift \
@@ -64,10 +66,26 @@ echo "==> Code sign with a STABLE identity (operator directive 2026-08-16)"
 # reappears on every build. Signing with a fixed Developer identity keeps folder
 # grants — and the TZ-4 Full Disk Access grant — sticky across rebuilds.
 # Operator-verified command/identity on this machine (TeamIdentifier PTN74UT4G3).
-SIGN_ID="Apple Development: andrei.roman@gmail.com (T9FDE7X7VE)"
+# PORTABILITY (2026-08-17): identity resolution instead of a hardcoded cert.
+# Order: $TERRAZZO_SIGN_IDENTITY env; else the first Apple Development identity
+# in the keychain; else AD-HOC ("-") with a loud warning — the build still runs
+# on any machine, at the cost of TCC grants resetting per rebuild.
+SIGN_ID="${TERRAZZO_SIGN_IDENTITY:-}"
+if [ -z "$SIGN_ID" ]; then
+    SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development/{print $2; exit}')"
+fi
+if [ -z "$SIGN_ID" ]; then
+    echo "WARN: no code-signing identity found — signing AD-HOC. The app runs," >&2
+    echo "but macOS privacy (TCC) grants will reset on every rebuild. Set" >&2
+    echo "TERRAZZO_SIGN_IDENTITY or add an Apple Development cert to persist them." >&2
+    SIGN_ID="-"
+fi
 codesign --force --sign "$SIGN_ID" "$APP"
 
-echo "==> Assert the signature carries a stable TeamIdentifier"
+echo "==> Assert the signature matches the chosen identity class"
+if [ "$SIGN_ID" = "-" ]; then
+    echo "    (ad-hoc build — TeamIdentifier assertion skipped by design)"
+else
 # An ad-hoc or unsigned bundle reports 'TeamIdentifier=not set'. Require a real
 # team id so an identity-less build (which would defeat TCC persistence) fails
 # LOUDLY here rather than silently re-prompting the operator at runtime.
@@ -84,6 +102,7 @@ if ! grep -Eq '^TeamIdentifier=[A-Z0-9]+$' <<<"$SIG_DESC"; then
 	echo "BUILD FAILED: $APP has no stable TeamIdentifier after codesign" >&2
 	echo "$SIG_DESC" >&2
 	exit 1
+fi
 fi
 
 echo "==> Built $APP (signed: $SIGN_ID)"

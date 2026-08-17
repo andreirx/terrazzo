@@ -28,6 +28,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/xcode_env.sh"
+resolve_developer_dir
 
 APP="build/Terrazzo.app"
 HOST_BIN="build/verify_host"
@@ -52,7 +54,7 @@ echo "==> (2a) Build the app bundle (also needed for structure assertions)"
 scripts/build.sh
 
 echo "==> (1a) Compile the offscreen verify host (real QuadRenderer + cores)"
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swiftc \
+swiftc \
 	-O \
 	-o "$HOST_BIN" \
 	scripts/verify_host.swift \
@@ -106,7 +108,7 @@ if cmp -s "$SCALE_LINEAR" "$SCALE_LOG_IGNORE"; then
 fi
 
 echo "==> (3a) Compile the scan gate host (real walker + reducer + cores + QuadRenderer)"
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swiftc \
+swiftc \
 	-O \
 	-o "$SCAN_BIN" \
 	scripts/scan_host.swift \

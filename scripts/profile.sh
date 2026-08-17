@@ -15,6 +15,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/xcode_env.sh"
+resolve_developer_dir
 
 BIN="build/scan_profile_host"
 SCAN_ROOT="${1:-$HOME}"
@@ -22,7 +24,7 @@ SCAN_ROOT="${1:-$HOME}"
 mkdir -p build
 
 echo "==> Compile the per-phase profile host (real DirectoryReader + reducer, no AppKit/Metal)"
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swiftc \
+swiftc \
 	-O \
 	-o "$BIN" \
 	scripts/scan_profile_host.swift \

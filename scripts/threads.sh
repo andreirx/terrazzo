@@ -19,6 +19,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/xcode_env.sh"
+resolve_developer_dir
 
 BIN="build/thread_host"
 SCAN_ROOT="${1:-$HOME}"
@@ -27,7 +29,7 @@ MAX_SECONDS="${2:-180}"
 mkdir -p build
 
 echo "==> Compile the threading-evidence host (real NavigationController + walker + pipeline)"
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swiftc \
+swiftc \
 	-O \
 	-o "$BIN" \
 	scripts/thread_host.swift \

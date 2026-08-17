@@ -13,6 +13,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/xcode_env.sh"
+resolve_developer_dir
 
 HOST_BIN="build/chrome_host"
 mkdir -p build
@@ -26,7 +28,7 @@ for f in Sources/App/*.swift; do
 done
 
 echo "==> Compile the chrome audit host (real App chrome + cores, minus main.swift)"
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swiftc \
+swiftc \
 	-O \
 	-o "$HOST_BIN" \
 	scripts/chrome_host.swift \

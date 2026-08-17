@@ -26,6 +26,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/xcode_env.sh"
+resolve_developer_dir
 
 BIN="build/scan_rate_host"
 SCAN_ROOT="${1:-$HOME}"
@@ -35,7 +37,7 @@ shift $(( $# > 2 ? 2 : $# ))   # drop rootDir + maxSeconds; forward the rest ($@
 mkdir -p build
 
 echo "==> Compile the scan-rate host (real walker + reducer, no AppKit/Metal)"
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swiftc \
+swiftc \
 	-O \
 	-o "$BIN" \
 	scripts/scan_rate_host.swift \

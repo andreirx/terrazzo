@@ -16,5 +16,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+source "$ROOT/scripts/xcode_env.sh"
 
-exec env DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test "$@"
+resolve_developer_dir --require-xctest
+exec env DEVELOPER_DIR="$DEVELOPER_DIR" swift test "$@"
