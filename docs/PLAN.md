@@ -238,10 +238,14 @@ banner, volume picker, popovers) uses semantic or app-palette colors —
 NEVER an unstyled NSTextField default. DURABLE RULE for all App chrome:
 text on the dark theme is labelColor-derived or app-palette; hardcoded
 blacks are defects. Acceptance: a screenshot pass over every chrome
-element at both window sizes; state each element checked. **Scale toggle: LOGARITHMIC area by default, linear option** (human
-directive 2026-08-16 — giant tiles eclipse the tail): tile weights pass
-through a monotone log transform (log(1+bytes), named constant base)
-before Squarify, per sibling set — pure TreemapCore, tiling exactness
+element at both window sizes; state each element checked. **Scale toggle: SQRT area by default, linear option** (human decision
+2026-08-17, superseding log after field use on a second machine: log
+flattened 8 orders of magnitude into ~3:1 and its distortion was
+magnitude-dependent — a 4KB root file outsized a nested 7GB one; power
+laws are the unique scale-invariant monotone family, so equal byte
+ratios render as equal area ratios at every depth; sqrt chosen over
+x^0.4 by the human for milder compression): weights pass through
+sqrt(bytes) before Squarify, per sibling set — pure TreemapCore, tiling exactness
 and sibling ordering unchanged (tests reuse). Linear mode shows true
 proportional areas ("the HUGE rectangles"). HONESTY GUARD: the active
 scale is always visible in the status bar ("Log scale" / "Linear");
@@ -318,6 +322,22 @@ The reducer/pipeline consume diffs exactly like scan events — the map
 updates live without rescan. Manual Rescan (TZ-4) remains the
 full-truth fallback. ALL revalidation is async events — never blocks
 navigation (the law).
+
+### TZ-9 — Memory law & giant-volume consent (human field report 2026-08-17)
+The other machine: 33 GB RSS scanning tens of millions of files —
+measured here: ~540 bytes per retained node (full-path String ids as
+dict keys, repeated in children arrays, O(depth) growth). LAW (sibling
+to the threading law): retained bytes per scanned node ≤ ~100 B, and a
+rescan returns RSS to baseline (leak gate: N rescans, footprint flat).
+Mechanism: lean node store — name-only strings + parent INDICES,
+children as index ranges into one contiguous array, full-path ids
+derived on demand at the boundaries (events/FSEvents mapping adapt).
+Targets: 5M-node volume ≲ 500 MB; 60M-node TM forest ≲ 6 GB. PLUS
+informed consent: the volume picker shows each volume's used-inode
+count (statfs, free) and warns before scanning monsters — Time Machine
+backup volumes (hardlink forests, detectable) get an explicit "this is
+N million entries" confirmation. Acceptance: measured B/node before/
+after on a real scan; rescan leak gate; footprint stated at home scale.
 
 ### TZ-8 — Glass-pane depth tint (human design 2026-08-17)
 The focus level's hue acts as a TRANSLUCENT PANE (~50% alpha at rest,
