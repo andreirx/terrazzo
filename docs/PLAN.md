@@ -367,6 +367,47 @@ through both flights. Builders never edit this document — mechanism
 corrections route through the operator (governance reaffirmed after a
 builder edit was reverted).
 
+### TZ-10 — Field batch 2026-08-17 (ten human rulings from live / scan)
+1. WATCHLIST replaces Ignore (rename everywhere, name honesty): button
+   "Add to Watchlist" (removes the tile from layout exactly as ignore
+   did); the WATCHLIST panel is a REAL VISIBLE LIST — every entry a row
+   with filename, path relative to its volume, and size; one-click row
+   restore stays; EXPORT button writes a plain-text file (one entry per
+   line: size <TAB> path; NSSavePanel).
+2. Consistent watchlist affordance: the hover button appears under one
+   predictable rule (state it; no sometimes-shows), and the context menu
+   always carries the action for every level (see item 9).
+3. Bottom-left shows ONLY the current enclosing (viewport) folder —
+   always, never truncated (middle-truncate only above a generous width),
+   and the TZ-4 hover-path replacement behavior is REMOVED (the cursor
+   chip already shows hover info).
+4. Context-menu items show paths RELATIVE to the current viewport folder
+   (including the topmost visible ancestor), not bare filenames.
+5. Status bar reduced to: focus path (left) · scan state · a DETAILS
+   button. ALL accounting (capacity/free/reclaimable/available/scanned/
+   unaccounted decomposition/watchlist exclusion/culled tiles/scale)
+   moves into a Details dialog; the dialog also auto-pops once when a
+   scan completes.
+6. Scale DEFAULT = LINEAR (impact first); sqrt stays as the option.
+   (Reverses the sqrt-default half of the 2026-08-17 decision; the
+   human: linear's impact "is really driving your attention".)
+7. COLOR CASCADE v3: level-1 tiles tint STRONGER (raise pane presence),
+   and each level below goes progressively DARKER AND DIMMER while
+   inheriting the ancestor tint — a monotone darkening cascade into
+   depth (replaces the flat confetti look where all depths compete at
+   similar brightness; exact curve = named constants, operator tunes at
+   checkpoint with the human).
+8. Progress bar STOPS at completion — no indeterminate bounce after
+   "done" (field bug: the bar kept animating post-scan).
+9. Right-click menu lists the WHOLE ancestor chain under the cursor —
+   from the immediate child of the focus down to the deepest hit tile
+   (cap: named constant, default 5) — each row with its relative path +
+   "Add to Watchlist" + "Show in Finder". (Field bug: UI highlighted the
+   top child but the menu acted on the deepest — mismatch resolved by
+   showing all levels explicitly.)
+10. MCP server exposing the map/watchlist to Claude: EXTENSION POINT
+    ONLY, explicitly deferred by the human — NOT in this slice.
+
 ## Slice → relay mapping
 
 Same operator loop as glyph-saver: bootstrap
