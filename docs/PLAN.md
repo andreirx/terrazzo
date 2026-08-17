@@ -248,11 +248,11 @@ x^0.4 by the human for milder compression): weights pass through
 sqrt(bytes) before Squarify, per sibling set — pure TreemapCore, tiling exactness
 and sibling ordering unchanged (tests reuse). Linear mode shows true
 proportional areas ("the HUGE rectangles"). HONESTY GUARD: the active
-scale is always visible in the status bar ("Log scale" / "Linear");
+scale is always visible in the status bar ("Sqrt scale" / "Linear");
 labels and hover chips show real bytes in both modes — areas may
 compress, numbers never lie. Toggle in the control bar next to the
 depth setting. EVIDENCE ITEM: report the below-pixel-culled count on the
-SAME scene under log vs linear (quantifies the sibling-starvation
+SAME scene under sqrt vs linear (quantifies the sibling-starvation
 exposure; note in the report that depth-starved tiles are exposed by
 ZOOM, not scale — no monotone transform can exceed a parent's pixel
 budget, which is why the culled counter legitimately never reaches zero
@@ -349,10 +349,23 @@ replaced by this continuous emergence — depth becomes material.
 Mechanism (fits the law by construction): GPUQuad carries TWO colors
 (own hue, inherited pane hue) precomputed on the pipeline actor; the
 fragment shader blends by ONE uniform driven by the camera flight t —
-O(1) per frame on main. Tests: blend endpoints equal today's two color
-states (rest == paned, dived == own — no drift from the ratified hue
-identities); dissolve monotone in t; ascend is the exact reverse; the
-dim ladder composes with the pane (multiplicative, order stated).
+O(1) per frame on main. Tests: the dissolved endpoint
+preserves the ratified hue identities; dissolve monotone in t; the dim
+ladder composes with the pane (multiplicative, order stated).
+CONTINUITY LAW (refined 2026-08-17 through two review escalates): each
+direction must be POP-FREE with TESTED endpoint equalities — the
+MECHANISM may differ per scene encoding. Dive: dissolve 0→1 on the
+outgoing scene + a brightnessRebase uniform 1→1/dimFalloff (children
+gain one focus-relative dim step during the flight — "descending into
+the light"); commit rebases to (new scene, t=0) with EXACT per-channel
+equality. Ascend: the incoming parent scene's per-instance endpoints
+BAKE both looks (flight-start == committed child rest; flight-end ==
+parent rest), dissolve 1→0, rebase uniform IDENTITY (the dim step lives
+in the baked endpoints — an inverse uniform would double-apply it).
+Tests: both handoff equalities within epsilon + monotone luminance
+through both flights. Builders never edit this document — mechanism
+corrections route through the operator (governance reaffirmed after a
+builder edit was reverted).
 
 ## Slice → relay mapping
 
