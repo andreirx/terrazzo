@@ -195,7 +195,7 @@ final class ScanController {
     // user's choice survives a rescan/volume switch (the new pipeline defaults would otherwise
     // reset them). The IGNORE set is owned by NavigationController (it drives the panel + status)
     // and cleared on a new scan (a fresh pipeline starts with none), so it is NOT stored here.
-    private(set) var currentScale: AreaScale = .log
+    private(set) var currentScale: AreaScale = .sqrt
     private(set) var currentIncludeHidden = true
     private(set) var currentDepthWindow = ScanPolicy.default.depthDetailWindow
 
@@ -253,7 +253,7 @@ final class ScanController {
         let pipe = ScenePipeline(rootId: root.path, rootName: root.lastPathComponent)
         pipeline = pipe
         // TZ-5: re-apply the current lens choices so a rescan/volume-switch keeps the user's
-        // scale/hidden/depth (a new pipeline defaults to log/shown/5). The ignore set is not
+        // scale/hidden/depth (a new pipeline defaults to sqrt/shown/5). The ignore set is not
         // re-applied — a new scan starts with none (NavigationController.resetForNewScan clears it).
         Task {
             await pipe.setScale(currentScale)

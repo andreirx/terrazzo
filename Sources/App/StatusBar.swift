@@ -68,9 +68,9 @@ struct ScanStatus {
     /// against the volume-wide inode denominator.
     var isVolumeRoot: Bool = false
     /// The active AREA SCALE this scene was rendered with (TZ-5 deliverable 2). Drives the
-    /// always-visible "Log scale"/"Linear" status field (the honesty guard). Echoed from the
-    /// scene, so the label matches what is actually drawn. Default `.log` (the ratified default).
-    var scaleMode: AreaScale = .log
+    /// always-visible "Sqrt scale"/"Linear" status field (the honesty guard). Echoed from the
+    /// scene, so the label matches what is actually drawn. Default `.sqrt` (the ratified default).
+    var scaleMode: AreaScale = .sqrt
     /// Retained total of nodes filtered out for being HIDDEN (TZ-5 deliverable 3), from the scene.
     /// Drives the "hidden filtered · X GB" field, shown only when non-zero (show-hidden off AND
     /// hidden mass in view). Default 0 keeps pre-TZ-5 call sites compiling.
@@ -268,6 +268,11 @@ final class StatusBar: NSView {
     /// Whether a hover path is currently overriding the breadcrumb.
     private var hovering = false
 
+    /// The committed focus breadcrumb (NOT the transient hover override) — a test seam for the
+    /// headless trace, which samples it at a dive/ascend commit to prove the label tracks the focus
+    /// stack synchronously (OPERATOR_NOTE 2026-08-17 #1), never lagging until a scene arrives.
+    var focusPathValue: String { focusPath }
+
     /// Show a hovered node's FULL path in the bottom bar (D9, dimmer style), or `nil`
     /// to revert to the focus breadcrumb. The chip on the tile middle-truncates a long
     /// path; the bottom bar shows it whole (head-truncated only if the strip is too
@@ -420,13 +425,13 @@ final class StatusBar: NSView {
         // scale is always labeled"). Echoed from the scene so it matches what is drawn; the
         // numbers on tiles/hover are always REAL bytes in either mode.
         switch s.scaleMode {
-        case .log:
-            out.append(VolumeField(value: "Log scale",
-                tooltip: "Tile areas are log-compressed so giant folders don’t eclipse the long tail. The sizes shown on tiles and in hover are always the real bytes; only the areas are compressed. Switch to Linear in the toolbar for true proportions.",
+        case .sqrt:
+            out.append(VolumeField(value: "Sqrt scale",
+                tooltip: "Tile areas are sqrt-compressed so giant folders don’t eclipse the long tail, while equal size ratios still render as equal area ratios at every depth. The sizes shown on tiles and in hover are always the real bytes; only the areas are compressed. Switch to Linear in the toolbar for true proportions.",
                 importance: .essential)) // TZ-5 deliverable 2 honesty guard: the active scale is ALWAYS shown
         case .linear:
             out.append(VolumeField(value: "Linear",
-                tooltip: "Tile areas are true-proportional to bytes — the huge folders look huge. Switch to Log scale in the toolbar to expose the long tail.",
+                tooltip: "Tile areas are true-proportional to bytes — the huge folders look huge. Switch to Sqrt scale in the toolbar to expose the long tail.",
                 importance: .essential))
         }
         out.append(VolumeField(

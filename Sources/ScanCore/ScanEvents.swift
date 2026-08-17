@@ -160,7 +160,7 @@ public struct RevalidationDiff: Equatable, Sendable {
 public struct ScanReducer {
     /// The DEFAULT area-weight transform for the projection: linear (weight == bytes,
     /// clamped ≥ 0). ScanCore stays independent of visualization POLICY — it takes a bare
-    /// `(bytes) -> weight` function and never learns whether the caller means linear or log
+    /// `(bytes) -> weight` function and never learns whether the caller means linear or sqrt
     /// (that named enum, `AreaScale`, lives in TreemapCore; review-1 change 3). The
     /// composition layer passes the SAME transform the treemap's Squarify uses, so the
     /// pruned set matches the rendered partition; when no transform is supplied (the reducer's
@@ -548,7 +548,7 @@ public struct ScanReducer {
     ///   - weight: the per-node area-weight transform `(bytes) -> weight` (TZ-5). Applied to the
     ///     area-bounded split so the projection materializes exactly the subtrees the
     ///     SAME-weighted Squarify will render. ScanCore is neutral to WHICH scale it is (linear
-    ///     or log) — the composition layer supplies `AreaScale.weight` (TreemapCore). Ignored on
+    ///     or sqrt) — the composition layer supplies `AreaScale.weight` (TreemapCore). Ignored on
     ///     the full (`minRenderArea == 0`) path. Defaults to linear (`linearWeight`).
     public func makeTree(focusId: String? = nil,
                          depthWindow: Int = ScanPolicy.default.depthDetailWindow,
@@ -582,7 +582,7 @@ public struct ScanReducer {
     ///
     /// TZ-5 LENSES ride along as pure projection parameters (see `makeTree`): `excluding`
     /// (the ignore set) and `includeHidden` drop nodes so siblings renormalize; `weight`
-    /// weights the area split so log/linear pruning matches the layer's Squarify (the
+    /// weights the area split so sqrt/linear pruning matches the layer's Squarify (the
     /// composition layer passes the same transform to both). It ALSO
     /// returns `hiddenFilteredBytes` — the summed retained total of the nodes dropped for
     /// being HIDDEN (not for being ignored: ignored subtrees are accounted by the App from
@@ -642,7 +642,7 @@ public struct ScanReducer {
                 // RENORMALIZE into the freed area (the ratified ignore behavior). Hidden mass
                 // is accounted HERE, exactly once; ignored children are skipped WITHOUT hidden
                 // accounting (the App owns their mass) — the no-double-count rule. Weights use
-                // the injected `weight` transform so a log/linear projection prunes exactly what
+                // the injected `weight` transform so a sqrt/linear projection prunes exactly what
                 // the same-weighted Squarify will render (the composition layer passes both).
                 var totalW = 0.0
                 for cid in node.childIds {

@@ -123,9 +123,9 @@ public struct RenderScene: Equatable, Sendable {
     /// Whether the scan is still streaming (drives the status indicator).
     public let running: Bool
     /// The AREA SCALE this scene was laid out with (TZ-5 deliverable 2). Echoed back so the
-    /// status bar's always-visible "Log scale"/"Linear" label reflects the ACTUAL rendered
+    /// status bar's always-visible "Sqrt scale"/"Linear" label reflects the ACTUAL rendered
     /// scene, not a separate copy of the toggle state (name honesty: the label matches what
-    /// is drawn). Default `.log` — the ratified default scale.
+    /// is drawn). Default `.sqrt` — the ratified default scale.
     public let scaleMode: AreaScale
     /// Retained total of the nodes DROPPED for being HIDDEN in this projection (TZ-5
     /// deliverable 3) — the "hidden filtered · X GB" status figure. 0 when show-hidden is on
@@ -156,7 +156,7 @@ public struct RenderScene: Equatable, Sendable {
                 labels: [SceneLabel], tree: SizeTree, belowPixelCount: Int,
                 running: Bool, filesProcessed: Int = 0,
                 scannedBytes: Int64? = nil,
-                scaleMode: AreaScale = .log, hiddenFilteredBytes: Int64 = 0,
+                scaleMode: AreaScale = .sqrt, hiddenFilteredBytes: Int64 = 0,
                 ignoredBytes: Int64 = 0, ignoredCurrentById: [String: Int64] = [:]) {
         self.generation = generation
         self.focusId = focusId

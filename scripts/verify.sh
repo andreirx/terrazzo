@@ -41,14 +41,17 @@ OUT2="build/verify-2.png"
 FOCUS_ROOT="build/verify-focus-root.png"
 FOCUS_CHILD="build/verify-focus-child.png"
 SCALE_LINEAR="build/verify-scale-linear.png"
-SCALE_LOG="build/verify-scale-log.png"
-SCALE_LOG_IGNORE="build/verify-scale-log-ignore.png"
+SCALE_SQRT="build/verify-scale-sqrt.png"
+SCALE_SQRT_IGNORE="build/verify-scale-sqrt-ignore.png"
+DISSOLVE_0="build/verify-dissolve-0.png"
+DISSOLVE_HALF="build/verify-dissolve-half.png"
+DISSOLVE_1="build/verify-dissolve-1.png"
 SCAN_OUT1="build/verify-scan-1.png"
 SCAN_OUT2="build/verify-scan-2.png"
 SCAN_PROMOTED="build/verify-scan-promoted.png"
 
 mkdir -p build
-rm -f "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD" "$SCALE_LINEAR" "$SCALE_LOG" "$SCALE_LOG_IGNORE" "$SCAN_OUT1" "$SCAN_OUT2" "$SCAN_PROMOTED"
+rm -f "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD" "$SCALE_LINEAR" "$SCALE_SQRT" "$SCALE_SQRT_IGNORE" "$DISSOLVE_0" "$DISSOLVE_HALF" "$DISSOLVE_1" "$SCAN_OUT1" "$SCAN_OUT2" "$SCAN_PROMOTED"
 
 echo "==> (2a) Build the app bundle (also needed for structure assertions)"
 scripts/build.sh
@@ -67,12 +70,14 @@ swiftc \
 	-framework ImageIO \
 	-target arm64-apple-macos14
 
-echo "==> (1b) Render two viewport frames + two focus frames + three TZ-5 scale/ignore frames"
+echo "==> (1b) Render two viewport frames + two focus frames + three TZ-5 scale/ignore frames + three TZ-8 dissolve frames"
 "$HOST_BIN" "$SHADER" "$FIXTURE" "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD" \
-	"$SCALE_LINEAR" "$SCALE_LOG" "$SCALE_LOG_IGNORE"
+	"$SCALE_LINEAR" "$SCALE_SQRT" "$SCALE_SQRT_IGNORE" \
+	"$DISSOLVE_0" "$DISSOLVE_HALF" "$DISSOLVE_1"
 
-echo "==> (1c) Assert all seven frames were written and are non-empty"
-for f in "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD" "$SCALE_LINEAR" "$SCALE_LOG" "$SCALE_LOG_IGNORE"; do
+echo "==> (1c) Assert all ten frames were written and are non-empty"
+for f in "$OUT1" "$OUT2" "$FOCUS_ROOT" "$FOCUS_CHILD" "$SCALE_LINEAR" "$SCALE_SQRT" "$SCALE_SQRT_IGNORE" \
+	"$DISSOLVE_0" "$DISSOLVE_HALF" "$DISSOLVE_1"; do
 	if [[ ! -s "$f" ]]; then
 		echo "VERIFY FAILED: a frame is missing/empty ($f)" >&2
 		exit 1
@@ -91,19 +96,35 @@ if cmp -s "$FOCUS_ROOT" "$FOCUS_CHILD"; then
 	exit 1
 fi
 
-echo "==> (1f) TZ-5: assert linear / log / log+ignore frames all DIFFER (scale toggle + ignore change the map)"
-if cmp -s "$SCALE_LINEAR" "$SCALE_LOG"; then
-	echo "VERIFY FAILED: $SCALE_LINEAR and $SCALE_LOG are byte-identical — the log scale did not change the layout" >&2
+echo "==> (1f) TZ-5: assert linear / sqrt / sqrt+ignore frames all DIFFER (scale toggle + ignore change the map)"
+if cmp -s "$SCALE_LINEAR" "$SCALE_SQRT"; then
+	echo "VERIFY FAILED: $SCALE_LINEAR and $SCALE_SQRT are byte-identical — the sqrt scale did not change the layout" >&2
 	exit 1
 fi
-if cmp -s "$SCALE_LOG" "$SCALE_LOG_IGNORE"; then
-	echo "VERIFY FAILED: $SCALE_LOG and $SCALE_LOG_IGNORE are byte-identical — ignoring the largest tile did not change the layout" >&2
+if cmp -s "$SCALE_SQRT" "$SCALE_SQRT_IGNORE"; then
+	echo "VERIFY FAILED: $SCALE_SQRT and $SCALE_SQRT_IGNORE are byte-identical — ignoring the largest tile did not change the layout" >&2
 	exit 1
 fi
 # review-0 change 4a: assert the THIRD pair too, so ALL THREE frames are proven distinct
-# (linear ≠ log ≠ log+ignore ≠ linear) rather than only the two adjacent pairs.
-if cmp -s "$SCALE_LINEAR" "$SCALE_LOG_IGNORE"; then
-	echo "VERIFY FAILED: $SCALE_LINEAR and $SCALE_LOG_IGNORE are byte-identical — the three scale/ignore frames are not all distinct" >&2
+# (linear ≠ sqrt ≠ sqrt+ignore ≠ linear) rather than only the two adjacent pairs.
+if cmp -s "$SCALE_LINEAR" "$SCALE_SQRT_IGNORE"; then
+	echo "VERIFY FAILED: $SCALE_LINEAR and $SCALE_SQRT_IGNORE are byte-identical — the three scale/ignore frames are not all distinct" >&2
+	exit 1
+fi
+
+echo "==> (1g) TZ-8: assert the three dissolve frames (t=0 rest, t=0.5, t=1 dived) all DIFFER (the pane dissolves)"
+# The host already asserted MONOTONE + LINEAR scene-mean progression across t and died otherwise
+# (see 'VERIFY_HOST TZ-8 dissolve means' above). Here we independently confirm the pixels changed.
+if cmp -s "$DISSOLVE_0" "$DISSOLVE_HALF"; then
+	echo "VERIFY FAILED: $DISSOLVE_0 and $DISSOLVE_HALF are byte-identical — the dissolve did not change the map" >&2
+	exit 1
+fi
+if cmp -s "$DISSOLVE_HALF" "$DISSOLVE_1"; then
+	echo "VERIFY FAILED: $DISSOLVE_HALF and $DISSOLVE_1 are byte-identical — the dissolve did not change the map" >&2
+	exit 1
+fi
+if cmp -s "$DISSOLVE_0" "$DISSOLVE_1"; then
+	echo "VERIFY FAILED: $DISSOLVE_0 and $DISSOLVE_1 are byte-identical — rest and dived states are the same" >&2
 	exit 1
 fi
 

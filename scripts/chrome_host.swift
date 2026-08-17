@@ -168,8 +168,8 @@ struct ChromeHost {
     @MainActor
     static func auditStatusBarVisibility(_ view: NSView, size: String) -> [String] {
         // Each required field is identified by a stable substring of its rendered text (the fixture
-        // in makeStatusBar sets: 2 ignored, hidden filtered, Log scale, ● scanning…).
-        let required = ["ignored", "hidden filtered", "Log scale", "scanning"]
+        // in makeStatusBar sets: 2 ignored, hidden filtered, Sqrt scale, ● scanning…).
+        let required = ["ignored", "hidden filtered", "Sqrt scale", "scanning"]
         let fields = collectTextFields(view)
         let bounds = view.bounds
         var failures: [String] = []
@@ -279,7 +279,7 @@ struct ChromeHost {
                                             availableForImportantBytes: 180_000_000_000)
         v.update(ScanStatus(volume: volume, scannedBytes: 640_000_000_000, belowPixelCount: 7,
                             running: true, filesProcessed: 1_200_000, totalInodes: 2_000_000,
-                            isVolumeRoot: true, scaleMode: .log, hiddenFilteredBytes: 3_500_000_000))
+                            isVolumeRoot: true, scaleMode: .sqrt, hiddenFilteredBytes: 3_500_000_000))
         v.setIgnoredAccounting(count: 2, bytes: 40_000_000_000)
         v.setFocusPath("/Users/andrei/Library/Caches")
         finalize(v)

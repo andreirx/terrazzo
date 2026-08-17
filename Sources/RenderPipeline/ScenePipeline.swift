@@ -87,9 +87,9 @@ public actor ScenePipeline {
     /// Show-hidden lens (deliverable 3): `true` (default) shows hidden nodes; `false` filters
     /// dotfile/UF_HIDDEN nodes from layout, their mass reported as `hiddenFilteredBytes`.
     private var includeHidden = true
-    /// Area scale (deliverable 2): `.log` is the ratified DEFAULT (VISION: "logarithmically
-    /// compressed by default"). The App's toggle flips it via `setScale`.
-    private var scale: AreaScale = .log
+    /// Area scale (deliverable 2): `.sqrt` is the ratified DEFAULT (PLAN §TZ-5, 2026-08-17,
+    /// superseding log). The App's toggle flips it via `setScale`.
+    private var scale: AreaScale = .sqrt
 
     /// Sub-pixel cull threshold (device-px area). A tile smaller than ~2×2 device px
     /// carries no readable pixels, and the tail of a deep tree is almost all such
@@ -596,7 +596,7 @@ public actor ScenePipeline {
         // siblings renormalize (makeRenderTree). COHERENCE OF SCALE IS ENFORCED HERE, at the one
         // module that imports both cores (review-1 change 3): this composition layer hands the
         // reducer projection `scale.weight` (a bare `(bytes) -> weight` function — ScanCore stays
-        // ignorant of linear vs log) AND hands `TreemapScene.layout` the same `scale` enum below,
+        // ignorant of linear vs sqrt) AND hands `TreemapScene.layout` the same `scale` enum below,
         // so the pruned set and the Squarify partition agree by construction (a pruned tail tile is
         // one the same-weighted layout would also cull — never a grown-but-empty tile). The
         // `AreaScale` policy lives in TreemapCore; the pipeline is where it meets the scan side.

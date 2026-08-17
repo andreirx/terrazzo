@@ -44,22 +44,33 @@ import simd
 
 final class QuadRenderer {
     /// CPU mirror of MSL `Uniforms` (Shaders.metal). Field order + sizes MUST match.
-    /// `float2` ↔ `SIMD2<Float>` (8-byte, 8-aligned); total 32 bytes. Passed by value
-    /// via `setVertexBytes` (well under the 4 KB inline limit) — no per-frame buffer.
+    /// `float2` ↔ `SIMD2<Float>` (8-byte, 8-aligned). Passed by value via
+    /// `setVertexBytes(..., length: MemoryLayout<Uniforms>.stride, ...)` — the byte count
+    /// is COMPUTED from the layout, never hard-coded, so adding a scalar (e.g. TZ-8's
+    /// `dissolveT`) needs no size edit here; only the MSL mirror must stay field-for-field
+    /// aligned. Well under the 4 KB inline limit — no per-frame buffer.
     struct Uniforms {
         var viewport: SIMD2<Float>       // device-px drawable size (world→NDC map)
         var camScale: SIMD2<Float>       // camera per-axis scale (1,1 = identity)
         var camTranslate: SIMD2<Float>   // camera translate (device px)
         var t: Float                     // settle parameter [0,1]
+        var dissolveT: Float             // TZ-8 glass-pane dissolve [0,1] (0 rest/paned, 1 dived/own)
+        var brightnessRebase: Float      // TZ-8 NOTE #5 dive REBASE: normal-tile scalar (1 = identity)
         var highlightIndex: Int32        // instance to highlight, or -1
     }
 
     /// The identity uniform for a viewport: no camera, no settle (`t=0` shows `from`),
-    /// no highlight. The offscreen gates and any snap use this.
-    static func identityUniforms(viewportWidth w: Double, height h: Double) -> Uniforms {
+    /// no highlight. `dissolveT` defaults to 0 (the REST/paned colour) — the committed
+    /// rest state the offscreen gates render; pass a value to capture a mid-dissolve frame
+    /// (TZ-8 verify gate renders 0 / 0.5 / 1).
+    /// `brightnessRebase` defaults to 1 (identity): the offscreen gates render the committed REST
+    /// state, where no dive rebase is in flight (TZ-8 NOTE #5). The dissolve gate varies only
+    /// `dissolveT`; the rebase is a live-flight uniform, not part of the deterministic rest frames.
+    static func identityUniforms(viewportWidth w: Double, height h: Double,
+                                 dissolveT: Float = 0) -> Uniforms {
         Uniforms(viewport: SIMD2(Float(w), Float(h)),
                  camScale: SIMD2(1, 1), camTranslate: SIMD2(0, 0),
-                 t: 0, highlightIndex: -1)
+                 t: 0, dissolveT: dissolveT, brightnessRebase: 1, highlightIndex: -1)
     }
 
     private static let background = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
@@ -136,11 +147,13 @@ final class QuadRenderer {
 
     /// Offscreen seam (verify.sh / tests): render a prebuilt `[GPUQuad]` into `target`
     /// and BLOCK until the GPU finishes. Deterministic — identity camera, no settle,
-    /// no highlight; pure function of `quads`.
-    func renderSynchronously(quads: [GPUQuad], into target: MTLTexture) {
+    /// no highlight; pure function of `quads` and `dissolveT`. `dissolveT` (default 0 =
+    /// the committed REST/paned state) lets the TZ-8 gate capture the same fixture at
+    /// 0 / 0.5 / 1 and assert a monotone colour progression.
+    func renderSynchronously(quads: [GPUQuad], into target: MTLTexture, dissolveT: Float = 0) {
         guard let buf = makeQuadBuffer(quads), let cmd = queue.makeCommandBuffer() else { return }
         let u = Self.identityUniforms(viewportWidth: Double(target.width),
-                                      height: Double(target.height))
+                                      height: Double(target.height), dissolveT: dissolveT)
         encode(from: buf, to: buf, count: quads.count, uniforms: u, into: target, cmd: cmd)
         cmd.commit()
         cmd.waitUntilCompleted()
@@ -148,9 +161,10 @@ final class QuadRenderer {
 
     /// Offscreen convenience for the deterministic gates: build the render-ready
     /// quads from `tiles` (via the shared off-main builder) and render the committed
-    /// state. Renders ONCE per gate frame — no frame-path per-tile conversion.
-    func renderSynchronously(tiles: [TileRect], into target: MTLTexture) {
-        renderSynchronously(quads: QuadBuilder.build(tiles: tiles), into: target)
+    /// state (optionally at a fixed `dissolveT`). Renders ONCE per gate frame — no
+    /// frame-path per-tile conversion.
+    func renderSynchronously(tiles: [TileRect], into target: MTLTexture, dissolveT: Float = 0) {
+        renderSynchronously(quads: QuadBuilder.build(tiles: tiles), into: target, dissolveT: dissolveT)
     }
 
     // MARK: - Encoding

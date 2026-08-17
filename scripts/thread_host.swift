@@ -75,6 +75,14 @@ final class ThreadHarness {
     private var deniedSamples: [String] = []
     private var lastProgressPrint = 0.0
 
+    // OPERATOR_NOTE 2026-08-17 #1 (focus-path label commit-time check): after every dive/ascend the
+    // bottom-bar breadcrumb must equal the controller's focus path SYNCHRONOUSLY — sampled here right
+    // after the nav call, i.e. BEFORE any pipeline scene can arrive (scenes hop the actor on a later
+    // runloop turn). If the label ever lags the focus stack, `pathLabelLagFailures` is non-zero.
+    private var pathLabelSamples = 0
+    private var pathLabelLagFailures = 0
+    private var pathLabelFirstFailure: String?
+
     private var navTimer: Timer?
     private var capTimer: Timer?
     private var diving = true
@@ -148,6 +156,17 @@ final class ThreadHarness {
                     self.diving.toggle()
                 }
                 self.focusPosts += 1
+                // OPERATOR_NOTE #1 check: sample the breadcrumb SYNCHRONOUSLY, before any scene
+                // arrives for this navigation. It must equal the controller's current focus path.
+                self.pathLabelSamples += 1
+                let labelPath = self.statusBar.focusPathValue
+                let focusPath = self.navigation.currentFocusPath
+                if labelPath != focusPath {
+                    self.pathLabelLagFailures += 1
+                    if self.pathLabelFirstFailure == nil {
+                        self.pathLabelFirstFailure = "label='\(labelPath)' focus='\(focusPath)'"
+                    }
+                }
             }
         }
         RunLoop.main.add(nav, forMode: .common); navTimer = nav
@@ -271,7 +290,13 @@ final class ThreadHarness {
         let expectedUnaccounted = max(0, lastCapacity - lastFree - lastScanned)
         print("TZTHREAD TZ-4 unaccounted figure: \(lastUnaccounted) B  (capacity \(lastCapacity) − free \(lastFree) − scanned \(lastScanned) = \(expectedUnaccounted) B)")
 
-        let pass = worstGapMs < 100 && monotonic && scenes > 0
+        // OPERATOR_NOTE #1: the focus-path breadcrumb must never lag the focus stack (sampled at
+        // every dive/ascend commit, before any scene arrived).
+        let pathOK = pathLabelLagFailures == 0
+        print("TZTHREAD OPERATOR_NOTE#1 focus-path label at commit: \(pathLabelSamples) samples, "
+              + "\(pathLabelLagFailures) lag failures \(pathOK ? "(label tracked focus synchronously — no lag)" : "(LAGGED: \(pathLabelFirstFailure ?? "?"))")")
+
+        let pass = worstGapMs < 100 && monotonic && scenes > 0 && pathOK
         print("TZTHREAD verdict: \(pass ? "PASS" : "REVIEW")")
         fflush(stdout)
     }

@@ -26,16 +26,25 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// CPU mirror: RenderPipeline.GPUQuad (8 contiguous floats, 32-byte stride).
-// World-pixel geometry (top-left origin, y-down) + resolved colour + style code.
+// CPU mirror: RenderPipeline.GPUQuad (11 contiguous floats, 44-byte stride).
+// World-pixel geometry (top-left origin, y-down) + TWO resolved colours + style code.
+// TZ-8: the two colour triples are the dissolve ENDPOINTS, positionally — r/g/b is shown at
+// dissolveT=0, ownR/ownG/ownB at dissolveT=1. On pipeline-scene quads those are the REST
+// (paned) / DIVED (own-hue) colours; on ascend camera-handoff quads they are repurposed as the
+// flight's end/start displayed colours (see RenderPipeline/GPUQuad.swift). The shader only ever
+// mixes them positionally. The FRAGMENT stage blends by u.dissolveT (carried through VOut);
+// the vertex stage stays geometry-only.
 struct GPUQuad {
     float x;    // world-pixel rect origin x (device px)
     float y;    // world-pixel rect origin y (device px)
     float w;    // world-pixel width
     float h;    // world-pixel height
-    float r;
+    float r;    // REST (paned) colour — shown at dissolveT = 0
     float g;
     float b;
+    float ownR; // DIVED (own-hue) colour — shown at dissolveT = 1
+    float ownG;
+    float ownB;
     float style; // 0 normal, 1 pending (outlined-dim), 2 denied,
                  // 3 denied-overflow AGGREGATE ("N denied items" — hatched, TZ-4b #3.2)
 };
@@ -46,13 +55,21 @@ struct Uniforms {
     float2 camScale;     // camera per-axis scale (1,1 = identity)
     float2 camTranslate; // camera translate (device px)
     float  t;            // settle parameter in [0,1] (0 = show `from`)
+    float  dissolveT;    // TZ-8 glass-pane dissolve in [0,1]: 0 = rest (paned), 1 = dived (own)
+    float  brightnessRebase; // TZ-8 NOTE #5 dive REBASE: scalar on NORMAL tiles (1 = identity)
     int    highlightIndex; // instance to highlight, or -1 for none
 };
 
 struct VOut {
     float4 position [[position]];
     float2 local;      // 0..1 within the tile
-    float3 color;
+    // TZ-8: the two glass-pane endpoint colours are carried to the FRAGMENT stage, which
+    // performs the dissolve mix (packet deliverable 2 — the ratified blend is a fragment
+    // op). Both are uniform across the tile's 4 vertices, so interpolation is a no-op.
+    float3 rest;       // dissolveT = 0 (paned)
+    float3 own;        // dissolveT = 1 (own hue)
+    float  dissolveT;  // TZ-8 glass-pane dissolve param, from the uniform
+    float  brightnessRebase; // TZ-8 NOTE #5 dive REBASE scalar (uniform → varying), from the uniform
     float2 pixelSize;  // ON-SCREEN tile size in device pixels (post-camera)
     float  style;      // GPUQuad.style, flat across the tile
     float  highlight;  // 1 if this instance is the hover target, else 0
@@ -88,10 +105,18 @@ vertex VOut quad_vertex(uint vid [[vertex_id]],
     float2 ndc = float2(2.0 * px.x / u.viewport.x - 1.0,
                         1.0 - 2.0 * px.y / u.viewport.y);
 
+    // TZ-8 GLASS-PANE endpoints, carried to the FRAGMENT stage for the dissolve mix
+    // (deliverable 2 — the blend is a fragment op). The App drives `dissolveT` from the
+    // camera flight (dive 0→1, ascend 1→0, rest 0); passing it through as a per-vertex
+    // varying keeps the vertex stage geometry-only. Colour follows the settle TARGET `b`
+    // (same rule as before TZ-8: geometry morphs, colour snaps to the destination).
     VOut o;
     o.position = float4(ndc, 0.0, 1.0);
     o.local = corner;
-    o.color = float3(b.r, b.g, b.b);
+    o.rest = float3(b.r, b.g, b.b);           // dissolveT = 0 (paned)
+    o.own  = float3(b.ownR, b.ownG, b.ownB);  // dissolveT = 1 (own hue)
+    o.dissolveT = u.dissolveT;
+    o.brightnessRebase = u.brightnessRebase;  // TZ-8 NOTE #5 dive rebase, applied in the fragment
     o.pixelSize = abs(sSize);
     o.style = b.style;
     o.highlight = (int(iid) == u.highlightIndex) ? 1.0 : 0.0;
@@ -99,7 +124,19 @@ vertex VOut quad_vertex(uint vid [[vertex_id]],
 }
 
 fragment float4 quad_fragment(VOut in [[stage_in]]) {
-    float3 c = in.color;
+    // TZ-8 GLASS-PANE DISSOLVE (deliverable 2 — performed HERE, in the fragment stage).
+    // Blend the tile's two precomputed endpoint colours by the `dissolveT` varying, THEN
+    // apply the border/style branch and the hover highlight LAST (deliverable 4 order of
+    // operations). O(1) per fragment. Mirrors QuadBuilder.displayedColor exactly.
+    float3 c = mix(in.rest, in.own, in.dissolveT);
+    // TZ-8 OPERATOR_NOTE #5 — DIVE brightness REBASE. Over a dive flight the App ramps
+    // `brightnessRebase` 1 → 1/dimFalloff, brightening the whole OUTGOING scene by exactly one
+    // dim-ladder step so the dissolved endpoint renders IDENTICALLY to the incoming scene at rest
+    // (no commit pop). Applied to NORMAL data tiles ONLY (style < 0.5): reserved colours
+    // (pending/denied/aggregate) carry a depth-invariant reserved colour and must stay reserved
+    // (deliverable 4/5e). 1.0 at every rest state and across the whole ascend (embedChild bakes the
+    // dim-correct parent colours), so this is a no-op except during a dive. Mirrors displayedColor.
+    if (in.style < 0.5) { c *= in.brightnessRebase; }
     float minSide = min(in.pixelSize.x, in.pixelSize.y);
     float2 p = in.local * in.pixelSize;                     // pixel coords in tile
     float d = min(min(p.x, in.pixelSize.x - p.x),

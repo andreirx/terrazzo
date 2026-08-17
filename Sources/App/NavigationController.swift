@@ -200,6 +200,24 @@ final class NavigationController: CanvasInputDelegate {
         scanController?.setFocus(focusId)
     }
 
+    /// Paint the focus-path breadcrumb from the focus STACK, synchronously, at the instant the
+    /// focus changes (OPERATOR_NOTE 2026-08-17 #1 — the human field bug: the bottom-left path
+    /// LAGGED dives, still reading "~" after zooming twice). The path is MAIN-SIDE state — the
+    /// current focus id IS its absolute path (`focusStack.last`), so the breadcrumb is knowable as
+    /// an O(1) read the moment we push/pop the stack; it must NEVER wait for the pipeline's scene to
+    /// arrive (the same disease as the old tile-label lag). Called at every dive/ascend/promote
+    /// commit BEFORE `applyFocusToPipeline`, so the label is correct before any scene is even posted.
+    /// `setFocusPath` keeps the TZ-4 hover-path override intact: it records the breadcrumb but does
+    /// not repaint while a hover path is showing, so a mid-hover navigation does not stomp the hover.
+    private func updateFocusPathLabel() {
+        bottomBar.setFocusPath(focusStack.last ?? "")
+    }
+
+    /// The current focus path (breadcrumb) — a test seam for the headless trace, which samples it
+    /// right after a dive/ascend to prove the label matches the focus stack BEFORE any scene arrives
+    /// (OPERATOR_NOTE #1 check). `focusStack.last` is the current focus's absolute path.
+    var currentFocusPath: String { focusStack.last ?? "" }
+
     /// Post the current viewport to the pipeline (startup + resize). Called by
     /// AppDelegate once ScanController is wired, and on every viewport change.
     func pushViewport() {
@@ -460,13 +478,16 @@ final class NavigationController: CanvasInputDelegate {
         // Cache the parent snapshot we dived through, for a dive-reversed ascend.
         sceneStack.append(base)
         focusStack.append(childId)
+        updateFocusPathLabel() // commit-time breadcrumb (OPERATOR_NOTE #1) — before the async scene
         scanController?.setPhase("dive")
         applyFocusToPipeline() // pipeline lays out the child focus; scene arrives async
 
         // Dive: whole world (viewport) → child rect grows to fill the viewport. The
         // camera flies over the parent's ALREADY-prebuilt quads (no per-tile build).
         animateCamera(fromFrame: vp, toFrame: childRect,
-                      baseQuads: base.quads, baseNodeIds: base.nodeIds) { [weak self] in
+                      baseQuads: base.quads, baseNodeIds: base.nodeIds,
+                      dissolveFrom: 0, dissolveTo: 1,       // DIVE: panes dissolve
+                      rebaseFrom: 1, rebaseTo: QuadBuilder.diveRebaseEnd) { [weak self] in // + depths brighten one step (NOTE #5)
             guard let self else { return }
             self.commitToLatestScene()
             self.scanController?.setPhase("scanning")
@@ -492,6 +513,7 @@ final class NavigationController: CanvasInputDelegate {
             trace("ascend \(childId) -> \(parentId) (no cache, snap)")
             focusStack.removeLast()
             if !sceneStack.isEmpty { sceneStack.removeLast() }
+            updateFocusPathLabel() // commit-time breadcrumb (OPERATOR_NOTE #1)
             applyFocusToPipeline()
             return
         }
@@ -499,6 +521,7 @@ final class NavigationController: CanvasInputDelegate {
         let childScene = displayed // the committed child layout currently on screen
         focusStack.removeLast()
         _ = sceneStack.removeLast()
+        updateFocusPathLabel() // commit-time breadcrumb (OPERATOR_NOTE #1) — now reads the parent
         let vp = viewport
         scanController?.setPhase("ascend")
         applyFocusToPipeline() // pipeline lays out the parent focus; fresh scene async
@@ -516,7 +539,9 @@ final class NavigationController: CanvasInputDelegate {
 
         // Zoom out: child-fills-viewport (from) → parent fills viewport (identity).
         animateCamera(fromFrame: childRect, toFrame: vp,
-                      baseQuads: baseQuads, baseNodeIds: baseNodeIds) { [weak self] in
+                      baseQuads: baseQuads, baseNodeIds: baseNodeIds,
+                      dissolveFrom: 1, dissolveTo: 0,       // ASCEND: panes re-condense
+                      rebaseFrom: 1, rebaseTo: 1) { [weak self] in // no brightness rebase (embedChild bakes dim-correct colours, NOTE #5)
             guard let self else { return }
             if !self.commitToLatestScene() {
                 // Fresh parent scene not here yet (rare — setFocus force-emits): hold the
@@ -549,6 +574,7 @@ final class NavigationController: CanvasInputDelegate {
         // Land on the new root; the old root is now one child among the new siblings.
         focusStack = [newRootId]
         sceneStack = []
+        updateFocusPathLabel() // commit-time breadcrumb (OPERATOR_NOTE #1) — the promoted root now
     }
 
     /// Run the PROMOTION camera: the inverse of a dive. The promoted `scene` is the new
@@ -575,7 +601,9 @@ final class NavigationController: CanvasInputDelegate {
             into: childRect, parentQuads: scene.quads, parentNodeIds: scene.nodeIds,
             childId: promo.oldRootId)
         animateCamera(fromFrame: childRect, toFrame: vp,
-                      baseQuads: baseQuads, baseNodeIds: baseNodeIds) { [weak self] in
+                      baseQuads: baseQuads, baseNodeIds: baseNodeIds,
+                      dissolveFrom: 1, dissolveTo: 0,       // PROMOTE (zoom-out): re-condense
+                      rebaseFrom: 1, rebaseTo: 1) { [weak self] in // no brightness rebase (embedChild bakes dim-correct colours, NOTE #5)
             guard let self else { return }
             self.commitToLatestScene()
             self.scanController?.setPhase("scanning")
@@ -609,8 +637,22 @@ final class NavigationController: CanvasInputDelegate {
 
     // MARK: - Camera animation driver (uniform-based; O(1) per frame)
 
+    /// - Parameters `dissolveFrom`/`dissolveTo`: the TZ-8 glass-pane dissolve endpoints for
+    ///   this flight (DIVE: 0→1, panes dissolve to reveal children's own hues; ASCEND/PROMOTE:
+    ///   1→0, panes re-condense). The per-frame value eases with the SAME smoothstep the camera
+    ///   uses, so colour and geometry move together; on completion the commit's settle resets
+    ///   the dissolve to 0 (the fresh scene at rest — its panes condensed).
+    /// - Parameters `rebaseFrom`/`rebaseTo`: the TZ-8 OPERATOR_NOTE #5 dive brightness-REBASE
+    ///   endpoints. DIVE: 1 → `QuadBuilder.diveRebaseEnd` (1/dimFalloff) — the flight brightens the
+    ///   OUTGOING scene by exactly one dim-ladder step so its dived endpoint renders identically to
+    ///   the incoming scene at rest (no commit pop). ASCEND/PROMOTE/fallback: 1 → 1 (identity) —
+    ///   `QuadGeometry.embedChild` already bakes the dim-correct parent colours into the flight base,
+    ///   so a scalar rebase there would double-dim and reintroduce a pop. Eased with the same
+    ///   smoothstep; reset to 1 by the commit's settle (`resetCamera`).
     private func animateCamera(fromFrame: Rect, toFrame: Rect,
                                baseQuads: [GPUQuad], baseNodeIds: [String],
+                               dissolveFrom: Float, dissolveTo: Float,
+                               rebaseFrom: Float, rebaseTo: Float,
                                completion: @escaping () -> Void) {
         let vp = viewport
         guard vp.width > 0, vp.height > 0 else { completion(); return }
@@ -637,7 +679,9 @@ final class NavigationController: CanvasInputDelegate {
         // The FIRST painted frame is this explicit t=0 frame — nothing is drawn between
         // the buffer upload and here, so there is no identity/parent-world flash before
         // the matching t=0 child frame (review-2 gap 2, ascend continuity).
-        applyCameraFrame(fromFrame: fromFrame, toFrame: toFrame, viewport: vp, t: 0)
+        applyCameraFrame(fromFrame: fromFrame, toFrame: toFrame, viewport: vp, t: 0,
+                         dissolveFrom: dissolveFrom, dissolveTo: dissolveTo,
+                         rebaseFrom: rebaseFrom, rebaseTo: rebaseTo)
 
         let start = CACurrentMediaTime()
         let dur = FocusCamera.refocusDurationSeconds
@@ -645,7 +689,9 @@ final class NavigationController: CanvasInputDelegate {
             MainActor.assumeIsolated {
                 guard let self else { tmr.invalidate(); return }
                 let t = min(1.0, (CACurrentMediaTime() - start) / dur)
-                self.applyCameraFrame(fromFrame: fromFrame, toFrame: toFrame, viewport: vp, t: t)
+                self.applyCameraFrame(fromFrame: fromFrame, toFrame: toFrame, viewport: vp, t: t,
+                                      dissolveFrom: dissolveFrom, dissolveTo: dissolveTo,
+                                      rebaseFrom: rebaseFrom, rebaseTo: rebaseTo)
                 if t >= 1.0 {
                     tmr.invalidate()
                     self.cameraTimer = nil
@@ -658,11 +704,27 @@ final class NavigationController: CanvasInputDelegate {
         cameraTimer = timer
     }
 
-    /// Push the camera affine at parameter `t` to the canvas (a uniform update).
-    private func applyCameraFrame(fromFrame: Rect, toFrame: Rect, viewport vp: Rect, t: Double) {
+    /// Push the camera affine, the TZ-8 dissolve, AND the TZ-8 NOTE #5 brightness-rebase at flight
+    /// parameter `t` to the canvas (one uniform update, O(1)). Both the dissolve and the rebase ease
+    /// with the SAME smoothstep FocusCamera applies to the geometry (smoothstep(t) = t²(3−2t);
+    /// endpoints exact, monotone, and symmetric so ascend's 1→0 is the exact reverse of dive's 0→1),
+    /// so colour and geometry move together. `dissolveT = dissolveFrom + (dissolveTo−dissolveFrom)·s`;
+    /// `brightnessRebase = rebaseFrom + (rebaseTo−rebaseFrom)·s`.
+    private func applyCameraFrame(fromFrame: Rect, toFrame: Rect, viewport vp: Rect, t: Double,
+                                  dissolveFrom: Float, dissolveTo: Float,
+                                  rebaseFrom: Float, rebaseTo: Float) {
         let tr = FocusCamera.transform(fromFrame: fromFrame, toFrame: toFrame, viewport: vp, t: t)
+        let s = Float(t * t * (3 - 2 * t)) // smoothstep, mirroring FocusCamera's ease
+        let dissolveT = dissolveFrom + (dissolveTo - dissolveFrom) * s
+        let brightnessRebase = rebaseFrom + (rebaseTo - rebaseFrom) * s
         canvas.setCamera(scaleX: tr.scaleX, scaleY: tr.scaleY,
-                         translateX: tr.translateX, translateY: tr.translateY)
+                         translateX: tr.translateX, translateY: tr.translateY,
+                         dissolveT: dissolveT, brightnessRebase: brightnessRebase)
+        // Guard the format at the hot site: this runs ~60×/s during a flight; with tracing
+        // OFF (the app's normal state) we build no strings. O(1)/frame either way.
+        if Self.traceEnabled {
+            trace("dissolve t=\(String(format: "%.3f", t)) dissolveT=\(String(format: "%.3f", dissolveT)) rebase=\(String(format: "%.3f", brightnessRebase))")
+        }
     }
 
     // MARK: - Headless test seam (TZ-3b threading harness — conduct rule)
@@ -851,7 +913,9 @@ final class NavigationController: CanvasInputDelegate {
             childQuads: ghost.quads, childNodeIds: ghost.nodeIds, into: branchRect,
             parentQuads: ancestorWorld.quads, parentNodeIds: ancestorWorld.nodeIds, childId: branchId)
         animateCamera(fromFrame: branchRect, toFrame: viewport,
-                      baseQuads: baseQuads, baseNodeIds: baseNodeIds) { [weak self] in
+                      baseQuads: baseQuads, baseNodeIds: baseNodeIds,
+                      dissolveFrom: 1, dissolveTo: 0,       // animated ascent (dive reversed): re-condense
+                      rebaseFrom: 1, rebaseTo: 1) { [weak self] in // no brightness rebase (embedChild bakes dim-correct colours, NOTE #5)
             guard let self else { return }
             if !self.commitToLatestScene() { self.presentSnapshot(ancestorWorld) }
             self.scanController?.setPhase("scanning")

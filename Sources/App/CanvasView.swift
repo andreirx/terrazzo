@@ -95,6 +95,17 @@ final class CanvasView: NSView {
     /// Camera affine (world px → screen px). Identity except during a dive/ascend.
     private var camScale = SIMD2<Float>(1, 1)
     private var camTranslate = SIMD2<Float>(0, 0)
+    /// TZ-8 glass-pane dissolve parameter [0,1] — a single uniform, NOT per-tile. 0 at every
+    /// settled/rest state (the paned colour); driven 0→1 (dive) / 1→0 (ascend) by the camera
+    /// flight via `setCamera`. Reset to 0 by `resetCamera` (settle/snap == a fresh scene at
+    /// rest). O(1)/frame — the whole point of the two-colour GPUQuad (PLAN §"TZ-8").
+    private var dissolveT: Float = 0
+    /// TZ-8 OPERATOR_NOTE #5 dive brightness REBASE — a single uniform scaling every NORMAL tile,
+    /// NOT per-tile. 1 at every settled/rest state; a dive flight ramps it 1 → 1/dimFalloff in
+    /// lock-step with the camera (via `setCamera`) so the outgoing scene brightens by one dim step to
+    /// meet the incoming scene with no commit pop; ascend/promote leave it at 1 (embedChild bakes the
+    /// dim-correct colours). Reset to 1 by `resetCamera` (a fresh scene at rest). O(1)/frame.
+    private var brightnessRebase: Float = 1
     /// Hover-highlight instance index, or -1 (a uniform, not per-instance data).
     private var highlightIndex: Int32 = -1
 
@@ -220,18 +231,26 @@ final class CanvasView: NSView {
         fromBuf = buf; toBuf = buf
     }
 
-    /// Update the camera affine (world px → screen px) and redraw. O(1)/frame — the
-    /// prebuilt base buffer is reused; only the uniform changes.
-    func setCamera(scaleX: Double, scaleY: Double, translateX: Double, translateY: Double) {
+    /// Update the camera affine (world px → screen px) AND the TZ-8 dissolve, then redraw.
+    /// O(1)/frame — the prebuilt base buffer is reused; only the uniforms change. The camera
+    /// driver (NavigationController.applyCameraFrame) sets `dissolveT` in lock-step with the
+    /// flight so the pane dissolves as the camera flies.
+    func setCamera(scaleX: Double, scaleY: Double, translateX: Double, translateY: Double,
+                   dissolveT: Float, brightnessRebase: Float) {
         camScale = SIMD2(Float(scaleX), Float(scaleY))
         camTranslate = SIMD2(Float(translateX), Float(translateY))
+        self.dissolveT = min(1, max(0, dissolveT))
+        self.brightnessRebase = brightnessRebase
         render()
     }
 
-    /// Reset the camera to identity (world px == screen px). Used when a settle takes
-    /// over from a camera flight.
+    /// Reset the camera to identity (world px == screen px) AND the dissolve to 0 (the
+    /// paned REST colour). Used when a settle/snap takes over from a camera flight — the
+    /// committed scene is presented at rest, so its panes are condensed (dissolveT = 0).
     func resetCamera() {
         camScale = SIMD2(1, 1); camTranslate = SIMD2(0, 0)
+        dissolveT = 0
+        brightnessRebase = 1 // TZ-8 NOTE #5: a committed scene at rest is un-rebased
     }
 
     /// Record the viewport the freshly-installed quads were laid out for (TZ-4 D8). The
@@ -586,7 +605,8 @@ final class CanvasView: NSView {
         let u = QuadRenderer.Uniforms(
             viewport: SIMD2(Float(ds.width), Float(ds.height)),
             camScale: camScale, camTranslate: camTranslate,
-            t: t, highlightIndex: highlightIndex)
+            t: t, dissolveT: dissolveT, brightnessRebase: brightnessRebase,
+            highlightIndex: highlightIndex)
         renderer.render(from: fromBuf, to: toBuf, count: quadCount, uniforms: u, to: metalLayer)
     }
 

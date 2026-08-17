@@ -230,7 +230,7 @@ public enum TreemapScene {
     ///     any units in tests).
     ///   - borderInset: per-level inset (default `defaultBorderInset`).
     ///   - scale: per-sibling-set layout-weight transform (TZ-5 deliverable 2). `.linear`
-    ///     (default) tiles by true bytes; `.log` compresses the range so giants cannot
+    ///     (default) tiles by true bytes; `.sqrt` compresses the range so giants cannot
     ///     eclipse the tail. Monotone, so tiling exactness and sibling ordering are
     ///     UNCHANGED — only the areas compress (the numbers on tiles are always real bytes).
     ///     The composition layer passes the SAME scale to `ScanReducer.makeRenderTree`, so
@@ -334,7 +334,7 @@ public enum TreemapScene {
     /// the one aggregate) is viewport-bounded, not child-count-bounded (finding 3c).
     private static func badgePlan(children: [SizeTree], innerArea: Double, scale: AreaScale)
         -> (placements: [Placement], weights: [Double]) {
-        // TZ-5: the per-sibling-set weight transform (linear bytes vs log(1+bytes)). Applied
+        // TZ-5: the per-sibling-set weight transform (linear bytes vs sqrt(bytes)). Applied
         // HERE, at the single point Squarify weights are formed, so the scale governs the exact
         // partition. Everything downstream (badge floor, aggregate overflow, tiling exactness)
         // is weight-agnostic — it operates on areas and these weights, so it is unchanged.

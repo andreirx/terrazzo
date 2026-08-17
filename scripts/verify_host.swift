@@ -42,13 +42,14 @@ private let viewportB = (w: 1300, h: 520)
 struct VerifyHost {
     static func main() {
         let args = CommandLine.arguments
-        guard args.count == 10 else {
-            FileHandle.standardError.write(Data("usage: \(args.first ?? "verify_host") <shaders.metal> <fixture.json> <out1.png> <out2.png> <focus-root.png> <focus-child.png> <scale-linear.png> <scale-log.png> <scale-log-ignore.png>\n".utf8))
+        guard args.count == 13 else {
+            FileHandle.standardError.write(Data("usage: \(args.first ?? "verify_host") <shaders.metal> <fixture.json> <out1.png> <out2.png> <focus-root.png> <focus-child.png> <scale-linear.png> <scale-sqrt.png> <scale-sqrt-ignore.png> <dissolve-0.png> <dissolve-half.png> <dissolve-1.png>\n".utf8))
             exit(2)
         }
         let shaderPath = args[1], fixturePath = args[2], out1 = args[3], out2 = args[4]
         let focusRootOut = args[5], focusChildOut = args[6]
-        let scaleLinearOut = args[7], scaleLogOut = args[8], scaleLogIgnoreOut = args[9]
+        let scaleLinearOut = args[7], scaleSqrtOut = args[8], scaleSqrtIgnoreOut = args[9]
+        let dissolve0Out = args[10], dissolveHalfOut = args[11], dissolve1Out = args[12]
 
         guard let device = MTLCreateSystemDefaultDevice() else { die("no Metal device") }
 
@@ -92,7 +93,7 @@ struct VerifyHost {
                     px: viewportA.w, py: viewportA.h, out: focusChildOut)
 
         // TZ-5 scale + ignore frames (packet acceptance + review-0 change 4b): the SAME fixture
-        // scene under (a) linear, (b) log, and (c) log with the LARGEST top-level tile IGNORED —
+        // scene under (a) linear, (b) sqrt, and (c) sqrt with the LARGEST top-level tile IGNORED —
         // all three must differ. These now go through the REAL CHANGED PATH: a `ScanReducer`
         // rebuilt from the fixture tree, then `makeRenderTree(excluding:weight:)` — the same
         // area-bounded projection + prune the pipeline runs — instead of hand-filtering a
@@ -106,25 +107,89 @@ struct VerifyHost {
         let cullLinear = renderProjectedFrame(device: device, renderer: renderer, reducer: reducer,
                                               focusId: tree.id, excluding: [], scale: .linear,
                                               px: viewportA.w, py: viewportA.h, out: scaleLinearOut)
-        let cullLog = renderProjectedFrame(device: device, renderer: renderer, reducer: reducer,
-                                           focusId: tree.id, excluding: [], scale: .log,
-                                           px: viewportA.w, py: viewportA.h, out: scaleLogOut)
+        let cullSqrt = renderProjectedFrame(device: device, renderer: renderer, reducer: reducer,
+                                           focusId: tree.id, excluding: [], scale: .sqrt,
+                                           px: viewportA.w, py: viewportA.h, out: scaleSqrtOut)
         _ = renderProjectedFrame(device: device, renderer: renderer, reducer: reducer,
                                  focusId: tree.id, excluding: Set([largest?.id].compactMap { $0 }),
-                                 scale: .log, px: viewportA.w, py: viewportA.h, out: scaleLogIgnoreOut)
+                                 scale: .sqrt, px: viewportA.w, py: viewportA.h, out: scaleSqrtIgnoreOut)
 
         print("VERIFY_HOST CULL (fixture @ \(viewportA.w)x\(viewportA.h), via ScanReducer.makeRenderTree): "
-              + "linear=\(cullLinear) log=\(cullLog) below-pixel tiles (projection-prune + final cull)"
-              + " (log ≤ linear — log exposes starved siblings; largest ignored = \(largest?.name ?? "<none>"))")
+              + "linear=\(cullLinear) sqrt=\(cullSqrt) below-pixel tiles (projection-prune + final cull)"
+              + " (sqrt ≤ linear — sqrt exposes starved siblings; largest ignored = \(largest?.name ?? "<none>"))")
+        // TZ-8 GLASS-PANE DISSOLVE gate (packet acceptance): the SAME fixture at focus=root,
+        // rendered at dissolveT = 0 (rest/paned), 0.5, and 1 (dived/own) through the REAL
+        // shader path (renderSynchronously(dissolveT:)). The scene mean channel value is a
+        // LINEAR function of dissolveT (per-tile mix is linear; averaging is linear), so the
+        // three means MUST be monotone AND the 0.5 frame their midpoint — a strong, exact check
+        // of the shader blend, not merely "the pixels differ". `focusChild` gives a deep tile
+        // so the dissolve has a visible descendant (a hue root alone is a no-op — own == pane).
+        let mean0 = renderDissolveFrame(device: device, renderer: renderer, tree: tree,
+                                        focusId: focusChild.id, dissolveT: 0,
+                                        px: viewportA.w, py: viewportA.h, out: dissolve0Out)
+        let meanHalf = renderDissolveFrame(device: device, renderer: renderer, tree: tree,
+                                           focusId: focusChild.id, dissolveT: 0.5,
+                                           px: viewportA.w, py: viewportA.h, out: dissolveHalfOut)
+        let mean1 = renderDissolveFrame(device: device, renderer: renderer, tree: tree,
+                                        focusId: focusChild.id, dissolveT: 1,
+                                        px: viewportA.w, py: viewportA.h, out: dissolve1Out)
+        let midpoint = (mean0 + mean1) / 2
+        let monotone = (mean0 <= meanHalf && meanHalf <= mean1) || (mean0 >= meanHalf && meanHalf >= mean1)
+        // Linearity tolerance: means are 0..765 channel-sums; allow 2.0 for rounding/rasterisation.
+        let linear = abs(meanHalf - midpoint) <= 2.0
+        print("VERIFY_HOST TZ-8 dissolve means (focus \(focusChild.id)): "
+              + "t=0 \(String(format: "%.2f", mean0))  t=0.5 \(String(format: "%.2f", meanHalf))  "
+              + "t=1 \(String(format: "%.2f", mean1))  (midpoint \(String(format: "%.2f", midpoint)); "
+              + "monotone=\(monotone) linear=\(linear))")
+        if !monotone { die("TZ-8 dissolve is not monotone across t (0 → 0.5 → 1)") }
+        if !linear { die("TZ-8 dissolve 0.5 frame is not the midpoint of 0 and 1 (shader mix not linear)") }
+        if abs(mean1 - mean0) < 1.0 { die("TZ-8 dissolve endpoints barely differ — the fixture's focus child has no paned descendant to dissolve") }
+
         print("VERIFY_HOST OK: wrote \(out1) (\(viewportA.w)x\(viewportA.h)) and \(out2) (\(viewportB.w)x\(viewportB.h)); "
               + "focus frames \(focusRootOut) (root) and \(focusChildOut) (child \(focusChild.id)); "
-              + "scale frames \(scaleLinearOut) (linear), \(scaleLogOut) (log), \(scaleLogIgnoreOut) (log+ignore)")
+              + "scale frames \(scaleLinearOut) (linear), \(scaleSqrtOut) (sqrt), \(scaleSqrtIgnoreOut) (sqrt+ignore); "
+              + "dissolve frames \(dissolve0Out) (t=0), \(dissolveHalfOut) (t=0.5), \(dissolve1Out) (t=1)")
+    }
+
+    /// Render the focus scene at a fixed TZ-8 `dissolveT` through the real shader and return the
+    /// MEAN lit-channel sum (Σ over lit pixels of R+G+B, divided by lit count) — the scalar the
+    /// dissolve monotonicity/linearity gate compares. Writes the PNG (operator visual evidence).
+    static func renderDissolveFrame(device: MTLDevice, renderer: QuadRenderer, tree: SizeTree,
+                                    focusId: String, dissolveT: Float, px: Int, py: Int, out: String) -> Double {
+        let viewport = Rect(x: 0, y: 0, width: Double(px), height: Double(py))
+        let tiles = TreemapScene.layout(tree: tree, focusId: focusId, viewport: viewport)
+        guard !tiles.isEmpty else { die("dissolve scene produced no tiles (focus \(focusId))") }
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: px, height: py, mipmapped: false)
+        desc.usage = [.renderTarget, .shaderRead]
+        desc.storageMode = .shared
+        guard let target = device.makeTexture(descriptor: desc) else { die("makeTexture failed") }
+        renderer.renderSynchronously(tiles: tiles, into: target, dissolveT: dissolveT)
+
+        let bytesPerRow = px * 4
+        var pixels = [UInt8](repeating: 0, count: bytesPerRow * py)
+        pixels.withUnsafeMutableBytes { raw in
+            target.getBytes(raw.baseAddress!, bytesPerRow: bytesPerRow,
+                            from: MTLRegionMake2D(0, 0, px, py), mipmapLevel: 0)
+        }
+        var sum = 0.0, lit = 0, i = 0
+        while i < pixels.count {
+            let s = Int(pixels[i]) + Int(pixels[i + 1]) + Int(pixels[i + 2])
+            if s > 24 { sum += Double(s); lit += 1 }
+            i += 4
+        }
+        if lit == 0 { die("dissolve frame \(out) is blank") }
+        writePNG(pixels: &pixels, width: px, height: py, bytesPerRow: bytesPerRow, path: out)
+        let mean = sum / Double(lit)
+        print("  dissolve frame \(out): dissolveT=\(dissolveT), \(tiles.count) tiles, \(lit) lit px, mean channel-sum \(String(format: "%.2f", mean))")
+        return mean
     }
 
     /// Build the scene at the given pixel viewport (optionally focused on `focusId`, under the
     /// given area `scale`), render through the real QuadRenderer into an offscreen texture, assert
     /// non-blank, write PNG. Returns the below-pixel-culled tile count (area < 4 px², non-focus) —
-    /// the "same scene under log vs linear" evidence the scale frames report.
+    /// the "same scene under sqrt vs linear" evidence the scale frames report (sqrt ratified
+    /// 2026-08-17, superseding log — PLAN §TZ-5).
     @discardableResult
     static func renderFrame(device: MTLDevice, renderer: QuadRenderer, tree: SizeTree,
                             focusId: String? = nil, px: Int, py: Int, out: String,

@@ -39,32 +39,32 @@ final class LensTests: XCTestCase {
 
     // MARK: - Scale (deliverable 2)
 
-    /// LOG is a MONOTONE transform: the tiling stays EXACT (children fill the inset parent) and
+    /// SQRT is a MONOTONE transform: the tiling stays EXACT (children fill the inset parent) and
     /// the sibling ORDERING is unchanged — only the areas compress. Assert on a mixed sibling set.
-    func testLogScalePreservesTilingExactnessAndOrdering() {
+    func testSqrtScalePreservesTilingExactnessAndOrdering() {
         let r = flatReducer([("A", 1000), ("B", 300), ("C", 60)].map { ($0.0, $0.1, false) })
         // The reducer takes a bare weight transform (AreaScale lives in TreemapCore now, review-1
         // change 3); the layout takes the AreaScale enum. The composition passes both from ONE scale.
         let (tree, _, _) = r.makeRenderTree(focusId: "/r", depthWindow: 5,
                                             minRenderArea: minArea, viewportArea: vpArea,
-                                            weight: AreaScale.log.weight)
-        let tiles = TreemapScene.layout(tree: tree, focusId: "/r", viewport: viewport, scale: .log)
+                                            weight: AreaScale.sqrt.weight)
+        let tiles = TreemapScene.layout(tree: tree, focusId: "/r", viewport: viewport, scale: .sqrt)
         // Exact tiling: the three children fill the border-inset root.
         let inner = viewport.inset(by: TreemapScene.defaultBorderInset)
         let sum = tiles.filter { $0.dimLevel == 1 }.reduce(0.0) { $0 + $1.rect.area }
         XCTAssertEqual(sum, inner.area, accuracy: inner.area * 1e-9 + 1e-6,
-                       "log weights still partition the parent EXACTLY (monotone transform)")
-        // Ordering preserved: A ≥ B ≥ C by area under log too (monotone ⇒ no reordering).
+                       "sqrt weights still partition the parent EXACTLY (monotone transform)")
+        // Ordering preserved: A ≥ B ≥ C by area under sqrt too (monotone ⇒ no reordering).
         XCTAssertGreaterThanOrEqual(areaOf(tiles, "/r/A"), areaOf(tiles, "/r/B"))
         XCTAssertGreaterThanOrEqual(areaOf(tiles, "/r/B"), areaOf(tiles, "/r/C"))
     }
 
-    /// The founding point of the scale toggle: LOG EXPOSES the starved tail. On a giant-plus-many-
+    /// The founding point of the scale toggle: SQRT EXPOSES the starved tail. On a giant-plus-many-
     /// small sibling set, the small tiles are SUB-PIXEL under linear (culled) but readable under
-    /// log — so log's below-pixel-culled count is strictly lower. This is the PLAN evidence item,
+    /// sqrt — so sqrt's below-pixel-culled count is strictly lower. This is the PLAN evidence item,
     /// quantified deterministically (the giant cannot be exposed by scale — that needs zoom — but
     /// its siblings can).
-    func testLogScaleExposesStarvedSiblingsFewerBelowPixelTiles() {
+    func testSqrtScaleExposesStarvedSiblingsFewerBelowPixelTiles() {
         var kids: [(String, Int64, Bool)] = [("giant", 1_000_000_000, false)]
         for i in 0..<50 { kids.append(("s\(i)", 1000, false)) }
         let r = flatReducer(kids)
@@ -80,11 +80,11 @@ final class LensTests: XCTestCase {
         }
 
         let linearCulled = belowPixelCount(.linear)
-        let logCulled = belowPixelCount(.log)
+        let sqrtCulled = belowPixelCount(.sqrt)
         XCTAssertEqual(linearCulled, 50, "under LINEAR the 50 starved siblings are all sub-pixel")
-        XCTAssertEqual(logCulled, 0, "under LOG the starved siblings clear the pixel threshold — the tail is exposed")
-        XCTAssertLessThan(logCulled, linearCulled,
-                          "log reduces below-pixel culling (the sibling-starvation exposure, quantified)")
+        XCTAssertEqual(sqrtCulled, 0, "under SQRT the starved siblings clear the pixel threshold — the tail is exposed")
+        XCTAssertLessThan(sqrtCulled, linearCulled,
+                          "sqrt reduces below-pixel culling (the sibling-starvation exposure, quantified)")
     }
 
     // MARK: - Ignore (deliverable 1)
@@ -146,8 +146,8 @@ final class LensTests: XCTestCase {
         func layout(excluding ids: Set<String>) -> [TileRect] {
             let (tree, _, _) = r.makeRenderTree(focusId: "/r", depthWindow: 5,
                                                 minRenderArea: minArea, viewportArea: vpArea,
-                                                excluding: ids, weight: AreaScale.log.weight)
-            return TreemapScene.layout(tree: tree, focusId: "/r", viewport: viewport, scale: .log)
+                                                excluding: ids, weight: AreaScale.sqrt.weight)
+            return TreemapScene.layout(tree: tree, focusId: "/r", viewport: viewport, scale: .sqrt)
         }
         let original = layout(excluding: [])
         _ = layout(excluding: ["/r/B"])          // ignore B

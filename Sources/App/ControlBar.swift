@@ -36,8 +36,8 @@ final class ControlBar: NSView {
     private let etaLabel = NSTextField(labelWithString: "")
 
     // TZ-5 visualization-lens controls (deliverables 2/3/4).
-    /// Scale toggle: segment 0 = Log (default), 1 = Linear (deliverable 2).
-    private let scaleControl = NSSegmentedControl(labels: ["Log", "Linear"],
+    /// Scale toggle: segment 0 = Sqrt (default), 1 = Linear (deliverable 2).
+    private let scaleControl = NSSegmentedControl(labels: ["Sqrt", "Linear"],
                                                   trackingMode: .selectOne, target: nil, action: nil)
     /// Show-hidden checkbox, ON by default (deliverable 3).
     private let hiddenCheck = NSButton(checkboxWithTitle: "Hidden", target: nil, action: nil)
@@ -86,12 +86,12 @@ final class ControlBar: NSView {
         rescanButton.action = #selector(rescanClicked)
         rescanButton.toolTip = "Cancel and re-run the scan for the current volume."
 
-        // Scale toggle (deliverable 2). Segment 0 = Log (the ratified default), 1 = Linear.
+        // Scale toggle (deliverable 2). Segment 0 = Sqrt (the ratified default), 1 = Linear.
         scaleControl.selectedSegment = 0
         scaleControl.controlSize = .small
         scaleControl.target = self
         scaleControl.action = #selector(scaleChanged)
-        scaleControl.toolTip = "Tile area scale. Log (default) compresses giant folders so the long tail is visible; Linear shows true proportions. The sizes on tiles are always real bytes in either mode."
+        scaleControl.toolTip = "Tile area scale. Sqrt (default) compresses giant folders so the long tail is visible, while equal size ratios render as equal area ratios at every depth; Linear shows true proportions. The sizes on tiles are always real bytes in either mode."
         scaleControl.setContentHuggingPriority(.defaultHigh, for: .horizontal)
 
         // Show-hidden checkbox (deliverable 3), ON by default.
@@ -162,7 +162,7 @@ final class ControlBar: NSView {
     @objc private func rescanClicked() { onRescan?() }
 
     @objc private func scaleChanged() {
-        onScaleChange?(scaleControl.selectedSegment == 1 ? .linear : .log)
+        onScaleChange?(scaleControl.selectedSegment == 1 ? .linear : .sqrt)
     }
 
     @objc private func hiddenChanged() {

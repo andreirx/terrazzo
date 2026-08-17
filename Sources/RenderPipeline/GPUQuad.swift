@@ -14,21 +14,23 @@
 //
 //  WHY IT LIVES IN RenderPipeline (charter-compliant). The RenderPipeline charter
 //  (CLAUDE.md constraint 1) is PURE COMPOSITION with ZERO Metal/AppKit imports.
-//  `GPUQuad` is plain value data — eight `Float`s, no Metal type — and `QuadBuilder`
-//  is pure arithmetic (the colour ramp + a textbook HSB→RGB). The OPERATOR_NOTE
-//  authorises exactly this: "RenderPipeline may define the instance STRUCT as plain
-//  value data." The GPU-side mirror of this layout lives in Sources/App/Shaders.metal
-//  (`GPUQuad`); the two field lists MUST stay in lock-step (same contract QuadRenderer
-//  kept with its old CPU mirror).
+//  `GPUQuad` is plain value data — eleven `Float`s, no Metal type (TZ-8 added the
+//  second endpoint colour: rest/paned + own/dived) — and `QuadBuilder` is pure
+//  arithmetic (the colour ramp + a textbook HSB→RGB + the pane composite). The
+//  OPERATOR_NOTE authorises exactly this: "RenderPipeline may define the instance
+//  STRUCT as plain value data." The GPU-side mirror of this layout lives in
+//  Sources/App/Shaders.metal (`GPUQuad`); the two field lists MUST stay in lock-step
+//  (same contract QuadRenderer kept with its old CPU mirror).
 //
 //  GEOMETRY IS WORLD-PIXEL SPACE, NOT NDC. `x/y/w/h` are the tile's layout rect in
 //  DEVICE PIXELS (top-left origin, y-down) — the exact `TileRect.rect`. The camera
 //  transform (dive/ascend zoom) and the world→NDC map are applied in the VERTEX
 //  SHADER from uniforms, so a single prebuilt buffer serves every animation frame
 //  unchanged — the per-frame cost on main collapses to updating a handful of uniform
-//  scalars. Colour (`r/g/b`) and `style` are fully resolved here; the only things the
-//  shader still varies per frame are the camera transform, the settle parameter, and
-//  the hover highlight (all uniforms, O(1)).
+//  scalars. BOTH dissolve-endpoint colours (`r/g/b` rest/paned + `ownR/ownG/ownB`
+//  own/dived) and `style` are fully resolved here; the only things the shader still
+//  varies per frame are the camera transform, the settle parameter, the TZ-8 dissolve
+//  parameter (which endpoint colour to show), and the hover highlight (all uniforms, O(1)).
 //
 //  1:1 WITH THE SCENE'S TILES. `build` emits ONE quad per input tile, in the SAME
 //  order (degenerate/zero-area tiles included as zero-size quads that draw no
@@ -53,20 +55,72 @@ import ScanCore
 import TreemapCore
 #endif
 
-/// One render-ready tile instance: world-pixel geometry + resolved colour + style.
-/// Plain value data (eight `Float`s, 32-byte stride, no padding) so it crosses the
+/// One render-ready tile instance: world-pixel geometry + TWO resolved colours + style.
+/// Plain value data (eleven `Float`s, 44-byte stride, no padding) so it crosses the
 /// pipeline→main boundary by value and memcpy's straight into an MTLBuffer. The GPU
 /// mirror is `GPUQuad` in Sources/App/Shaders.metal — field order MUST match.
+///
+/// TZ-8 GLASS-PANE DEPTH TINT (PLAN §"TZ-8", ratified 2026-08-17). A tile carries its
+/// colour at BOTH ends of the dive dissolve, precomputed off main; the shader blends between
+/// them by ONE `dissolveT` uniform driven by the camera flight (O(1)/frame, nothing per-tile
+/// on main — the ratified mechanism).
+///
+/// THE LOAD-BEARING CONTRACT IS POSITIONAL, NOT SEMANTIC (name-honesty, review-1 finding).
+/// `r/g/b` is whatever colour the tile shows at dissolveT = 0; `ownR/ownG/ownB` is whatever it
+/// shows at dissolveT = 1. The shader and `displayedColor` only ever `mix(rgb, ownRGB,
+/// dissolveT)` — they NEVER assume what those colours mean. TWO producers fill the two slots
+/// with DIFFERENT semantics, so the field names below describe only the first:
+///
+///   • `QuadBuilder.quad` — PIPELINE-SCENE quads (the steady-state render). Here the slots
+///     carry the ratified PANED / OWN endpoints:
+///       - `r/g/b`          = REST (paned): the tile's own hue composited under the level-1
+///         ancestor's translucent pane at `paneRestAlpha` (0.5). FOCUS-RELATIVE — its pane hue
+///         is the inherited ancestor hue, which changes when the tile becomes a hue root under
+///         a new focus; QuadGeometry.commitFrom carries it. Equals own for hue roots (focus +
+///         level-1 tiles), where own == pane.
+///       - `ownR/ownG/ownB` = DIVED (own hue): the tile's own name-derived hue through the dim
+///         ladder. Its HUE (chromaticity) is name-derived and focus-invariant; its RGB VALUE is
+///         NOT — brightness = base·falloff^dimLevel and `dimLevel` is focus-relative, so the
+///         SAME node's own RGB darkens by one ladder step when a dive makes it a deeper
+///         descendant. "Own hue is focus-invariant" is true of the HUE, not the RGB.
+///     Reserved-colour tiles (denied/pending) set BOTH triples to the SAME reserved colour, so
+///     the dissolve is a no-op — reserved colours never participate in panes (TZ-8 deliverable
+///     4; VISION invisible-space colours stay reserved).
+///
+///   • `QuadGeometry.embedChild` — CAMERA-HANDOFF quads (the ascend flight base ONLY). Here the
+///     two slots are REPURPOSED as the flight's START / END DISPLAYED endpoints, NOT paned/own:
+///       - `ownR/ownG/ownB` (shown at dissolveT = 1, flight START) = the CHILD scene's DISPLAYED
+///         colour (so the ascend opens exactly on what is on screen — no snap);
+///       - `r/g/b`          (shown at dissolveT = 0, flight END)   = the PARENT scene's PANED
+///         colour for that node (so the pane re-condenses before the commit).
+///     On these quads `ownR/ownG/ownB` is therefore NOT "the own hue" — it is the child's
+///     displayed rest colour; only the POSITIONAL contract above holds. Renaming the fields to
+///     drop the "own" semantics would touch the Metal mirror + every call site (a boundary
+///     change, deferred); documented here instead. See `QuadGeometry.embedChild`.
 public struct GPUQuad: Equatable, Sendable {
     /// World-pixel rect (device px, top-left origin, y-down) — the tile's layout rect.
     public var x: Float
     public var y: Float
     public var w: Float
     public var h: Float
-    /// Resolved colour (already ramped / HSB-converted / reserved for denied·pending).
+    /// dissolveT = 0 endpoint (the POSITIONAL contract; see the struct doc). On PIPELINE-SCENE
+    /// quads (`QuadBuilder.quad`) this is the REST (paned) colour — own hue under the ancestor
+    /// pane at `QuadBuilder.paneRestAlpha`, focus-relative, or a reserved denied·pending colour.
+    /// On CAMERA-HANDOFF quads (`QuadGeometry.embedChild`) it is the flight-END displayed colour
+    /// (the parent scene's paned colour). Kept named `r/g/b` since TZ-3b (QuadGeometry threads
+    /// it through the dive/ascend geometry); the "rest" meaning is the scene-quad case only.
     public var r: Float
     public var g: Float
     public var b: Float
+    /// dissolveT = 1 endpoint (the POSITIONAL contract; see the struct doc). On PIPELINE-SCENE
+    /// quads (`QuadBuilder.quad`) this is the DIVED (own-hue) colour — the tile's own name hue
+    /// through the dim ladder; its HUE is focus-invariant, its RGB VALUE is not (dimLevel, hence
+    /// brightness, is focus-relative). Equals `r/g/b` for hue roots and reserved tiles. On
+    /// CAMERA-HANDOFF quads (`QuadGeometry.embedChild`) it is the flight-START displayed colour
+    /// (the child scene's displayed colour), NOT an own hue.
+    public var ownR: Float
+    public var ownG: Float
+    public var ownB: Float
     /// Fragment-shader style branch: 0 = normal data tile (darkened border),
     /// 1 = pending (outlined-dim), 2 = denied (reserved colour), 3 = denied-overflow
     /// AGGREGATE ("N denied items" — a hatched denied badge, TZ-4b OPERATOR_NOTE #3.2).
@@ -74,9 +128,12 @@ public struct GPUQuad: Equatable, Sendable {
     public var style: Float
 
     public init(x: Float, y: Float, w: Float, h: Float,
-                r: Float, g: Float, b: Float, style: Float) {
+                r: Float, g: Float, b: Float,
+                ownR: Float, ownG: Float, ownB: Float, style: Float) {
         self.x = x; self.y = y; self.w = w; self.h = h
-        self.r = r; self.g = g; self.b = b; self.style = style
+        self.r = r; self.g = g; self.b = b
+        self.ownR = ownR; self.ownG = ownG; self.ownB = ownB
+        self.style = style
     }
 }
 
@@ -88,7 +145,13 @@ public enum QuadBuilder {
     // black. Verbatim the constants QuadRenderer carried — moved, not re-tuned.
     private static let baseBrightness: Float = 0.92
     private static let tileSaturation: Float = 0.55
-    private static let dimFalloff: Float = 0.74
+    // Per-level brightness falloff. INTERNAL (not private) as an earned test seam: the dive
+    // REBASE handoff-continuity test (QuadGeometryTests.testDiveRebaseRgbContinuityAtCommit,
+    // TZ-8 OPERATOR_NOTE #4) must pin the OLD-scene dive endpoint against the NEW-scene rest to
+    // EXACTLY one dim-ladder step — that identity IS this constant, so the test reads it rather
+    // than duplicating the literal 0.74. Simpler alternative rejected: hardcoding 0.74 in the
+    // test, which would silently drift if the ladder were ever re-tuned.
+    static let dimFalloff: Float = 0.74
     // Denied space: its OWN warm amber-red, deliberately off the data ramp (VISION
     // §"invisible space is first-class"; name honesty — never approximated as data).
     private static let deniedColor: (Float, Float, Float) = (0.86, 0.34, 0.24)
@@ -99,6 +162,30 @@ public enum QuadBuilder {
     // not-yet-known region reads as an outlined placeholder, not empty canvas.
     private static let pendingColor: (Float, Float, Float) = (0.30, 0.36, 0.46)
 
+    /// TZ-8 pane strength AT REST (named constant, PLAN §"TZ-8" deliverable 1). The level-1
+    /// ancestor's hue acts as a translucent glass pane over its descendants; at rest the pane
+    /// is at this alpha, so the REST (paned) colour is `alpha·pane + (1−alpha)·own` — the
+    /// descendant's own hue shows through by `(1−alpha)`, the "rest glimmer" (deliverable 3).
+    /// 0.5 = the pane dominates ~50%, own hue glimmers ~50%. THE TUNING KNOB: if the map reads
+    /// mushy (sibling identity at the focus level unclear), raise this toward 1.0 (more pane,
+    /// less glimmer). Shipped at 0.5 — the ratified rest alpha.
+    public static let paneRestAlpha: Float = 0.5
+
+    /// TZ-8 OPERATOR_NOTE #5 (2026-08-17, DECISION tz8-rebase-raw-rgb-continuity — RESOLVED): the
+    /// DIVE brightness-rebase ENDPOINT. A dive reuses the OUTGOING (parent-focus) scene's ALREADY
+    /// -prebuilt quads (no per-tile rebuild on main — OPERATOR_NOTE gap 1), so at the dive endpoint a
+    /// target-child shows its own hue at the OLD, one-step-too-DEEP brightness (`base·falloff^2` while
+    /// the incoming scene renders it a hue root at `base·falloff^1`). To land on the incoming scene
+    /// with NO brightness pop (the earlier ~35% jump review-5 flagged), the App ramps ONE
+    /// `brightnessRebase` uniform 1 → this over the flight, brightening every NORMAL tile of the
+    /// outgoing scene by EXACTLY one dim-ladder step (`1/dimFalloff`). HSB→RGB is linear in
+    /// brightness, so a scalar factor is exactly one ladder step; then rendered old-`dissolveT=1`
+    /// == rendered new-`dissolveT=0` per channel (QuadGeometryTests.testDiveRebaseRgbContinuityAtCommit).
+    /// O(1) on main — a single scalar, nothing per-tile (the law holds). ASCEND needs no rebase (its
+    /// base is rebuilt by `QuadGeometry.embedChild`, which already bakes the dim-correct parent
+    /// colours into the flight-end slot), so its uniform stays 1 — see NavigationController.ascend.
+    public static let diveRebaseEnd: Float = 1 / dimFalloff
+
     /// Resolve every tile to a render-ready quad, 1:1 and in order.
     public static func build(tiles: [TileRect]) -> [GPUQuad] {
         var out = [GPUQuad]()
@@ -107,30 +194,82 @@ public enum QuadBuilder {
         return out
     }
 
-    /// The colour precedence QuadRenderer used to compute per draw, now once per
-    /// scene: denied-aggregate → denied (kind) → pending (scanState) → normal data
-    /// (hue · dim ladder). Denied is a KIND fact; pending is a STATE fact (not finished)
-    /// — both first-class, never silent. Style 3 (once the retired `.synthetic`
-    /// unaccounted hatch — HUMAN FIELD RULING #1) is REVIVED with a new meaning: the
-    /// denied-overflow AGGREGATE badge (TZ-4b OPERATOR_NOTE #3.2), distinguished by
-    /// `TileRect.deniedAggregateCount > 0`.
+    /// Resolve a tile to a render-ready quad carrying BOTH dissolve-endpoint colours.
+    ///
+    /// ORDER OF OPERATIONS (TZ-8 deliverable 4 — composition rules, stated in code):
+    ///  1. RESERVED COLOURS FIRST. denied-aggregate → denied (KIND) → pending (STATE). These
+    ///     get a reserved colour in BOTH triples, so the dissolve is a no-op — reserved
+    ///     colours NEVER participate in panes (VISION invisible-space colours stay reserved;
+    ///     name honesty). They also keep their distinct fragment `style` branch (hatch/outline).
+    ///  2. DIM LADDER (normal data tile). brightness = baseBrightness · dimFalloff^dimLevel —
+    ///     applied WITHIN each hue, MULTIPLICATIVELY, and to BOTH endpoint colours equally, so
+    ///     the ladder composes with the pane unchanged (a dived tile is dimmed by its depth
+    ///     just as a paned one is).
+    ///  3. PANE BLEND. ownColor = own name hue; paneColor = the level-1 ancestor's inherited
+    ///     hue (`TileRect.hue`) at the SAME brightness; the REST colour = pane composited over
+    ///     own at `paneRestAlpha`. For a HUE ROOT (focus/level-1 tile) own hue == inherited
+    ///     hue, so paned == own and the dive dissolve is a visual no-op on it — exactly the
+    ///     ratified rule that a tile's pane is dissolved to reveal ITS CHILDREN's hues.
+    ///  4. (SHADER, per frame) DISSOLVE: displayed = mix(rest, own, dissolveT) — `displayedColor`
+    ///     below mirrors it for headless tests.
+    ///  5. (SHADER) HOVER HIGHLIGHT is applied LAST, over the dissolved colour (unchanged).
+    ///
+    /// Style 3 (once the retired `.synthetic` unaccounted hatch — HUMAN FIELD RULING #1) is
+    /// the denied-overflow AGGREGATE badge (TZ-4b OPERATOR_NOTE #3.2), `deniedAggregateCount > 0`.
     public static func quad(for t: TileRect) -> GPUQuad {
-        let color: (Float, Float, Float)
+        let rest: (Float, Float, Float)   // dissolveT = 0 (paned)
+        let own: (Float, Float, Float)    // dissolveT = 1 (own hue)
         let style: Float
         if t.kind == .denied && t.deniedAggregateCount > 0 {
-            color = deniedAggregateColor; style = 3
+            rest = deniedAggregateColor; own = deniedAggregateColor; style = 3
         } else if t.kind == .denied {
-            color = deniedColor; style = 2
+            rest = deniedColor; own = deniedColor; style = 2
         } else if t.scanState != .complete {
-            color = pendingColor; style = 1
+            rest = pendingColor; own = pendingColor; style = 1
         } else {
             let brightness = baseBrightness * pow(dimFalloff, Float(t.dimLevel))
-            color = hsb(h: Float(t.hue), s: tileSaturation, b: brightness); style = 0
+            // The tile's OWN hue = its name-derived hue (`TileColor.hue`, the ratified
+            // name→hue identity). `TileRect.hue` is the INHERITED level-1 ancestor hue (the
+            // pane): equal to this for hue roots, the ancestor's for deeper descendants.
+            let ownColor = hsb(h: Float(TileColor.hue(for: t.name)), s: tileSaturation, b: brightness)
+            let paneColor = hsb(h: Float(t.hue), s: tileSaturation, b: brightness)
+            own = ownColor
+            rest = mix3(ownColor, paneColor, paneRestAlpha) // pane over own at rest alpha
+            style = 0
         }
         return GPUQuad(
             x: Float(t.rect.x), y: Float(t.rect.y),
             w: Float(t.rect.width), h: Float(t.rect.height),
-            r: color.0, g: color.1, b: color.2, style: style)
+            r: rest.0, g: rest.1, b: rest.2,
+            ownR: own.0, ownG: own.1, ownB: own.2, style: style)
+    }
+
+    /// The colour a tile DISPLAYS at a given `dissolveT`, mixing its two endpoint colours.
+    /// This is the PURE MIRROR of the `mix(rest, own, dissolveT)` in the FRAGMENT stage of
+    /// Shaders.metal (TZ-8 deliverable 2 — the blend is a fragment op; the endpoints ride
+    /// through VOut) — the two MUST stay in lock-step, exactly as the GPUQuad field lists do. Exists so the dive dissolve (monotonicity, ascend-reverse,
+    /// reserved-colour invariance) is unit-testable HEADLESS, with no GPU (QuadRenderer runs
+    /// only under the Metal gates). `dissolveT` is clamped to [0,1] like the flight parameter.
+    public static func displayedColor(_ q: GPUQuad, dissolveT: Float,
+                                      brightnessRebase: Float = 1) -> (Float, Float, Float) {
+        let d = min(1, max(0, dissolveT))
+        let c = mix3((q.r, q.g, q.b), (q.ownR, q.ownG, q.ownB), d)
+        // TZ-8 OPERATOR_NOTE #5 — the DIVE brightness REBASE, mirrored for headless tests. The
+        // shader multiplies the dissolved colour of a NORMAL data tile by the `brightnessRebase`
+        // uniform (Shaders.metal, `quad_fragment`). RESERVED colours (denied/pending — style != 0)
+        // are NEVER rebased: they carry a depth-invariant reserved colour, so brightening them would
+        // both violate deliverable 4/5e (reserved colours stay reserved) AND break their own handoff
+        // continuity (old-t=1 reserved == new-t=0 reserved requires factor 1). Default 1 makes this a
+        // no-op for every pre-note-#5 caller (all rest states, and the whole ascend path).
+        guard q.style < 0.5 else { return c }
+        return (c.0 * brightnessRebase, c.1 * brightnessRebase, c.2 * brightnessRebase)
+    }
+
+    /// Component-wise linear blend `(1−t)·a + t·b`. Used for the pane composite (rest colour)
+    /// and, via `displayedColor`, for the dissolve — the same linear `mix` the shader uses.
+    static func mix3(_ a: (Float, Float, Float), _ b: (Float, Float, Float), _ t: Float)
+        -> (Float, Float, Float) {
+        (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t, a.2 + (b.2 - a.2) * t)
     }
 
     /// HSB → RGB, all components in [0,1]; `h` wraps mod 1. Standard 6-sector

@@ -175,7 +175,7 @@ final class ScenePipelineTests: XCTestCase {
         let rootId = "/r"
         let pipe = ScenePipeline(rootId: rootId, rootName: "r")
         // Pin the cull MECHANICS under LINEAR scale: this test is about which tiles the
-        // pixel cull drops, not the default scale. Under the ratified LOG default the tail is
+        // pixel cull drops, not the default scale. Under the ratified SQRT default the tail is
         // deliberately EXPANDED (fewer culls) — that behavior is exercised by the TreemapCore
         // scale tests; here we hold scale fixed so the exact culled count is deterministic.
         await pipe.setScale(.linear)
@@ -816,9 +816,9 @@ final class ScenePipelineTests: XCTestCase {
         await ingestTask.value
 
         var it = pipe.scenes.makeAsyncIterator()
-        // Final settle: LOG is the ratified default scale; hidden is shown, nothing filtered.
+        // Final settle: SQRT is the ratified default scale; hidden is shown, nothing filtered.
         let first = await it.next()
-        XCTAssertEqual(first?.scaleMode, .log, "the default scale is Log, echoed on the scene")
+        XCTAssertEqual(first?.scaleMode, .sqrt, "the default scale is Sqrt, echoed on the scene")
         XCTAssertEqual(first?.hiddenFilteredBytes, 0, "nothing filtered while show-hidden is on")
         XCTAssertTrue(first?.tiles.contains { $0.nodeId == "\(rootId)/.H" } ?? false,
                       "the hidden node is drawn while show-hidden is on (the scan always includes it)")
@@ -843,7 +843,7 @@ final class ScenePipelineTests: XCTestCase {
                        "an ignored node is excluded from layout (its siblings renormalize)")
     }
 
-    // MARK: - 14. TZ-5: pipeline-level cull counts (linear vs log) + ignore accounting
+    // MARK: - 14. TZ-5: pipeline-level cull counts (linear vs sqrt) + ignore accounting
 
     /// END-TO-END through the REAL changed path (review-0 change 4b): drive `ScenePipeline`'s
     /// `setScale`/`setIgnored`, which run `ScanReducer.makeRenderTree(excluding:weight:)` +
@@ -851,9 +851,9 @@ final class ScenePipelineTests: XCTestCase {
     /// `RenderScene.belowPixelCount`/`ignoredBytes`. This is the pipeline-level evidence the
     /// verify PNG host cannot give (it lays out a hand-filtered SizeTree directly, bypassing the
     /// reducer projection). A giant + 50 starved siblings: under LINEAR the siblings are sub-pixel
-    /// (culled/pruned and COUNTED); under LOG the tail is exposed (fewer culls). Then ignoring the
+    /// (culled/pruned and COUNTED); under SQRT the tail is exposed (fewer culls). Then ignoring the
     /// giant excludes it AND reports its exact excluded mass.
-    func testPipelineLinearVsLogCullCountsAndIgnoreAccounting() async {
+    func testPipelineLinearVsSqrtCullCountsAndIgnoreAccounting() async {
         let rootId = "/r"
         let pipe = ScenePipeline(rootId: rootId, rootName: "r")
         await pipe.setViewport(viewport)
@@ -874,22 +874,22 @@ final class ScenePipelineTests: XCTestCase {
         await ingestTask.value
 
         var it = pipe.scenes.makeAsyncIterator()
-        // Force LINEAR (default is LOG) and read its cull count from the emitted scene.
+        // Force LINEAR (default is SQRT) and read its cull count from the emitted scene.
         await pipe.setScale(.linear)
         let linear = await it.next()
-        // Back to LOG and read again — the SAME scene under the other scale.
-        await pipe.setScale(.log)
-        let log = await it.next()
-        guard let linear, let log else { return XCTFail("no scenes emitted for the scale toggle") }
+        // Back to SQRT and read again — the SAME scene under the other scale.
+        await pipe.setScale(.sqrt)
+        let sqrt = await it.next()
+        guard let linear, let sqrt else { return XCTFail("no scenes emitted for the scale toggle") }
 
         XCTAssertEqual(linear.belowPixelCount, 50,
                        "LINEAR: all 50 starved siblings fall below pixel size (pruned/culled + counted)")
-        XCTAssertEqual(log.belowPixelCount, 0,
-                       "LOG: the tail clears the pixel threshold — the starved siblings are exposed")
-        XCTAssertLessThan(log.belowPixelCount, linear.belowPixelCount,
-                          "log reduces below-pixel culling through the real pipeline projection")
+        XCTAssertEqual(sqrt.belowPixelCount, 0,
+                       "SQRT: the tail clears the pixel threshold — the starved siblings are exposed")
+        XCTAssertLessThan(sqrt.belowPixelCount, linear.belowPixelCount,
+                          "sqrt reduces below-pixel culling through the real pipeline projection")
 
-        // Ignore the giant (under log): excluded from the tiles AND its exact mass reported as the
+        // Ignore the giant (under sqrt): excluded from the tiles AND its exact mass reported as the
         // excluded UNION figure (review-0 change 2, computed on the actor from reducer state).
         await pipe.setIgnored(["\(rootId)/giant"])
         let ignored = await it.next()

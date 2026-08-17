@@ -57,7 +57,8 @@ public enum QuadGeometry {
                 y: Float(Double(q.y) * t.scaleY + t.translateY),
                 w: Float(Double(q.w) * t.scaleX),
                 h: Float(Double(q.h) * t.scaleY),
-                r: q.r, g: q.g, b: q.b, style: q.style)
+                r: q.r, g: q.g, b: q.b,
+                ownR: q.ownR, ownG: q.ownG, ownB: q.ownB, style: q.style) // BOTH colours pass through
     }
 
     /// Build the ASCEND CAMERA BASE (rider 1 / review-0 gap 3). Take the cached parent
@@ -70,6 +71,25 @@ public enum QuadGeometry {
     /// child-subtree tile maps back onto the committed child scene EXACTLY — the opening
     /// frame is the displayed child scene, no snap. `childFocusRect` is read from the
     /// child focus quad (dimLevel 0 fills the viewport), so no viewport value is needed.
+    ///
+    /// TZ-8 GLASS-PANE RE-CONDENSATION (review-0 item 1 — the ascend colour snap). This is a
+    /// DIVE-REVERSED flight: the caller drives `dissolveT` 1→0 over it. The displayed colour
+    /// at a flight parameter is `mix(rest, own, dissolveT)`, so the endpoint SHOWN at
+    /// dissolveT = 1 (flight START) is the OWN slot and the endpoint shown at dissolveT = 0
+    /// (flight END) is the REST slot. For the shared child subtree we must therefore:
+    ///   - own slot  (shown at dissolveT = 1) := the CHILD scene's DISPLAYED colour (its
+    ///     rest colour — the child scene renders at rest/dissolveT = 0), so t = 0 opens
+    ///     EXACTLY on what is on screen (continuity, no opening snap); and
+    ///   - rest slot (shown at dissolveT = 0) := the PARENT scene's paned colour for that
+    ///     node, so as the flight runs 1→0 the tile MORPHS from its child-focus colour to its
+    ///     parent-focus paned colour, landing on the parent scene BEFORE the commit — the
+    ///     commit's settle then finds the colour already correct (no snap).
+    /// NOTE the OWN slot deliberately carries the child's rest, NOT the parent's own: colour
+    /// is FOCUS-RELATIVE and `dimLevel` is focus-relative, so a shared tile is one dim level
+    /// SHALLOWER (brighter) under the child focus than under the parent — using the parent's
+    /// own here would darken the opening frame by one ladder step, reintroducing a t = 0 snap.
+    /// A child-only tile (deeper detail absent from the parent projection) has no parent
+    /// target; it holds its displayed colour (both slots = child rest) as it shrinks away.
     public static func embedChild(childQuads: [GPUQuad], childNodeIds: [String],
                                   into childRect: Rect,
                                   parentQuads: [GPUQuad], parentNodeIds: [String],
@@ -81,15 +101,30 @@ public enum QuadGeometry {
         let focusRect = Rect(x: Double(f.x), y: Double(f.y), width: Double(f.w), height: Double(f.h))
         let embed = FocusCamera.fit(frame: focusRect, into: childRect) // viewport → childRect
         let childIds = Set(childNodeIds)
+        // Parent REST (paned) colour by node id — the re-condensation TARGET (shown at the
+        // flight end, dissolveT = 0) for a shared child-subtree tile.
+        var parentRestById = [String: (Float, Float, Float)](minimumCapacity: parentNodeIds.count)
+        for i in parentNodeIds.indices {
+            parentRestById[parentNodeIds[i]] = (parentQuads[i].r, parentQuads[i].g, parentQuads[i].b)
+        }
         var quads = [GPUQuad](); quads.reserveCapacity(parentQuads.count + childQuads.count)
         var nodeIds = [String](); nodeIds.reserveCapacity(quads.capacity)
         // Parent tiles NOT in the child subtree stay as-is.
         for i in parentNodeIds.indices where !childIds.contains(parentNodeIds[i]) {
             quads.append(parentQuads[i]); nodeIds.append(parentNodeIds[i])
         }
-        // The child subtree, mapped viewport → C's slot.
+        // The child subtree, mapped viewport → C's slot, with dissolve endpoints reset so the
+        // pane RE-CONDENSES from the child-focus colour to the parent-focus paned colour.
         for i in childNodeIds.indices {
-            quads.append(transform(childQuads[i], by: embed)); nodeIds.append(childNodeIds[i])
+            let g = transform(childQuads[i], by: embed) // child-scene geometry into C's slot
+            let displayed = (childQuads[i].r, childQuads[i].g, childQuads[i].b) // child renders at rest
+            let recondensed = parentRestById[childNodeIds[i]] ?? displayed // parent paned, or hold
+            quads.append(GPUQuad(
+                x: g.x, y: g.y, w: g.w, h: g.h,
+                r: recondensed.0, g: recondensed.1, b: recondensed.2,        // dissolveT = 0 (parent paned)
+                ownR: displayed.0, ownG: displayed.1, ownB: displayed.2,     // dissolveT = 1 (child displayed)
+                style: g.style))
+            nodeIds.append(childNodeIds[i])
         }
         return (quads, nodeIds)
     }
@@ -129,7 +164,9 @@ public enum QuadGeometry {
                 // committed (focus-relative) scene so the re-tint lands AT commit.
                 let c = sceneQuads[i]
                 out.append(GPUQuad(x: placed.x, y: placed.y, w: placed.w, h: placed.h,
-                                   r: c.r, g: c.g, b: c.b, style: c.style))
+                                   r: c.r, g: c.g, b: c.b,
+                                   ownR: c.ownR, ownG: c.ownG, ownB: c.ownB, // BOTH dissolve
+                                   style: c.style))                          // colours snap
             } else {
                 out.append(sceneQuads[i]) // absent from the base — its own committed quad
             }
