@@ -140,6 +140,12 @@ final class WatchlistPanel: NSView {
             row.widthAnchor.constraint(equalTo: rowStack.widthAnchor).isActive = true
         }
         needsLayout = true
+        // FIELD BUG (2026-08-18, second report of "the list is not a list"): the panel's FRAME
+        // is assigned by ChromeContainer.layout(), not by this view's own layout pass. Marking
+        // only ourselves dirty re-lays the rows inside the STALE frame (sized when the list had
+        // one entry), so entry #2+ existed but never got height — a one-row scroll window
+        // masquerading as a list. Invalidate the view that owns our frame.
+        superview?.needsLayout = true
     }
 
     /// The NATURAL height the panel wants (title + ALL rows + export button, unclamped).

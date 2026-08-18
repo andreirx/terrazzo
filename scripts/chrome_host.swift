@@ -224,8 +224,13 @@ struct ChromeHost {
                                  relativePath: "Users/apple/folder-\($0)",
                                  bytes: Int64($0 + 1) * 1_000_000_000, hue: Double($0) * 0.11)
         }
-        panel.setEntries(entries)
 
+        var vis0: [String] = []
+        // PRODUCTION ORDER (field bug 2026-08-18, "the list is STILL not a list"): the app
+        // builds + lays out the container at launch and entries arrive LATER. The old audit
+        // populated BEFORE the first layout, so the container's initial pass saw full content
+        // and the gate was blind to the stale-frame bug (panel invalidating itself instead of
+        // the frame-owning container). Audit the real order: empty layout first, grow after.
         let container = ChromeContainer(controlBar: controlBar, banner: banner, consentBanner: consentBanner,
                                         canvas: canvas, statusBar: statusBar, watchlistPanel: panel)
         container.appearance = NSAppearance(named: .darkAqua)
@@ -233,7 +238,36 @@ struct ChromeHost {
         container.setFrameSize(NSSize(width: width, height: height))
         container.layoutSubtreeIfNeeded()
 
-        var vis: [String] = []
+        // Grow 1 → 3 entries post-layout, exactly as the live app does, relying ONLY on
+        // setEntries' own invalidation (no manual container poke — that is what's under test).
+        panel.setEntries(Array(entries.prefix(1)))
+        container.layoutSubtreeIfNeeded()
+        let oneRowH = panel.frame.height
+        // Clear the container's dirty flag the way a completed runloop pass would, then grow.
+        container.needsLayout = false
+        panel.setEntries(Array(entries.prefix(3)))
+        // THE FAITHFUL ASSERTION: the live runloop only calls layout() on views flagged dirty.
+        // setEntries must flag the FRAME-OWNING container — asserting the flag (not the height
+        // after layoutSubtreeIfNeeded, which lays out regardless of flags and masked the bug in
+        // the first version of this gate) is what reproduces the production mechanism.
+        if !container.needsLayout {
+            vis0.append("WatchlistPanel @ \(size): PRODUCTION-ORDER stale-frame bug — setEntries after "
+                + "layout does NOT flag the frame-owning container dirty (the panel would keep its "
+                + "1-row frame until an unrelated relayout)")
+        }
+        container.layoutSubtreeIfNeeded()
+        let threeRowH = panel.frame.height
+        if threeRowH <= oneRowH + 1 {
+            vis0.append(String(format: "WatchlistPanel @ %@: PRODUCTION-ORDER growth failed — 3 entries "
+                + "height %.0f not taller than 1-entry height %.0f", size, threeRowH, oneRowH))
+        } else if container.needsLayout == false {
+            print("CHROME WATCHLIST-PANEL production-order OK @ \(size): container flagged + 1-row \(Int(oneRowH)) → 3-row \(Int(threeRowH))")
+        }
+
+        panel.setEntries(entries)
+        container.layoutSubtreeIfNeeded()
+
+        var vis: [String] = vis0
         let natural = panel.contentHeight()
         let canvasHeight = height - ControlBar.height - StatusBar.height
         let clampCeiling = canvasHeight - 20 // ChromeContainer 2*margin
